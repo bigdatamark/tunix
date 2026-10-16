@@ -31,44 +31,44 @@ abstractmethod = abc.abstractmethod
 
 
 class AbstractDataQueue(ABC, Generic[_T]):
-  """Abstract base class for data queues."""
   # [CLASS DOC]
   # Abstract generic queue interface over item type _T. Subclasses must
   # implement put, get, qsize and close. Cannot be instantiated directly.
+  """Abstract base class for data queues."""
 
   @abstractmethod
   def put(self, item: _T) -> None:
+    # [FUNCTION DOC]
+    # Abstract. Input: item of type _T. Adds it to the queue; returns None.
     """Puts an item into the queue."""
-  # [FUNCTION DOC]
-  # Abstract. Input: item of type _T. Adds it to the queue; returns None.
 
   @abstractmethod
   def get(self, block: bool = True, timeout: float | None = None) -> _T:
+    # [FUNCTION DOC]
+    # Abstract. Inputs: block (wait if empty, default True), timeout (seconds or
+    # None for no limit). Returns the next item; implementations raise
+    # queue.Empty when no item is available within the constraints.
     """Gets an item from the queue."""
-  # [FUNCTION DOC]
-  # Abstract. Inputs: block (wait if empty, default True), timeout (seconds or
-  # None for no limit). Returns the next item; implementations raise
-  # queue.Empty when no item is available within the constraints.
 
   @abstractmethod
   def qsize(self) -> int:
+    # [FUNCTION DOC]
+    # Abstract. Returns the approximate number of queued items (int).
     """Returns the approximate size of the queue."""
-  # [FUNCTION DOC]
-  # Abstract. Returns the approximate number of queued items (int).
 
   @abstractmethod
   def close(self) -> None:
+    # [FUNCTION DOC]
+    # Abstract. Closes the queue / releases pending items; returns None.
     """Closes the queue."""
-# [FUNCTION DOC]
-# Abstract. Closes the queue / releases pending items; returns None.
 
 
 class SimpleDataQueue(AbstractDataQueue[_T]):
-  """A simple data queue based on queue.Queue."""
   # [CLASS DOC]
   # FIFO, thread-safe implementation of AbstractDataQueue wrapping a private
   # queue.Queue instance. Closing only drains items; it does not prevent later
   # puts or gets.
+  """A simple data queue based on queue.Queue."""
 
   def __init__(self, maxsize: int = 0):
     # [FUNCTION DOC]

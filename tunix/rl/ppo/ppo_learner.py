@@ -146,6 +146,11 @@ class PPOConfig(algo_config_lib.AlgorithmConfig):
 
 
 class PPOLearner(rl_learner.RLLearner[PPOConfig]):
+  # [CLASS DOC]
+  # RLLearner specialized with PPOConfig. Uses a critic trained alongside the
+  # actor; one completion per prompt; installs PPO policy and value losses.
+  # State beyond the base: _use_reward_model (whether scores come from the
+  # inference worker's reward model rather than reward functions).
   """PPO (Proximal Policy Optimization) learner.
 
   PPO is a reinforcement learning algorithm that fine-tunes models using an

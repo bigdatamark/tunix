@@ -290,6 +290,10 @@ def put_params_on_memory_kind(
     return params
 
   def _get_new_sharding(x):
+    # [FUNCTION DOC]
+    # HELPER: Returns a copy of a sharding with the requested memory kind
+    # (NamedSharding rebuilt from mesh and spec; other shardings via
+    # with_memory_kind).
     if isinstance(x, jax.NamedSharding):
       return jax.NamedSharding(x.mesh, x.spec, memory_kind=memory_kind)
     else:

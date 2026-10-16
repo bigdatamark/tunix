@@ -146,11 +146,11 @@ TGrpoConfig = TypeVar("TGrpoConfig", bound=GRPOConfig)
 
 
 class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
-  """GRPO (Group Relative Policy Optimization) learner.
   # [CLASS DOC]
   # Generic RL learner over a GRPOConfig-bounded config type. Holds no extra
   # state beyond RLLearner; implements the abstract hooks for rollout and
   # advantage computation, trajectory ids, iteration and generation counts.
+  """GRPO (Group Relative Policy Optimization) learner.
 
   GRPO is a reinforcement learning algorithm designed to enhance the reasoning
   abilities of large language models, like mathematical problem-solving. It is

@@ -56,8 +56,8 @@ class DrGRPOConfig(grpo_learner_lib.GRPOConfig):
 
 
 class DrGRPOLearner(grpo_learner_lib.GrpoLearner[DrGRPOConfig]):
+  # [CLASS DOC]
+  # Dr. GRPO learner: identical behavior to GRPOLearner; the differences come
+  # entirely from DrGRPOConfig (the "drgrpo" advantage estimator, which skips
+  # std normalization, and the token-scale loss aggregation). Adds no methods.
   """Dr. GRPO Learner."""
-# [CLASS DOC]
-# Dr. GRPO learner: identical behavior to GRPOLearner; the differences come
-# entirely from DrGRPOConfig (the "drgrpo" advantage estimator, which skips
-# std normalization, and the token-scale loss aggregation). Adds no methods.

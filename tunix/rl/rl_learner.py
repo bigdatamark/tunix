@@ -62,7 +62,6 @@ TConfig = TypeVar("TConfig", bound=algo_config_lib.AlgorithmConfig)
 
 
 class RLLearner(abc.ABC, Generic[TConfig]):
-  """Base class that should be extended by specific RL algorithms."""
   # [CLASS DOC]
   # Generic abstract base over an AlgorithmConfig type. Subclasses implement
   # _generate_and_compute_advantage, _compute_trajectory_ids, _num_iterations
@@ -73,6 +72,7 @@ class RLLearner(abc.ABC, Generic[TConfig]):
   # executor for data preparation, the restored trainer iteration
   # (_last_iter_step) used to fast-forward data, and rollout / compute-logps
   # micro batch sizes.
+  """Base class that should be extended by specific RL algorithms."""
 
   def __init__(
       self,

@@ -102,9 +102,9 @@ class VanillaRollout(base_rollout.BaseRollout):
     # current graphdef and state and returns common.compute_per_token_logps with
     # the tokenizer's pad and eos ids, gradients stopped and no logits:
     # per-token log-probs of completions under the rollout model.
-    # KNOWN ISSUE: the signature does not accept the extra completion_mask or
-    # keyword arguments that other backends/callers may pass, and temperature is
-    # not applied.
+    # KNOWN ISSUE: the rollout temperature is not applied, so these logps use
+    # temperature 1 while reference/actor logps are computed at the sampling
+    # temperature.
     """Returns per-token log probabilities from the rollout policy."""
     graphdef, state = self._sampler.model_def_and_state()
     return common.compute_per_token_logps(

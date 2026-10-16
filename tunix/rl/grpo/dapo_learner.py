@@ -173,9 +173,9 @@ def reward_shaping(
 
 
 class DAPOLearner(grpo_learner_lib.GrpoLearner[DAPOConfig]):
-  """DAPO learner."""
   # [CLASS DOC]
   # GRPO learner specialized with DAPOConfig; only constructor behavior differs.
+  """DAPO learner."""
 
   def __init__(
       self,
