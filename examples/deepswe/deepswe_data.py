@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataset utilities for the DeepSWE agentic GRPO recipe. create_dataset loads an R2E-Gym Hugging Face
+# dataset into a grain MapDataset (list-valued fields JSON-encoded to strings), and batch_fn is a
+# custom batching function (auto-discovered by AgenticGrpoPipeline) that collates examples with
+# heterogeneous field types. Key sets: _STR_KEYS (repo_name, docker_image, commit_hash,
+# parsed_commit_content, execution_result_content) and _DICT_KEYS (modified_files, relevant_files,
+# modified_entity_summaries) are collated to Python lists; _ARRAY_KEYS (counts, prompt,
+# problem_statement, expected_output_json) to numpy arrays; all other keys to lists.
 """Dataset loading for the DeepSWE agentic GRPO recipe.
 
 Returns a raw grain.MapDataset ready for post_init_dataset().
@@ -33,6 +41,14 @@ def create_dataset(
     shuffle: bool = True,
     seed: int = 42,
 ) -> grain.MapDataset:
+  # [FUNCTION DOC]
+  # Lazily imports datasets.load_dataset, defaults cache_dir to <cwd>/dataset_cache and creates it,
+  # loads dataset_name/dataset_split with trust_remote_code=True, maps _transform over it in memory
+  # (every list-valued field replaced by its JSON string), shuffles with seed if shuffle (default True),
+  # and returns grain.MapDataset.source over it. Inputs: dataset_name (default "R2E-Gym/R2E-Gym-V1"),
+  # dataset_split ("train"), cache_dir, shuffle, seed (42). Output: grain.MapDataset of example dicts.
+  # Raises: dataset download/loading errors. Side effects: network access, directory creation, cache
+  # writes, and execution of remote dataset code (trust_remote_code).
   """Load the R2E-Gym dataset and return a raw grain.MapDataset.
 
   Args:
@@ -61,6 +77,8 @@ def create_dataset(
   )
 
   def _transform(entry):
+    # [FUNCTION DOC]
+    # HELPER: mutates entry in place, replacing every list value with its JSON-encoded string, and returns it.
     for k, v in entry.items():
       if isinstance(v, list):
         entry[k] = json.dumps(v)
@@ -99,6 +117,12 @@ _ARRAY_KEYS = {
 
 
 def batch_fn(elements: list[dict]) -> dict:
+  # [FUNCTION DOC]
+  # Collates a non-empty list of example dicts into one dict keyed by the first element's keys: keys in
+  # _STR_KEYS or _DICT_KEYS and unknown keys become lists of values; keys in _ARRAY_KEYS become numpy
+  # arrays of values. Raises IndexError on an empty list and KeyError if a later element lacks a key.
+  # KNOWN ISSUE: the _STR_KEYS/_DICT_KEYS branch is identical to the fallback branch, so those sets have
+  # no effect on behavior.
   """Batch a list of R2E-Gym examples into a dict of lists / arrays."""
   batched: dict = {}
   for key in elements[0].keys():

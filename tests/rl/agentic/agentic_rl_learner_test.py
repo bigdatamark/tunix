@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for AgenticRLLearner construction-time validation of the rollout
+# configuration and train-time micro-batch validation. Uses Mock RL clusters
+# and a minimal DummyLearner subclass. Checked errors (all ValueError):
+# max_tokens_to_generate differing from AgenticRLConfig.max_response_length,
+# return_logprobs False when use_rollout_logps is set (per mode when the
+# rollout config is a train/eval dict), vLLM engine without server mode, and
+# compute_logps_micro_batch_size differing from train_micro_batch_size.
+# Side effects: temporarily patches rl_utils.is_sharing_weights.
+# KNOWN ISSUE: asyncio, typing.Any and absl logging are imported but unused.
+
 """Tests for agentic_rl_learner."""
 
 import asyncio
@@ -28,13 +39,23 @@ from tunix.rl.rollout import base_rollout
 
 
 class DummyLearner(agentic_rl_learner.AgenticRLLearner):
+  # [CLASS DOC]
+  # HELPER: concrete AgenticRLLearner whose only override, _process_results,
+  # returns an empty list.
   def _process_results(self, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: ignores all keyword arguments and returns an empty list.
     return []
 
 
 class AgenticRLLearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Validation tests for AgenticRLLearner config checks.
 
   def test_validate_rollout_config_mismatch_max_tokens(self):
+    # [FUNCTION DOC]
+    # Verifies construction raises ValueError when rollout
+    # max_tokens_to_generate (10) differs from max_response_length (20).
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
     rl_cluster.cluster_config.rollout_engine = "generic"
@@ -60,6 +81,10 @@ class AgenticRLLearnerTest(parameterized.TestCase):
       )
 
   def test_validate_rollout_config_missing_logprobs(self):
+    # [FUNCTION DOC]
+    # Verifies construction raises ValueError "must have
+    # return_logprobs=True" when use_rollout_logps is set but the rollout
+    # config does not return logprobs.
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
     rl_cluster.cluster_config.rollout_engine = "generic"
@@ -85,6 +110,10 @@ class AgenticRLLearnerTest(parameterized.TestCase):
       )
 
   def test_validate_rollout_config_dict_mode(self):
+    # [FUNCTION DOC]
+    # Verifies that with a per-mode dict of rollout configs each entry is
+    # validated and the error names the offending mode ("RolloutConfig
+    # (eval) must have return_logprobs=True").
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
     rl_cluster.cluster_config.rollout_engine = "generic"
@@ -118,6 +147,9 @@ class AgenticRLLearnerTest(parameterized.TestCase):
       )
 
   def test_validate_rollout_config_vllm_missing_server_mode(self):
+    # [FUNCTION DOC]
+    # Verifies the vLLM rollout engine requires rollout_vllm_server_mode
+    # True, else construction raises ValueError.
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
     rl_cluster.cluster_config.rollout_engine = "vllm"
@@ -146,6 +178,10 @@ class AgenticRLLearnerTest(parameterized.TestCase):
       )
 
   def test_train_batch_size_mismatch_raises_error(self):
+    # [FUNCTION DOC]
+    # With weight sharing patched off and a mocked cluster (actor and
+    # rollout meshes, compute_logps micro batch 2, train micro batch 1),
+    # verifies train() raises ValueError stating the two must be equal.
     with mock.patch.object(
         rl_utils, "is_sharing_weights", return_value=False
     ):

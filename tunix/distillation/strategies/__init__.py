@@ -11,6 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Package tunix.distillation.strategies: distillation loss strategies.
+# Behavior: re-exports BaseStrategy (abstract strategy contract) and the
+#   ModelForwardCallable type alias from base_strategy, plus the concrete
+#   strategies: LogitStrategy (KL on softened logits blended with task loss),
+#   AttentionTransferStrategy and AttentionProjectionStrategy (match
+#   intermediate attention maps), FeaturePoolingStrategy (match pooled
+#   intermediate features) and FeatureProjectionStrategy (match features
+#   after a learned projection of student features).
+# Every strategy turns (student model, teacher output, inputs) into a scalar
+#   loss (optionally with aux metrics) and may rewrite models before/after
+#   training via pre_process_models / post_process_models.
+# Inputs/outputs/exceptions: none at import. Side effects: imports submodules.
 """Module containing the distillation strategies."""
 
 # pylint: disable=g-importing-member

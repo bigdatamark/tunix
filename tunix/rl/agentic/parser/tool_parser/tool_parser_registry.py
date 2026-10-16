@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Small name-to-class registry for tool-call parsers.
+# Behavior: imports the Qwen and Gemini parser modules and re-exports ToolParser
+# (abstract base), QwenToolParser and GeminiToolParser as module-level aliases.
+# Holds a private mapping from the lowercase string keys "qwen" and "gemini" to
+# the corresponding parser classes (classes, not instances).
+# Side effects: none beyond importing the parser modules.
 """Registry for different tool parsers."""
 
 from tunix.rl.agentic.parser.tool_parser import gemini_parser
@@ -25,6 +32,13 @@ _PARSER_REGISTRY = {"qwen": QwenToolParser, "gemini": GeminiToolParser}
 
 
 def get_tool_parser(parser_name: str = "qwen") -> type[ToolParser]:
+  # [FUNCTION DOC]
+  # HELPER: Look up a tool-parser class by name.
+  # Inputs: parser_name, a string key; defaults to "qwen".
+  # Outputs: the parser class (not an instance) registered under that key.
+  # Exceptions: ValueError with message "Unknown parser: <name>" when the key is
+  # not in the registry (lookup is exact and case-sensitive).
+  # Side effects: none.
   if parser_name not in _PARSER_REGISTRY:
     raise ValueError(f"Unknown parser: {parser_name}")
   return _PARSER_REGISTRY[parser_name]

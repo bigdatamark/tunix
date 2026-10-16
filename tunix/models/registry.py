@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Model registry: defines MODEL_CATALOG, a tuple of naming.ModelNaming
+# entries, one per supported checkpoint (Gemma 1/1.1/2/3/4, Llama 3/3.1/3.2,
+# Qwen2.5 incl. coder/math, DeepSeek-R1-Distill-Qwen, Qwen3 incl. base, 2507
+# and MoE variants). Each entry specifies the Hugging Face model id together
+# with the expected model_name, family, version, config id and config
+# category. Because ModelNaming validates all explicit fields against values
+# derived from model_id in its post-init, importing this module acts as a
+# self-test of the naming rules: any inconsistent entry raises ValueError at
+# import time. Each config id must correspond to a ModelConfig classmethod in
+# the matching tunix.models.<category> module. No functions or classes.
 """Model registry."""
 
 from tunix.models import naming

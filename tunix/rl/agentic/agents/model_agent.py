@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines ModelAgent, the simplest conversational agent: every model response is
+# treated directly as the final action for the environment (single-turn tasks
+# such as math answer grading). Builds on ConversationAgentBase from base_agent
+# and the Action/Step types from agent_types.
 """Agent implementation for single-turn interactions."""
 
 import copy
@@ -21,9 +26,17 @@ from tunix.rl.agentic.agents import base_agent
 
 
 class ModelAgent(base_agent.ConversationAgentBase):
+  # [CLASS DOC]
+  # Single-turn agent. Inherits conversation history management (chat_completions
+  # list and trajectory) and default observation-to-message conversion from
+  # ConversationAgentBase; only overrides update_from_model.
   """Agent for single-turn interaction, responding directly to a task."""
 
   def __init__(self, system_prompt: str):
+    # [FUNCTION DOC]
+    # Construct the agent with the given system prompt by delegating to the base
+    # constructor (which initializes chat history and trajectory).
+    # Inputs: system_prompt string. Outputs: none.
     super().__init__(system_prompt=system_prompt)
 
   # If you want to handle observations in a special way, you can override
@@ -31,6 +44,16 @@ class ModelAgent(base_agent.ConversationAgentBase):
   # ConversationAgentBase.
 
   def update_from_model(self, response: str, **kwargs) -> agent_types.Action:
+    # [FUNCTION DOC]
+    # Record a model response and return it as the action.
+    # Inputs: response text; arbitrary keyword arguments (ignored).
+    # Behavior: appends an assistant message with the response to chat_completions;
+    # creates a Step whose chat_completions is a deep copy of the history, whose
+    # action is an Action wrapping the response, and whose model_response is the
+    # response; appends the Step to self.trajectory.steps.
+    # Outputs: a new Action wrapping the raw response (a separate object from the one
+    # stored in the Step).
+    # Side effects: mutates chat_completions and trajectory.
     """Receive model response and return it as the final action."""
     # 1. Add the model's output to the conversation history.
     self.chat_completions.append({"role": "assistant", "content": response})

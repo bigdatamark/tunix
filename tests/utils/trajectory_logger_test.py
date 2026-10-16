@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for tunix.utils.trajectory_logger.log_item, which appends a
+# dict item as a CSV row to '<log_path>/trajectory_log.csv', creating the
+# directory if needed and raising ValueError when log_path is None.
+# Side effects: creates files in temporary directories.
 import os
 import tempfile
 from typing import TypedDict
@@ -9,10 +14,17 @@ from tunix.utils import trajectory_logger
 
 
 class TrajectoryLoggerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for trajectory_logger.log_item.
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture; only calls the parent setUp.
     super().setUp()
 
   def test_log_item_with_none_log_path(self):
+    # [FUNCTION DOC]
+    # Verifies log_item(None, item) raises ValueError matching
+    # 'No directory for logging provided'.
     """Tests that log_item with log_path=None raises ValueError."""
     item = {
         'global_step': 0,
@@ -26,6 +38,9 @@ class TrajectoryLoggerTest(absltest.TestCase):
       trajectory_logger.log_item(None, item)
 
   def test_log_item_with_non_existent_dir_creates_dir(self):
+    # [FUNCTION DOC]
+    # Verifies log_item creates a missing directory and the trajectory_log.csv
+    # file inside it.
     """Tests that log_item creates a non-existent directory."""
     try:
       temp_dir = self.create_tempdir().full_path
@@ -43,6 +58,10 @@ class TrajectoryLoggerTest(absltest.TestCase):
     self.assertTrue(os.path.exists(log_file))
 
   def test_log_item_creates_and_writes_to_file(self):
+    # [FUNCTION DOC]
+    # Verifies three successive log_item calls append three CSV rows that pandas
+    # reads back correctly, including numpy ints, pipes, commas, quotes and
+    # embedded newlines (proper CSV quoting), with a single header row.
     """Tests that log_item creates and writes to a log file."""
     try:
       temp_dir = self.create_tempdir().full_path

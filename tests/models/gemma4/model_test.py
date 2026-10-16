@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for the Gemma 4 model (tunix.models.gemma4.model.Gemma4) using tiny one-layer configs
+# (embed 256, hidden 512, 4 heads of dim 64, 1 kv head) derived from the e2b dense and 26b-a4b MoE
+# configs. Checks forward pass logits shape [batch, seq, vocab], gradients under BLOCK and DECODER
+# rematerialization, and that a BLOCK-remat model can run inside a jitted while_loop.
+# Inputs: random tokens (batch 2, seq 32) with full causal masks. Side effects: prints a shape.
 
 """Tests for Gemma 4 model."""
 
@@ -24,8 +30,12 @@ from tunix.models.gemma4 import model as model_lib
 
 
 class ModelTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test suite for the Gemma 4 model.
 
   def test_forward_pass_dense(self):
+    # [FUNCTION DOC]
+    # Verifies a dense one-layer Gemma4 (shared-layer fraction 0) returns logits of shape (2, 32, vocab).
     config = model_lib.ModelConfig.gemma4_e2b()
     config.num_layers = 1
     config.embed_dim = 256
@@ -54,6 +64,9 @@ class ModelTest(absltest.TestCase):
     print(f"{logits.shape=}")
 
   def test_forward_pass_moe(self):
+    # [FUNCTION DOC]
+    # Verifies a one-layer MoE Gemma4 (4 experts, top-2, expert dim 128) returns logits of shape
+    # (2, 32, vocab).
     config = model_lib.ModelConfig.gemma4_26b_a4b()
     config.num_layers = 1
     config.embed_dim = 256
@@ -82,6 +95,8 @@ class ModelTest(absltest.TestCase):
     self.assertEqual(logits.shape, (2, 32, config.num_embed))
 
   def test_remat_block(self):
+    # [FUNCTION DOC]
+    # Verifies loss and gradients can be computed with nnx.value_and_grad when remat is BLOCK.
     config = model_lib.ModelConfig.gemma4_e2b()
     config.num_layers = 1
     config.embed_dim = 256
@@ -107,6 +122,8 @@ class ModelTest(absltest.TestCase):
     )[None, ...]
 
     def loss_fn(model, tokens, positions, attn_mask):
+      # [FUNCTION DOC]
+      # HELPER: runs the model and returns the sum of all logits as a scalar loss.
       logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
       return jnp.sum(logits)
 
@@ -117,6 +134,8 @@ class ModelTest(absltest.TestCase):
     self.assertIsNotNone(grads)
 
   def test_remat_decoder(self):
+    # [FUNCTION DOC]
+    # Verifies loss and gradients can be computed with nnx.value_and_grad when remat is DECODER.
     config = model_lib.ModelConfig.gemma4_e2b()
     config.num_layers = 1
     config.embed_dim = 256
@@ -142,6 +161,8 @@ class ModelTest(absltest.TestCase):
     )[None, ...]
 
     def loss_fn(model, tokens, positions, attn_mask):
+      # [FUNCTION DOC]
+      # HELPER: runs the model and returns the sum of all logits as a scalar loss.
       logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
       return jnp.sum(logits)
 
@@ -152,6 +173,10 @@ class ModelTest(absltest.TestCase):
     self.assertIsNotNone(grads)
 
   def test_remat_while_loop_trace_context(self):
+    # [FUNCTION DOC]
+    # Verifies a BLOCK-remat model, split into graphdef and Param state, can be merged and run inside the
+    # body of a jitted lax.while_loop (one iteration) without trace-context errors, producing logits of
+    # shape (2, 32, vocab).
     config = model_lib.ModelConfig.gemma4_e2b()
     config.num_layers = 1
     config.embed_dim = 256
@@ -178,7 +203,13 @@ class ModelTest(absltest.TestCase):
     graphdef, state = nnx.split(model, nnx.Param)
 
     def decode_fn(params):
+      # [FUNCTION DOC]
+      # HELPER: given the Param state, runs a while_loop from carry (step 0, zero logits) while step is
+      # below 1, each iteration calling the nested body. Returns the final (step, logits) carry.
       def body_fn(step, _):
+        # [FUNCTION DOC]
+        # HELPER: merges graphdef with params into a model, runs it on the captured tokens/positions/mask and
+        # returns (step plus one, logits). The second argument is ignored.
         transformer = nnx.merge(graphdef, params)
         logits, _ = transformer(
             tokens, positions=positions, attention_mask=attn_mask

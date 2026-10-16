@@ -11,6 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CLI script that checks a Tunix model's logits against the Hugging Face reference implementation.
+# Run as a module with --model_name (required, key of SUPPORTED_MODELS), --max_kl_div (float, default
+# 0.015) and --max_target_length (int, default 1024); unknown args are ignored. Main flow: builds a
+# 1 x N mesh ("fsdp","tp"), loads HF model (bfloat16) and tokenizer plus the Tunix model/tokenizer,
+# then for 3 fixed prompts runs one HF forward pass and one Tunix Sampler call (1 generation step,
+# echo, return_logits), prints top-10 token tables and overlap metrics for the last position, and
+# asserts the per-token max KL divergence is below max_kl_div.
+# SUPPORTED_MODELS maps model name to (HF repo id, Tunix loader taking a mesh and returning
+# (config, model), Tunix tokenizer factory). Only "gemma3-27b-it" is registered.
+# Side effects: sets jax_default_prng_impl to "unsafe_rbg", sets TF_CPP_MIN_LOG_LEVEL to "0" (the
+# inline comment says suppress, but 0 shows all logs), downloads models, prints to stdout.
+# KNOWN ISSUE: get_data is unused and references config attributes (global_batch_size_to_train_on,
+# max_target_length) that the Tunix ModelConfig does not obviously provide.
 """Check if a Tunix supported model's logits match the HF logits."""
 # python -m scripts.forward_pass_logit_checker --model_name=gemma3-27b-it
 
@@ -30,6 +44,10 @@ from tunix.models.gemma3 import params as gemma3_params_lib
 
 
 def load_gemma3_model(mesh):
+  # [FUNCTION DOC]
+  # HELPER: builds the Gemma3 27B-IT ModelConfig and creates the model from the GEMMA3_27B_IT checkpoint
+  # sharded on the given mesh. Input: mesh (jax Mesh). Output: tuple (config, model). Raises: checkpoint
+  # loading errors propagate. Side effects: reads checkpoint, allocates device memory.
   config = (
       gemma3_model_lib.ModelConfig.gemma3_27b_it()
   )  # pick corresponding config based on model version
@@ -50,6 +68,13 @@ SUPPORTED_MODELS = {
 def get_top_k_tokens_scores(
     logits_tensor, tokenizer_instance, k=10, description=""
 ):
+  # [FUNCTION DOC]
+  # Takes torch.topk of k entries from a 1-D logits tensor, decodes each id with the tokenizer, and
+  # returns a list of dicts with keys id (int), token (decoded text stripped), score (float), in descending
+  # score order. Inputs: logits_tensor (1-D torch tensor), tokenizer_instance (has decode), k (default 10),
+  # description (label for printed header). Output: the list. Side effect: prints a header and a
+  # markdown-style table of id/token/score. Raises: torch errors if k exceeds the vocab size.
+  # KNOWN ISSUE: builds two identical lists (collected_tokens and tokens); one is redundant.
   """Get the top-k tokens and their scores from a given logits tensor."""
   print(f"\n--- {description} top {k} tokens ---")
   collected_tokens = []
@@ -76,13 +101,19 @@ def get_top_k_tokens_scores(
 
 
 def compare_top_tokens(converted_tokens, golden_tokens):
+  # [FUNCTION DOC]
+  # Compares two top-token lists (dicts with an "id" key). Computes: overlap count of id sets,
+  # Jaccard similarity (intersection size divided by union size, 0.0 if union empty), and rank agreement
+  # (percentage of positions i, up to the shorter length, where the ids match; 0.0 if that length is 0).
+  # Prints a table of metrics, with overlap shown as "overlap/min_len". Output: none (returns None).
+  # Raises: KeyError if an entry lacks "id". Side effects: stdout only.
+  # Extract the sets of token IDs for comparison
   """Compares two lists of top tokens and calculates similarity metrics.
 
   Args:
       converted_tokens: top tokens from the converted model.
       golden_tokens:  top tokens from the golden model.
   """
-  # Extract the sets of token IDs for comparison
   converted_ids = {token["id"] for token in converted_tokens}
   golden_ids = {token["id"] for token in golden_tokens}
 
@@ -117,6 +148,16 @@ def compare_top_tokens(converted_tokens, golden_tokens):
 
 
 def check_kl_divergence(model_logits, golden_logits, atol=0.02):
+  # [FUNCTION DOC]
+  # Computes KL(P_golden || Q_model) per token between two 2-D logit tensors (SeqLen, Vocab). Slices both
+  # to the vocabulary width given by min of their dim 1 sizes, reshapes to (s, v), softmaxes golden and
+  # log-softmaxes model, prints the batchmean KL (average per row) and the max per-row KL (sum over vocab
+  # with reduction none). Asserts the max is below atol (default 0.02), raising AssertionError otherwise.
+  # Output: none. Side effects: prints.
+  # KNOWN ISSUE: docstring says inputs are (Batch, SeqLen, VocabSize) but the code unpacks exactly two
+  # dimensions and slices with shape[1], so 3-D inputs would fail; it only works for 2-D (seq, vocab).
+  # Also the token_size slice is on the last axis but computed from shape[1]; correct only for 2-D.
+  # 1. Select the relevant vocabulary slice from the logits.
   """Calculates KL divergence D_KL(P_golden || Q_model) over a batch of sequences.
 
   Args:
@@ -124,7 +165,6 @@ def check_kl_divergence(model_logits, golden_logits, atol=0.02):
       golden_logits: Logits from the golden model (Batch, SeqLen, VocabSize).
       atol: Maximum allowed KL divergence per token.
   """
-  # 1. Select the relevant vocabulary slice from the logits.
   token_size = min(model_logits.shape[1], golden_logits.shape[1])
   model_logits_sliced = model_logits[..., :token_size]
   golden_logits_sliced = golden_logits[..., :token_size]
@@ -176,6 +216,14 @@ def check_kl_divergence(model_logits, golden_logits, atol=0.02):
 
 
 def get_data(golden_data, golden_data_index, config):
+  # [FUNCTION DOC]
+  # Prepares one golden-data example for a forward pass. golden_data is indexable; entry golden_data_index
+  # must have "tokens", "logits", "prompt". Converts tokens to int32, raises ValueError if their length
+  # exceeds config.max_target_length, zero-pads to max_target_length, tiles to
+  # config.global_batch_size_to_train_on rows, builds segment ids (1 for real tokens, 0 for padding) and
+  # positions (0..max_target_length-1 per row), and converts logits to float32.
+  # Output: tuple (ids, decoder_segment_ids, decoder_positions, logits, seq_len). Side effects: prints.
+  # KNOWN ISSUE: unused by this script.
   """Get the golden data for the test indexed at golden_data_index."""
 
   print(f"Comparing forward pass for golden data index = {golden_data_index}")
@@ -234,6 +282,11 @@ def get_data(golden_data, golden_data_index, config):
 def convert_jax_weight_to_torch(
     weight: "jax.Array", dtype: str | None = None
 ) -> torch.Tensor:
+  # [FUNCTION DOC]
+  # HELPER: converts a (possibly multi-host sharded) JAX array to a torch tensor. Records target dtype
+  # (the array's dtype string unless dtype is given) and shape, all-gathers across processes, converts to a
+  # float32 numpy array, then to torch with the dtype looked up by name on the torch module and reshaped to
+  # the original shape. Output: torch.Tensor. Raises AttributeError if the dtype name is not a torch attr.
   expected_dtype = str(weight.dtype) if dtype is None else dtype
   expected_shape = weight.shape
   weight = multihost_utils.process_allgather(weight)
@@ -244,6 +297,15 @@ def convert_jax_weight_to_torch(
 
 
 def main(test_args):
+  # [FUNCTION DOC]
+  # Script entry point; see module doc for the full flow. Input: parsed args with model_name,
+  # max_target_length, max_kl_div. Per prompt: HF tokenizes (truncation to max_target_length) and takes
+  # logits of batch item 0; Tunix sampler cache size is max_target_length+5; Tunix logits for item 0 are
+  # sliced to the last actual_seq_len positions (HF sequence length) and converted to torch; top-10 tables
+  # for the final position are printed and compared; KL check runs on the full sequence.
+  # Output: none. Raises: KeyError for unknown model, AssertionError on KL failure.
+  # KNOWN ISSUE: assumes HF and Tunix tokenization produce the same length sequence; also mesh is assigned
+  # twice in a chained assignment (harmless).
   devices = jax.devices()
   print(f"Running on devices: {devices}")
   mesh = mesh = jax.make_mesh(

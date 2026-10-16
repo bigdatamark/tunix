@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Unit tests for tunix.rl.rl_learner.RLLearner micro-batch size resolution.
+# Defines a minimal concrete RLLearner subclass and drives train() against a
+# MagicMock RL cluster to check how rollout and compute-logps micro-batch sizes
+# are derived from (or validated against) mini_batch_size and
+# train_micro_batch_size in RLTrainingConfig.
+# Inputs: parameterized config values. Outputs: assertions only.
+# Side effects: none beyond in-memory mocks.
 """Tests for `rl_learner`."""
 
 from unittest import mock
@@ -11,29 +19,48 @@ from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl import rl_learner
 
 class DummyModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: empty nnx module used as stand-in actor and rollout model.
   pass
 
 
 class DummyConfig(algo_config_lib.AlgorithmConfig):
+  # [CLASS DOC]
+  # HELPER: AlgorithmConfig subclass with all default values, no additions.
   pass
 
 
 class DummyLearner(rl_learner.RLLearner[DummyConfig]):
+  # [CLASS DOC]
+  # HELPER: minimal concrete RLLearner implementing the abstract hooks with
+  # trivial behavior so that train() can run against a mocked cluster.
 
   def _generate_and_compute_advantage(self, training_input, mode):
+    # [FUNCTION DOC]
+    # HELPER: no-op; returns None regardless of training_input and mode.
     pass
 
   def _compute_trajectory_ids(self, example, steps):
+    # [FUNCTION DOC]
+    # HELPER: returns a list of empty strings, one per entry in
+    # example['prompts']; steps is ignored.
     return [''] * len(example['prompts'])
 
   def _num_iterations(self):
+    # [FUNCTION DOC]
+    # HELPER: returns 1 (single policy-update iteration per batch).
     return 1
 
   def _num_generations(self):
+    # [FUNCTION DOC]
+    # HELPER: returns 1 (one completion per prompt).
     return 1
 
 
 class RLLearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized tests of micro-batch size defaults and validation in
+  # RLLearner.
 
   @parameterized.named_parameters(
       ('1', None, None, None, None, [32, 32], False),
@@ -52,6 +79,16 @@ class RLLearnerTest(parameterized.TestCase):
       expected_values,
       expect_failure,
   ):
+    # [FUNCTION DOC]
+    # Builds an RLTrainingConfig (sgd optimizer, max_steps 1) with the given
+    # mini/train/rollout/compute-logps micro-batch sizes, a MagicMock cluster
+    # exposing that config and dummy models, and a DummyLearner with a
+    # constant reward function, then trains on one batch of 32 prompts.
+    # If expect_failure, asserts train raises ValueError (cases where rollout
+    # or logps micro-batch size differs from train micro-batch size).
+    # Otherwise asserts the learner's resolved rollout and compute-logps
+    # micro-batch sizes equal expected_values: they default to
+    # train_micro_batch_size, else mini_batch_size, else full batch size 32.
     config = rl_cluster_lib.RLTrainingConfig(
         actor_optimizer=optax.sgd(1e-3),
         mini_batch_size=mini_batch_size,

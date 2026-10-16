@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.strategies.feature_pooling
+# .FeaturePoolingStrategy: a distillation strategy that average-pools teacher
+# intermediate features (sowed from layers of type feature_layer) to the
+# student's feature shape and combines a feature distance loss (cosine
+# distance by default) weighted alpha with the student's task loss against
+# labels weighted (1 - alpha); alpha must be within [0, 1] else ValueError.
+# Eval loss is the task loss only. Module setup disables
+# jax_threefry_partitionable so random values match expected constants.
 """Tests for feature pooling strategy."""
 
 from absl.testing import absltest
@@ -28,33 +37,54 @@ FeaturePoolingStrategy = feature_pooling.FeaturePoolingStrategy
 
 
 class DummyModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: toy nnx model with a 3->1 Linear layer seeded with Rngs(0).
 
   def __init__(self):
+    # [FUNCTION DOC]
+    # HELPER: creates the Linear layer.
     self.linear = nnx.Linear(in_features=3, out_features=1, rngs=nnx.Rngs(0))
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # HELPER: returns linear(x).
     x = self.linear(x)
     return x
 
 
 class FeaturePoolingStrategyTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for FeaturePoolingStrategy with helper generators
+  # of random logits, one-hot labels and stacked attention-like features.
 
   def _get_dummy_logits(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: returns standard normal logits of shape (batch_size, num_classes)
+    # from key.
     return jax.random.normal(key, (batch_size, num_classes))
 
   def _get_dummy_labels(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: returns one-hot labels (batch_size, num_classes) from random ints.
     labels_int = jax.random.randint(key, (batch_size,), 0, num_classes)
     return jax.nn.one_hot(labels_int, num_classes)
 
   def model_forward_fn(self, model: nnx.Module, x: jax.Array):
+    # [FUNCTION DOC]
+    # HELPER: forward function used by the strategy; returns model(x).
     return model(x)
 
   def get_labels_fn(self, x: jax.Array):
+    # [FUNCTION DOC]
+    # HELPER: labels function; returns the scalar mean of x.
     return jnp.mean(x)
 
   def _get_dummy_features(
       self, key, num_layers=3, batch_size=2, num_heads=4, seq_len=8
   ):
+    # [FUNCTION DOC]
+    # HELPER: builds num_layers uniform arrays of shape (batch, heads, seq, seq),
+    # splitting the key each layer, stacked on a new leading axis.
     features = []
     for _ in range(num_layers):
       key, subkey = jax.random.split(key)
@@ -68,6 +98,8 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
       ("alpha_one", 1.0),
   )
   def test_init_valid(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies construction succeeds and stores alpha for 0, 0.5 and 1.
     strategy = FeaturePoolingStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,
@@ -83,6 +115,8 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
       ("alpha_over", 1.1),
   )
   def test_init_invalid(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies ValueError for alpha below 0 or above 1.
     with self.assertRaises(ValueError):
       FeaturePoolingStrategy(
           student_forward_fn=self.model_forward_fn,
@@ -98,6 +132,10 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
       ("alpha_zero", 0.0, 1.984897),
   )
   def test_compute_loss_default_cosine_distance(self, alpha, expected_loss):
+    # [FUNCTION DOC]
+    # Verifies compute_loss against reference values when teacher features have
+    # twice the layers and heads of the student's (pooled down): alpha 1, 0.5, 0
+    # give 0.162183, 1.07354, 1.984897 (tolerance 1e-5).
     key = jax.random.key(2)
     output_key, s_feature_key, t_feature_key, label_key = jax.random.split(
         key, 4
@@ -129,6 +167,9 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
     npt.assert_allclose(computed_loss, expected_loss, rtol=1e-5, atol=1e-5)
 
   def test_compute_loss_empty_features(self):
+    # [FUNCTION DOC]
+    # Verifies compute_loss with empty student/teacher feature arrays returns
+    # the reference combined loss 1.444023 for alpha 0.6.
     key = jax.random.key(3)
     l_key, label_key = jax.random.split(key, 2)
     batch_size, num_classes = 2, 5
@@ -158,6 +199,9 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
       ("alpha_zero", 0.0),
   )
   def test_compute_eval_loss(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies compute_eval_loss returns 2.49732 regardless of alpha (task loss
+    # only).
     s_key, l_key = jax.random.split(jax.random.key(0), 2)
     batch_size, num_classes = 4, 10
     student_logits = self._get_dummy_logits(s_key, batch_size, num_classes)
@@ -180,6 +224,10 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
     npt.assert_allclose(computed_loss, expected_loss, rtol=1e-5)
 
   def test_get_train_loss(self):
+    # [FUNCTION DOC]
+    # Verifies end-to-end: after pre_process_models on identical DummyModels,
+    # get_teacher_outputs returns 2.016251 and get_train_loss is 0 (student and
+    # teacher identical, labels equal to mean of input).
     strategy = FeaturePoolingStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,
@@ -207,6 +255,9 @@ class FeaturePoolingStrategyTest(parameterized.TestCase):
     npt.assert_allclose(computed_loss, expected_loss, atol=1e-5)
 
   def test_get_eval_loss(self):
+    # [FUNCTION DOC]
+    # Verifies get_eval_loss is 0 for the preprocessed student on inputs whose
+    # mean label equals the identical model output.
     strategy = FeaturePoolingStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,

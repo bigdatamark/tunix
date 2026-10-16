@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Generic utilities to export a LoRA-finetuned model as a plain safetensors
+# checkpoint: LoRA deltas (A times B scaled by alpha over rank) are merged into
+# the base checkpoint's weights and written out with all auxiliary files.
+# Model-specific naming/layout differences are supplied as callbacks/rules.
 """Utilities for saving models with merged LoRA weights in safetensors format."""
 
 import os
@@ -24,6 +29,9 @@ import safetensors.numpy as safe_np
 
 
 def join_path(path) -> str:
+  # [FUNCTION DOC]
+  # HELPER: Joins the elements of a graph path (tuple of keys/indices) into a
+  # dot-separated string after converting each to str. Returns that string.
   return '.'.join([str(field) for field in path])
 
 
@@ -39,6 +47,35 @@ def save_lora_merged_model_as_safetensors(
     ) = None,
     transpose_rules: dict[str, tuple[int, ...]] | None = None,
 ):
+  # [FUNCTION DOC]
+  # Merges LoRA weights into a base safetensors checkpoint and saves the result.
+  # Inputs: local_model_path (directory with model.safetensors and other files),
+  # output_dir (destination directory), lora_model (nnx model holding
+  # nnx.LoRAParam leaves), rank and alpha (LoRA hyperparameters, scale is
+  # alpha / rank), state_key_transform_fn (maps the dot-joined module path of a
+  # LoRA layer to the checkpoint key), custom_layer_extractor_fn (optional; takes
+  # and returns the dict of path string to [lora_a, lora_b] list, letting models
+  # rename/split/add entries), transpose_rules (optional dict of substring to axis
+  # permutation; the first substring contained in the state key causes the delta
+  # to be transposed by that permutation).
+  # Behavior: deletes output_dir if it exists and recreates it. Walks the model
+  # graph; for each LoRAParam, groups by the parent path: the first param seen for
+  # a path must have 'lora_a' in its name, the second 'lora_b'. Applies the custom
+  # extractor if given. Loads local_model_path + '/model.safetensors' as numpy
+  # arrays. For each layer: maps to state key (must exist), takes raw values,
+  # reshapes 3D lora_a (d0,d1,d2) to (d0*d1, d2) and 3D lora_b (d0,d1,d2) to
+  # (d0, d1*d2), computes (a @ b) * alpha / rank, optionally transposes, casts to
+  # the base dtype and adds in place. Saves the merged dict to
+  # output_dir/model.safetensors and copies every regular non-.safetensors file
+  # (config, tokenizer...) from the source directory.
+  # Outputs: none. Raises: AssertionError when the lora_a/lora_b ordering is wrong
+  # or a state key is missing; I/O errors from file operations.
+  # Side effects: removes and rewrites output_dir; reads the whole checkpoint into
+  # host memory.
+  # KNOWN ISSUE: only a single 'model.safetensors' file is supported (sharded
+  # checkpoints with index files are not merged; their shard files would also not
+  # be copied). The transpose_rules argument is not described in the docstring.
+  # Adding a jax array to a numpy array in place relies on implicit conversion.
   """Saves a model with LoRA weights merged in safetensors format.
 
   This is a generic function that can be used for any model architecture.

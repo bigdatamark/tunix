@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for ORPO (odds-ratio preference optimization) support in
+# tunix.sft.dpo.dpo_trainer (imported as orpo_lib): ORPOTrainer with
+# ORPOTrainingConfig(algorithm 'orpo') trains without a reference model,
+# logs reward metrics plus odds_ratio, dpo_loss_fn in ORPO mode with
+# lambda_orpo, and _prepare_inputs (no reference log-probs needed).
+# Module setup: disables jax_threefry_partitionable globally.
 from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -29,14 +36,22 @@ jax.config.update("jax_threefry_partitionable", False)
 
 
 class MySource(grain.RandomAccessDataSource):
+  # [CLASS DOC]
+  # HELPER: minimal grain RandomAccessDataSource over an indexable sequence.
 
   def __init__(self, data):
+    # [FUNCTION DOC]
+    # HELPER: stores the backing sequence.
     self._data = data
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the element at idx.
     return self._data[idx]
 
   def __len__(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the number of elements.
     return len(self._data)
 
 
@@ -49,6 +64,9 @@ def _dummy_dataset(
     rejected_ids: np.ndarray,
     rejected_mask: np.ndarray,
 ):
+  # [FUNCTION DOC]
+  # HELPER: grain MapDataset whose every element (source value ignored) is the
+  # same TrainingInput built from the given id/mask arrays.
   return grain.MapDataset.source(source).map(
       lambda x: orpo_lib.TrainingInput(
           prompt_ids=prompt_ids,
@@ -68,6 +86,10 @@ def _dummy_string_dataset(
     rejected_responses: list[str],
     return_dict=False,
 ):
+  # [FUNCTION DOC]
+  # HELPER: grain MapDataset whose every element is the same string batch, as
+  # DataInput or (return_dict True) a dict with prompts, chosen_responses and
+  # rejected_responses keys.
   ds = grain.MapDataset.source(source)
   if return_dict:
     return ds.map(
@@ -88,6 +110,8 @@ def _dummy_string_dataset(
 
 
 class ORPOTrainerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for ORPOTrainer, ORPO loss and input preparation.
 
   @parameterized.named_parameters(
       dict(
@@ -109,6 +133,10 @@ class ORPOTrainerTest(parameterized.TestCase):
       rejected_ids,
       rejected_mask,
   ):
+    # [FUNCTION DOC]
+    # Verifies ORPO training (10 steps, eval every 5, no ref model) updates
+    # params and logs rewards/*, log_probs/* and odds_ratio once per train step
+    # and 3 times for eval.
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
     orpo_config = orpo_lib.ORPOTrainingConfig(
@@ -187,6 +215,10 @@ class ORPOTrainerTest(parameterized.TestCase):
       ),
   )
   def test_orpo_trainer_with_string_inputs(self, train_ds):
+    # [FUNCTION DOC]
+    # Verifies ORPO training from string inputs (dataclass or dict) with
+    # MockVocab and length limits 3 updates params and logs reward metrics once
+    # per step.
     tokenizer = tc.MockVocab()
     model = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=tokenizer.GetPieceSize()),
@@ -226,6 +258,11 @@ class ORPOTrainerTest(parameterized.TestCase):
       )
 
   def test_orpo_loss_fn(self):
+    # [FUNCTION DOC]
+    # Verifies dpo_loss_fn with algorithm 'orpo', lambda_orpo 0.1: with
+    # compute_logps mocked to return seeded negative chosen/rejected sequence
+    # log-probs, the loss is a finite scalar and aux contains rewards/*,
+    # log_probs/* and odds_ratio with accuracy in [0, 1].
     """Test ORPO loss function directly with mocked logps."""
     np.random.seed(0)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
@@ -278,6 +315,9 @@ class ORPOTrainerTest(parameterized.TestCase):
       self.assertLessEqual(aux["rewards/accuracy"], 1.0)
 
   def test_orpo_prepare_inputs_for_strings(self):
+    # [FUNCTION DOC]
+    # Verifies ORPO _prepare_inputs on strings yields the same input_ids,
+    # attention-mask sums, completion mask and logits_to_keep 3 as DPO.
     tokenizer = tc.MockVocab()
 
     model = tc.ToyTransformer(
@@ -324,6 +364,10 @@ class ORPOTrainerTest(parameterized.TestCase):
     self.assertEqual(out.logits_to_keep, 3)
 
   def test_orpo_prepare_inputs(self):
+    # [FUNCTION DOC]
+    # Verifies ORPO _prepare_inputs on token inputs: concatenated prompt plus
+    # chosen/rejected ids, attention-mask sums 44/28/44/22, completion mask and
+    # logits_to_keep 4.
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     orpo_trainer = orpo_lib.ORPOTrainer(
         model=model,

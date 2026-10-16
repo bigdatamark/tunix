@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: small utility module for Gemma 3 multimodal models that scatters
+# vision (image soft-token) embeddings into the text embedding sequence at the
+# positions flagged by a mask. Pure JAX functions, no side effects.
 """Merge text and vision embeddings."""
 
 import einops
@@ -26,6 +30,14 @@ def merge_embeddings(
     vision_embeddings: jaxtyping.ArrayLike,  # (B, N, P, D)
     mask: jaxtyping.ArrayLike,  # (B, L)
 ) -> jaxtyping.ArrayLike:  # (B, L, D)
+  # [FUNCTION DOC]
+  # Merges vision embeddings into text embeddings per batch element (vmap over
+  # the batch axis of all three inputs of _merge_embeddings_inner).
+  # Inputs (keyword-only): text_embeddings [B, L, D], vision_embeddings
+  # [B, N_images, P_tokens_per_image, D], mask [B, L] (True at image
+  # placeholder positions; expected count per row equals N*P).
+  # Output: [B, L, D] with masked positions replaced by the flattened vision
+  # embeddings in order.
   """Merge the text and vision embeddings."""
   return jax.vmap(_merge_embeddings_inner, in_axes=(0, 0, 0))(
       text_embeddings, vision_embeddings, mask
@@ -37,6 +49,17 @@ def _merge_embeddings_inner(
     vision_embeddings: jaxtyping.ArrayLike,  # (N, P, D)
     mask: jaxtyping.ArrayLike,  # (L)
 ) -> jaxtyping.ArrayLike:  # (L, D)
+  # [FUNCTION DOC]
+  # HELPER: unbatched merge. Flattens vision embeddings to [N*P, D]; finds the
+  # first N*P indices where mask is true (jnp.nonzero with fixed size, missing
+  # entries filled with index 0); scatters the vision rows into those text
+  # positions; then restores text position 0 to its original embedding (so the
+  # fill index 0 used when there are fewer mask positions does not corrupt it).
+  # Output: [L, D].
+  # KNOWN ISSUE: if the mask has fewer than N*P true positions, the extra
+  # vision rows are all written to index 0 and then discarded; and if a real
+  # image token sits at position 0 its vision embedding is overwritten by the
+  # original text embedding.
   """`merge_embeddings` without batch dimension."""
 
   vision_embeddings = einops.rearrange(

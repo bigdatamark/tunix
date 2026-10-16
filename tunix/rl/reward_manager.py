@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Reward managers: objects that run one or more reward functions over a batch
+# of (prompt, completion) pairs, combine their outputs into one scalar reward
+# per completion, and prepare logging metrics. Defines the RewardFn alias, an
+# abstract base, the "sequence-level" manager and the "agentic-sequence-level"
+# manager; both are registered in function_registry at import time (side
+# effect). Setting environment variable TUNIX_DEBUG_REWARDS logs one example.
+# Metric dicts map metric name to a pair of value and aggregation function
+# (None for non-numeric values such as prompt text).
 """Reward output for RL."""
 
 import abc
@@ -33,6 +42,12 @@ def _calculate_scalar_reward_log_metrics(
     prefix: str = "rewards",
     axis: int = 1,
 ) -> Dict[str, Any]:
+  # [FUNCTION DOC]
+  # HELPER: Inputs: reward array, prefix (default "rewards"), axis (default 1).
+  # Returns a dict with keys prefix plus "/sum", "/mean", "/min", "/max", each
+  # mapping to a pair of the NaN-aware sum / NaN-aware mean / min / max along
+  # axis and the aggregation (mean for sum and mean, min for min, max for max).
+  # Min and max are not NaN-aware.
   """Helper to calculate sum, mean, min, and max log metrics for rewards."""
   return {
       f"{prefix}/sum": (np.nansum(rewards, axis=axis), np.mean),
@@ -43,6 +58,10 @@ def _calculate_scalar_reward_log_metrics(
 
 
 class AbstractRewardManager(abc.ABC):
+  # [CLASS DOC]
+  # Abstract base. State: reward_fns (list of callables) and algo_config.
+  # Subclasses implement __call__ returning a dict with "rewards" (one float per
+  # completion) and "log_metrics".
   """Abstract base class for managing and orchestrating multiple reward function outputs."""
 
   def __init__(
@@ -50,6 +69,10 @@ class AbstractRewardManager(abc.ABC):
       reward_fns: RewardFn | List[RewardFn],
       algo_config: algo_config_lib.AlgorithmConfig,
   ):
+    # [FUNCTION DOC]
+    # Wraps a non-sequence reward_fns into a one-element list (sequences are kept
+    # as is). Raises ValueError if the resulting list is empty. Stores
+    # algo_config.
     """Initializes the manager with a list of callable reward function objects.
 
     Args:
@@ -75,6 +98,9 @@ class AbstractRewardManager(abc.ABC):
       completions: List[str],
       **kwargs,
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # Abstract. Inputs: prompts, completions, extra keyword args for reward
+    # functions. Must return a rewards info dict. Base body does nothing.
     """Computes the rewards for completions using the provided reward functions.
 
     Args:
@@ -91,6 +117,9 @@ class AbstractRewardManager(abc.ABC):
 
 @function_registry.register_reward_manager("sequence-level")
 class SequenceRewardManager(AbstractRewardManager):
+  # [CLASS DOC]
+  # Registered as "sequence-level". Computes one reward per completion by
+  # summing (NaN-aware) the outputs of all reward functions.
   """Reward manager for sequence-level rewards only."""
 
   def __init__(
@@ -99,6 +128,8 @@ class SequenceRewardManager(AbstractRewardManager):
       algo_config: algo_config_lib.AlgorithmConfig,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Accepts and ignores extra kwargs; delegates to the base initializer.
     """Initializes the manager with a list of callable reward function objects."""
     super().__init__(reward_fns, algo_config)
 
@@ -108,6 +139,8 @@ class SequenceRewardManager(AbstractRewardManager):
       completions: List[str],
       **kwargs,
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns _compute_rewards(prompts, completions, kwargs).
     """Computes the rewards for completions using the provided reward function, and return the sequence-level rewards information for advantage computationand logging."""
     return self._compute_rewards(prompts, completions, **kwargs)
 
@@ -117,6 +150,22 @@ class SequenceRewardManager(AbstractRewardManager):
       completions: List[str],
       **kwargs,
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # Inputs: prompts, completions, extra kwargs (e.g. dataset columns, mode).
+    # Converts algo_config to a dict. Builds a zeros matrix of prompt count by
+    # number of reward functions. For each reward function: inspects its
+    # signature; for each parameter other than self, prompts, completions and
+    # kwargs whose name is an algo_config field and is not already in the
+    # caller's kwargs, injects the config value. Calls the function with
+    # prompts, completions and the merged kwargs. Raises RuntimeError if it
+    # returns None or a list of the wrong length. Stores the result as a column.
+    # Then builds log metrics, computes per-row NaN-aware sums as final rewards,
+    # and if TUNIX_DEBUG_REWARDS is set logs the first example of each metric.
+    # Returns a dict with "rewards" (1-D array) and "log_metrics".
+    # KNOWN ISSUE: the comment says parameter named kwargs is skipped, but a
+    # VAR_KEYWORD parameter is named by the function author, so this only
+    # matches the literal name; non-list results of wrong length are only caught
+    # by NumPy broadcasting errors.
     """Computes the rewards for completions using the provided reward functions."""
 
     algo_config_params = asdict(self.algo_config)
@@ -174,10 +223,16 @@ class SequenceRewardManager(AbstractRewardManager):
     }
 
     def _log_one_example(log_metrics: Dict[str, Any]):
+      # [FUNCTION DOC]
+      # HELPER: Logs a header, then for each metric the first element of its first
+      # value as a string snippet, then a footer, via absl info logging.
       logging.info("======= example rewards =======")
 
       # add a snippet of the prompt, completion, and reward
       def snippet(s: str, k: int = 50):
+        # [FUNCTION DOC]
+        # HELPER: Returns s unchanged if at most 2k chars (k default 50), else the
+        # first k chars, an ellipsis and the last k chars.
         if len(s) <= 2 * k:
           return s
         return s[:k] + "..." + s[-k:]
@@ -197,6 +252,14 @@ class SequenceRewardManager(AbstractRewardManager):
       completions: List[str],
       rewards: np.ndarray,  # (num_prompts, num_reward_fns)
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds the logging dict: "prompts" and "completions" (raw lists,
+    # aggregation None), the rewards sum/mean/min/max across reward functions
+    # per example (axis 1), and for each reward function "rewards/" plus its
+    # __name__ mapping to its column with mean aggregation. Returns the dict.
+    # KNOWN ISSUE: callables without a __name__ attribute (e.g. functools.partial
+    # objects) raise AttributeError; the comment mentions an rl_cluster
+    # attribute that does not exist.
     """Logs individual and summed rewards, along with prompts/completions, for each trajectory."""
     # Assuming self.reward_fns and self.rl_cluster are accessible instance attributes
     metrics_to_log = {}
@@ -220,6 +283,10 @@ class SequenceRewardManager(AbstractRewardManager):
 
 @function_registry.register_reward_manager("agentic-sequence-level")
 class AgenticSequenceRewardManager(SequenceRewardManager):  # pytype: disable=base-class-error
+  # [CLASS DOC]
+  # Registered as "agentic-sequence-level". Final reward per trajectory is the
+  # environment-provided trajectory reward plus, if any reward functions are
+  # configured, their NaN-aware summed rewards.
   """Reward manager for agentic settings.
 
   Supports two reward sources:
@@ -237,6 +304,10 @@ class AgenticSequenceRewardManager(SequenceRewardManager):  # pytype: disable=ba
       algo_config: algo_config_lib.AlgorithmConfig,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # If reward_fns is None, sets an empty reward list and stores algo_config
+    # without validation; otherwise uses the parent initializer (which rejects
+    # empty lists). Extra kwargs are ignored.
     if reward_fns is None:
       self.reward_fns = []
       self.algo_config = algo_config
@@ -249,6 +320,17 @@ class AgenticSequenceRewardManager(SequenceRewardManager):  # pytype: disable=ba
       completions: List[str],
       **kwargs,
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # Inputs: prompts, completions, kwargs that must contain
+    # "trajectory_rewards" (KeyError otherwise; it is removed from kwargs).
+    # Converts trajectory rewards to an array, logs their sum/mean/min/max over
+    # axis 0 under prefix "trajectory_rewards" (scalars). If reward functions
+    # exist, computes their rewards with the remaining kwargs, adds them to the
+    # trajectory rewards and merges their log metrics. Returns a dict with
+    # "rewards" and "log_metrics".
+    # KNOWN ISSUE: the addition is in place, so when trajectory_rewards is
+    # already a float NumPy array the caller's array is modified; an integer
+    # array would raise a casting error when adding float rewards.
 
     log_metrics = {}
 

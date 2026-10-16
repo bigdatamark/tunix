@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Flax NNX implementation of the Qwen2 / Qwen2.5 decoder-only transformer (also
+# used for DeepSeek-R1-Distill-Qwen). Same overall structure as the Llama3
+# module (pre-norm decoder layers with GQA attention, gated SiLU MLP, RMSNorm,
+# RoPE) with these differences: q/k/v projections have biases; computation
+# dtype and parameter dtype are configurable; RoPE sin/cos are precomputed once
+# per forward in high precision; an optional TPU splash (flash) attention path
+# via shard_map is available for the no-cache case; sequence-parallel ('sp')
+# sharding can be enabled.
+# Module-level definitions: K_MASK (large negative attention-logit mask value),
+# LayerCache (dict with 'k', 'v', 'end_index'), Cache (dict 'layer_<i>' ->
+# LayerCache). Side effect at import: env_utils.setup_sharding_environment().
+# Shape letters: B batch, T query length, S key length, D embed, N query heads,
+# K kv heads, H head dim, F MLP hidden, V vocab.
 """Qwen2 model."""
 
 import dataclasses
@@ -42,6 +56,10 @@ Cache = dict[str, LayerCache]
 
 
 class RematConfig(enum.Enum):
+  # [CLASS DOC]
+  # Enum of rematerialization policies: NONE, BLOCK (remat attention and MLP
+  # blocks), DECODER (remat whole decoder layers). Compared against members and
+  # their values.
   NONE = enum.auto()  #  No remat, all activations will be stored in HBM.
   BLOCK = enum.auto()  # Remat the entire attn block.
   DECODER = enum.auto()  # Remat the entire decoder layer.
@@ -49,6 +67,13 @@ class RematConfig(enum.Enum):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardingConfig:
+  # [CLASS DOC]
+  # Frozen dataclass of PartitionSpec tuples for weights and activations: the
+  # Llama3 set (emb_vd, emb_dv, q_weight_dnh, kv_weight_dnh, o_weight_nhd,
+  # ffw_weight_df, ffw_weight_fd, rms_norm_weight, act_btd, act_btf, act_btnh)
+  # plus exp_weight_cdf / exp_weight_cfd (expert weights, unused by Qwen2) and
+  # qkv_bias.
+  # KNOWN ISSUE: the docstring says "Qwen3" though this is the Qwen2 module.
   """Sharding configuration for Qwen3 model."""
 
   emb_vd: Tuple[str | None, ...]
@@ -68,6 +93,13 @@ class ShardingConfig:
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False, enable_sp: bool = False):
+    # [FUNCTION DOC]
+    # Static factory for the default layout over mesh axes 'fsdp', 'tp' and
+    # optionally 'sp'. is_sampling drops 'fsdp' from weight specs and the 'tp'
+    # sharding of act_btd's last dim. enable_sp (only when not sampling) makes the
+    # model-dim weight axis the tuple ('fsdp', 'sp') and shards activation sequence
+    # dims on 'sp'. Expert weights shard expert dim on 'fsdp' and hidden on 'tp';
+    # qkv_bias and rms norm weight on 'tp'. Returns a ShardingConfig.
     fsdp = 'fsdp' if not is_sampling else None
     sp = 'sp' if (not is_sampling and enable_sp) else None
     fsdp = (fsdp, sp) if fsdp and sp else fsdp
@@ -92,6 +124,13 @@ class ShardingConfig:
 
 @dataclasses.dataclass(slots=True)
 class ModelConfig:
+  # [CLASS DOC]
+  # Mutable slotted dataclass of Qwen2 hyperparameters: num_layers, vocab_size,
+  # embed_dim, hidden_dim, num_heads, head_dim, num_kv_heads, rope_theta,
+  # norm_eps, use_tied_embedding (embedding reused as LM head), shd_config,
+  # remat_config, dtype (computation dtype), param_dtype, use_flash_attention
+  # (splash attention when no cache) and flash_attention_block_size. Classmethod
+  # presets are named after tunix config ids.
   """Configuration for the Qwen2 model."""
 
   num_layers: int
@@ -114,6 +153,9 @@ class ModelConfig:
   # qwen2.5-0.5B and qwen2.5-coder-0.5B share the same config.
   @classmethod
   def qwen2p5_0p5b(cls):  # qwen2.5-0.5B
+    # [FUNCTION DOC]
+    # Preset for Qwen2.5-0.5B (also coder): 24 layers, vocab 151936, embed 896,
+    # MLP 4864, 14 heads of dim 64, 2 KV heads, eps 1e-6, rope theta 1e6, tied.
     return cls(
         num_layers=24,
         vocab_size=151936,
@@ -129,15 +171,23 @@ class ModelConfig:
 
   @classmethod
   def qwen2p5_0p5b_instruct(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_0p5b (instruct).
     return cls.qwen2p5_0p5b()
 
   @classmethod
   def qwen2p5_coder_0p5b(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_0p5b (coder).
     return cls.qwen2p5_0p5b()
 
   # DeepSeek-R1-Distill-Qwen-1.5B
   @classmethod
   def deepseek_r1_distill_qwen_1p5b(cls):
+    # [FUNCTION DOC]
+    # Preset for DeepSeek-R1-Distill-Qwen-1.5B: 28 layers, vocab 151936, embed
+    # 1536, MLP 8960, 12 heads of dim 128, 2 KV heads, eps 1e-6, rope theta 10000,
+    # untied LM head.
     return cls(
         num_layers=28,
         vocab_size=151936,
@@ -153,6 +203,9 @@ class ModelConfig:
 
   @classmethod
   def qwen2p5_1p5b(cls):  # qwen2.5-1.5B
+    # [FUNCTION DOC]
+    # Preset for Qwen2.5-1.5B: 28 layers, vocab 151936, embed 1536, MLP 8960, 12
+    # heads of dim 128, 2 KV heads, eps 1e-6, rope theta 1e6, tied.
     return cls(
         num_layers=28,
         vocab_size=151936,
@@ -168,10 +221,14 @@ class ModelConfig:
 
   @classmethod
   def qwen2p5_1p5b_instruct(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_1p5b (instruct).
     return cls.qwen2p5_1p5b()
 
   @classmethod
   def qwen2p5_math_1p5b(cls):  # qwen2.5-math-1.5B
+    # [FUNCTION DOC]
+    # Preset for Qwen2.5-Math-1.5B: as qwen2p5_1p5b but rope theta 10000.
     return cls(
         num_layers=28,
         vocab_size=151936,
@@ -188,6 +245,9 @@ class ModelConfig:
   # qwen2.5-coder-3B and qwen2.5-3B share the same config.
   @classmethod
   def qwen2p5_3b(cls):
+    # [FUNCTION DOC]
+    # Preset for Qwen2.5-3B (also coder): 36 layers, vocab 151936, embed 2048, MLP
+    # 11008, 16 heads of dim 128, 2 KV heads, eps 1e-6, rope theta 1e6, tied.
     return cls(
         num_layers=36,
         vocab_size=151936,
@@ -203,15 +263,22 @@ class ModelConfig:
 
   @classmethod
   def qwen2p5_3b_instruct(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_3b (instruct).
     return cls.qwen2p5_3b()
 
   @classmethod
   def qwen2p5_coder_3b(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_3b (coder).
     return cls.qwen2p5_3b()
 
   # qwen2.5-7B and qwen2.5-coder-7B share the same config.
   @classmethod
   def qwen2p5_7b(cls):
+    # [FUNCTION DOC]
+    # Preset for Qwen2.5-7B (also coder): 28 layers, vocab 152064, embed 3584, MLP
+    # 18944, 28 heads of dim 128, 4 KV heads, eps 1e-6, rope theta 1e6, untied.
     return cls(
         num_layers=28,
         vocab_size=152064,
@@ -227,16 +294,23 @@ class ModelConfig:
 
   @classmethod
   def qwen2p5_7b_instruct(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_7b (instruct).
     return cls.qwen2p5_7b()
 
   @classmethod
   def qwen2p5_coder_7b(cls):
+    # [FUNCTION DOC]
+    # Preset alias of qwen2p5_7b (coder).
     return cls.qwen2p5_7b()
 
   # TODO(linchai): add other qwen2.5 model configs.
 
 
 def shard(x: jnp.ndarray, s: Tuple[str, ...]):
+  # [FUNCTION DOC]
+  # HELPER: Constrains activation x to PartitionSpec s on the current thread's
+  # physical mesh; returns x unchanged when there is no mesh or devices are CPU.
   mesh = pxla.thread_resources.env.physical_mesh
   if mesh.empty or jax.devices()[0].platform == 'cpu':
     return x
@@ -246,6 +320,9 @@ def shard(x: jnp.ndarray, s: Tuple[str, ...]):
 
 
 class Einsum(nnx.Module):
+  # [CLASS DOC]
+  # Parameterized einsum with weight w; casts input and weight to the
+  # computation dtype before contracting.
   """Einsum is a convenience module for parameterized tensor multiplication."""
 
   def __init__(
@@ -258,6 +335,9 @@ class Einsum(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Stores einsum_str, shape, dtype, param_dtype and creates w of the given shape
+    # in param_dtype using Glorot-uniform init (one RNG key) with the given sharding.
     self.einsum_str = einsum_str
     self.shape = shape
     self.dtype = dtype
@@ -271,12 +351,16 @@ class Einsum(nnx.Module):
 
   @jax.named_scope('einsum')
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x and w to self.dtype and returns their einsum per einsum_str.
     x = jnp.astype(x, self.dtype)
     w = jnp.astype(self.w.value, self.dtype)
     return jnp.einsum(self.einsum_str, x, w)
 
 
 class Embedder(nnx.Module):
+  # [CLASS DOC]
+  # Token embedding table [V, D] with encode (lookup) and decode (tied logits).
   """Embedder module."""
 
   def __init__(
@@ -289,6 +373,9 @@ class Embedder(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Creates input_embedding with standard normal values in param_dtype drawn from
+    # rngs.params, with out_sharding emb_vd; stores shd_config and dtype.
     self.input_embedding = nnx.Param(
         rngs.params.normal((vocab_size, embed_dim), dtype=param_dtype),
         out_sharding=shd_config.emb_vd,
@@ -298,6 +385,9 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_encode')
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Looks up embeddings for token ids [B,T], casts to dtype, shards with act_btd
+    # and returns [B,T,D].
     x = self.input_embedding[(x,)]
     x = jnp.astype(x, self.dtype)
     x = shard(x, self.shd_config.act_btd)
@@ -305,6 +395,9 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_decode')
   def decode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x and the table to dtype and returns x times the transposed table,
+    # i.e. logits [..., V].
     x = jnp.astype(x, self.dtype)
     w = jnp.astype(self.input_embedding.value, self.dtype)
     return jnp.dot(x, w.T)
@@ -315,6 +408,15 @@ def _generate_pos_embeddings(
     features: int,
     rope_theta: int,
 ) -> tuple[jax.Array, jax.Array]:
+  # [FUNCTION DOC]
+  # HELPER: Precomputes RoPE sinusoids. Inputs: positions [B,T], features (head
+  # dim), rope_theta. Inverse frequencies are 1 / theta^(2i/features) for i in
+  # [0, features/2). Computes the outer product positions x frequency with
+  # HIGHEST precision (bf16 rounding of positions would be catastrophic) giving
+  # [B,T,features/2], and returns (sin, cos) of it.
+  # KNOWN ISSUE: the docstring mentions min/max timescales and says the outputs
+  # are [length, features//2]; actually they are [B, T, features//2]; the arg is
+  # misspelled 'postions' in the docstring.
   """Generate Sin/Cos for Rotary Embeddings.
 
   Generates sinusoids at (features//2) different timescales, where the
@@ -357,6 +459,12 @@ def _generate_pos_embeddings(
 def apply_rotary_embedding(
     x: jax.Array, sin: jax.Array, cos: jax.Array
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Applies rotate-half RoPE: x is [B,T,N,H] and sin/cos are [B,T,H/2]
+  # (asserted 4D and 3D, AssertionError otherwise). Splits x's last dim into
+  # halves x1, x2, broadcasts sin/cos over the head axis, and returns
+  # concat(x1*cos - x2*sin, x2*cos + x1*sin). The result dtype follows JAX
+  # promotion of x with float32 sin/cos (not cast back).
   assert x.ndim == 4 and sin.ndim == 3 and cos.ndim == 3
   x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
   # [B, T, head_dim] -> [B, h, T, head_dim]
@@ -365,6 +473,8 @@ def apply_rotary_embedding(
 
 
 class RMSNorm(nnx.Module):
+  # [CLASS DOC]
+  # RMSNorm with learned scale w (ones init) computed in float32.
   """RMSNorm layer."""
 
   def __init__(
@@ -376,6 +486,9 @@ class RMSNorm(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Creates w = ones(dim) in param_dtype with out_sharding rms_norm_weight and
+    # stores norm_eps and dtype. Does not use an RNG.
     self.w = nnx.Param(
         jnp.ones(dim, param_dtype),
         out_sharding=shd_config.rms_norm_weight,
@@ -385,6 +498,9 @@ class RMSNorm(nnx.Module):
 
   @jax.named_scope('rms_norm')
   def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x to float32, divides by sqrt(mean(x^2 over last axis) + eps),
+    # multiplies by w (float32) and casts to self.dtype.
     x = jnp.astype(x, jnp.float32)
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.norm_eps)
     return jnp.astype(
@@ -394,6 +510,11 @@ class RMSNorm(nnx.Module):
 
 
 class Attention(nnx.Module):
+  # [CLASS DOC]
+  # Grouped-query self-attention with q/k/v biases, precomputed RoPE, optional
+  # KV cache, optional sequence-packing segment ids and optional TPU splash
+  # attention. Parameters: q_proj [D,N,H], k_proj/v_proj [D,K,H], o_proj
+  # [N,H,D] (Einsum), q_bias [N*H], k_bias and v_bias [K*H] (flat vectors).
   """Attention module."""
 
   def __init__(
@@ -402,6 +523,10 @@ class Attention(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates the projections with config dtypes and shardings, stores config,
+    # shd_config, n_rep (unused) and scale = head_dim^-0.5, and creates the three
+    # bias vectors initialized to zeros in param_dtype with qkv_bias sharding.
     self.config = config
     self.shd_config = config.shd_config
     self.q_proj = Einsum(
@@ -464,6 +589,34 @@ class Attention(nnx.Module):
       cos: jaxtyping.Array,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Core attention. Inputs: x [B,T,D]; cache (dict 'k','v' [B,S,K,H],
+    # 'end_index' [B]) or None; attn_mask boolean [B,T,S] or None; sin, cos
+    # [B,T,H/2]; segment_ids [B,T] or None (tokens attend only within equal ids).
+    # Steps: project q, k, v; add the flat biases (cast to compute dtype) after
+    # flattening heads, then restore [B,T,heads,H]; shard with act_btnh; apply RoPE
+    # to q and k. With a cache, write new k/v at offset end_index[0] mod cache
+    # length (shared across batch) and use the full buffers as keys/values.
+    # Flash path (use_flash_attention and T > 1): transpose to [B,heads,T,H],
+    # pre-scale q, build a causal multi-head splash mask of size (T,T) for all
+    # query heads, block sizes all equal to flash_attention_block_size, compute
+    # head/sequence shard counts from the mesh axes named in act_btnh, build the
+    # splash MHA kernel and run it per-batch-element (vmap) inside shard_map with q
+    # sharded and k/v unsharded on sequence; with segment_ids, pass them as splash
+    # SegmentIds; transpose back to [B,T,N,H].
+    # Default path: GQA einsum logits [B,K,N/K,T,S] times scale; mask with K_MASK
+    # where attn_mask is False and, if segment ids are given, where q and kv
+    # segment ids differ; float32 softmax cast to k dtype; weighted sum of values;
+    # reshape to [B,T,N,H].
+    # Finally o_proj and shard to act_btd. Returns (new_cache with updated k, v
+    # and end_index + T, or None; outputs [B,T,D]).
+    # Raises: AssertionError from RoPE on bad ranks; splash/shard_map errors when
+    # shapes are not divisible by block sizes or mesh axes.
+    # KNOWN ISSUE: the flash path ignores attn_mask (padding masks are not applied,
+    # only causal and segment masking) and assumes keys have the same length as the
+    # queries, so it is wrong when a cache is present with T > 1 (prefill into a
+    # longer cache). In the default path the segment mask is built as [B,T,T] and
+    # only matches the logits when S == T (i.e. no longer cache).
     """Attention block."""
     seq_len = x.shape[1]
 
@@ -664,6 +817,9 @@ class Attention(nnx.Module):
       cos: jaxtyping.Array,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat (unbound function, self first) when
+    # remat_config is BLOCK. Same inputs/outputs as block.
     if (
         self.config.remat_config == RematConfig.BLOCK
         or self.config.remat_config == RematConfig.BLOCK.value
@@ -678,18 +834,28 @@ class Attention(nnx.Module):
 
   @property
   def head_dim(self):
+    # [FUNCTION DOC]
+    # Returns head dim H from o_proj's shape (index 1).
     return self.o_proj.shape[1]
 
   @property
   def num_heads(self):
+    # [FUNCTION DOC]
+    # Returns number of query heads from q_proj's shape.
+    # KNOWN ISSUE: uses index 0, which is embed_dim D for shape [D,N,H].
     return self.q_proj.shape[0]
 
   @property
   def num_kv_heads(self):
+    # [FUNCTION DOC]
+    # Returns number of KV heads from k_proj's shape (index 1).
     return self.k_proj.shape[1]
 
 
 class MLP(nnx.Module):
+  # [CLASS DOC]
+  # Gated SiLU feed-forward network: down(silu(gate(x)) * up(x)) with bias-free
+  # nnx.Linear layers in config dtype/param_dtype.
   """MLP module."""
 
   def __init__(
@@ -698,6 +864,9 @@ class MLP(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates gate_proj, up_proj (D -> F, ffw_weight_df) and down_proj (F -> D,
+    # ffw_weight_fd) with zero-initialized kernels (to be overwritten by loading).
     self.config = config
     self.shd_config = config.shd_config
     kernel_init_fn = nnx.initializers.zeros_init()
@@ -739,6 +908,8 @@ class MLP(nnx.Module):
       self,
       x: jaxtyping.Array,
   ) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Computes silu(gate(x)) * up(x), shards with act_btf, returns down_proj of it.
     activations = nnx.silu(self.gate_proj(x)) * self.up_proj(x)
     activations = shard(activations, self.shd_config.act_btf)
     outputs = self.down_proj(activations)
@@ -746,6 +917,8 @@ class MLP(nnx.Module):
 
   @jax.named_scope('feed_forward')
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat when remat_config is BLOCK.
     if (
         self.config.remat_config == RematConfig.BLOCK
         or self.config.remat_config == RematConfig.BLOCK.value
@@ -756,6 +929,9 @@ class MLP(nnx.Module):
 
 
 class DecoderLayer(nnx.Module):
+  # [CLASS DOC]
+  # Pre-norm decoder layer: residual attention followed by residual MLP, each
+  # preceded by an RMSNorm.
   """DecoderLayer."""
 
   def __init__(
@@ -764,6 +940,9 @@ class DecoderLayer(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates input_layernorm, attn, post_attention_layernorm and mlp from config
+    # (norms use no RNG).
     self.config = config
     self.input_layernorm = RMSNorm(
         config.embed_dim,
@@ -797,6 +976,10 @@ class DecoderLayer(nnx.Module):
       cos,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Computes h = x + attn(input_layernorm(x), ...) and out = h +
+    # mlp(post_attention_layernorm(h)), forwarding cache, mask, sin/cos and
+    # segment ids. Returns (updated cache or None, out [B,T,D]).
     inputs_normalized = self.input_layernorm(x)
     cache, attn_output = self.attn(
         inputs_normalized,
@@ -822,6 +1005,8 @@ class DecoderLayer(nnx.Module):
       cos,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat when remat_config is DECODER. Same signature.
     if (
         self.config.remat_config == RematConfig.DECODER
         or self.config.remat_config == RematConfig.DECODER.value
@@ -847,6 +1032,11 @@ class DecoderLayer(nnx.Module):
 
 
 class Qwen2(BackendMappingMixin, nnx.Module):
+  # [CLASS DOC]
+  # Top-level Qwen2/Qwen2.5 causal LM. BackendMappingMixin uses
+  # BACKEND_PACKAGE_PATH (this module's name) to find the package's
+  # BACKEND_MAPPINGS for rollout weight sync. Submodules: embedder, layers,
+  # final_norm, and lm_head when embeddings are not tied.
   """Qwen2.5 model."""
 
   BACKEND_PACKAGE_PATH = __name__
@@ -857,6 +1047,10 @@ class Qwen2(BackendMappingMixin, nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Builds embedder, num_layers DecoderLayers, final RMSNorm and, unless
+    # use_tied_embedding, an lm_head Einsum [D,V] with emb_dv sharding. Consumes
+    # RNG keys.
     self.config = config
     self.embedder = Embedder(
         vocab_size=config.vocab_size,
@@ -895,6 +1089,17 @@ class Qwen2(BackendMappingMixin, nnx.Module):
       output_hidden_states: bool = False,
       segment_ids: jaxtyping.Array | None = None,  # [B, L]
   ) -> tuple[jaxtyping.Array, Cache | None]:
+    # [FUNCTION DOC]
+    # Forward pass. Inputs: input_tokens [B,L], positions [B,L], cache or None,
+    # attention_mask [B,L,L'] or None, output_hidden_states (if True, sows the
+    # final-normed hidden states as an nnx.Intermediate named
+    # 'all_hidden_states'), segment_ids [B,L] or None for packed sequences.
+    # Embeds tokens, computes RoPE sin/cos from positions (cast to activation
+    # dtype), runs each layer with its 'layer_<i>' cache when cache is truthy and
+    # collects updated caches into a new dict when a cache was given, applies the
+    # final norm, computes logits via tied embedding or lm_head and returns
+    # (logits cast to float32 [B,L,V], new cache or None).
+    # Side effects: sow when output_hidden_states.
     """Qwen2 model.
 
     Args:
@@ -943,6 +1148,9 @@ class Qwen2(BackendMappingMixin, nnx.Module):
     return jnp.astype(logits, jnp.float32), new_cache  # pytype: disable=bad-return-type
 
   def get_model_input(self):
+    # [FUNCTION DOC]
+    # Returns dummy forward kwargs: tokens and positions of ones [2,1] int32
+    # (batch 2 for FSDP on two devices), cache None, attention_mask ones [2,1,1].
     """Returns a dummy model input for the transformer.
 
     This dummy input has a batch size compatible with FSDP sharding on a

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.utils.math_utils.grade_answer_special_handling, which
+# compares a model answer with a ground-truth LaTeX answer using special
+# equivalence rules (recurring decimals, malformed sqrt cleanup, interval
+# unions written as inequalities). No side effects.
 """Tests for tunix.utils.math_utils special handling."""
 
 from absl.testing import absltest
@@ -20,6 +25,8 @@ from tunix.utils import math_utils
 
 
 class MathUtilsSpecialHandlingTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for the special-handling answer grader.
 
   @parameterized.named_parameters(
       dict(
@@ -62,6 +69,11 @@ class MathUtilsSpecialHandlingTest(parameterized.TestCase):
   def test_grade_answer_special_handling(
       self, given_answer: str, ground_truth: str, expected: bool
   ):
+    # [FUNCTION DOC]
+    # Verifies grade_answer_special_handling(given_answer, ground_truth) returns
+    # the expected bool: rounded values of an overlined recurring decimal match,
+    # '\sqrt{}{3}' is cleaned to '\sqrt{3}', 'a<=x<=b or c<=x<=d' matches
+    # '[a,b] U [c,d]', and a malformed interval (missing bracket) does not match.
     self.assertEqual(
         math_utils.grade_answer_special_handling(given_answer, ground_truth),
         expected,

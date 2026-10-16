@@ -5,6 +5,36 @@ a single mesh. Hyperparameters are exposed via argparse; the rollout backend
 is selected via the ``ROLLOUT_ENGINE`` environment variable ("vllm" or
 "vanilla", default "vllm").
 """
+# [MODULE DOC]
+# Script (top-level code) that trains Qwen3-8B on agentic FrozenLake with tunix's agentic GRPOLearner
+# on a single TPU host, using one shared mesh for actor, reference and rollout. Steps:
+# 1. Configures Python/absl logging to INFO; imports tunix modules and the FrozenLake agent/env;
+# tries pathwaysutils.initialize() and, if that fails, jax.distributed.initialize() (errors printed).
+# 2. Parses known CLI args (defaults): batch_size 64, mini_batch_size 64, learning_rate 1e-6, b1 0.9,
+# b2 0.95, weight_decay 0.0, num_batches 150, num_generations 8, beta 0.0, epsilon 0.003,
+# epsilon_high 0.005, loss_algo "gspo-token", max_prompt_length 2048, max_response_length 2048,
+# temperature 0.7, top_p 1.0, top_k 0 (no filtering, so rollout and trainer logprobs are comparable),
+# max_concurrency 256, shuffle_data True, seed 42, loss_agg_mode, kl_loss_mode, advantage_estimator
+# "rloo". Constants: 3 epochs, MAX_STEPS = num_batches * 3, eval every 10 steps on 2 test batches,
+# no warmup, grad clip 100 (effectively off), checkpointing disabled (CKPT_DIR None), TensorBoard at
+# /tmp/tunix-tb/frozenlake, ROLLOUT_ENGINE from env (default "vllm").
+# 3. Builds a shared mesh of shape (1, device_count) with axes ("fsdp","tp"); raises ValueError if
+# too few devices.
+# 4. Reads data from /tmp/data/frozenlake/{train,test}.parquet via fsspec, uses a Qwen chat template
+# parser with thinking disabled, and builds train/val/test datasets.
+# 5. Downloads Qwen3-8B safetensors to /tmp/models/Qwen3-8B if no .safetensors files exist, builds the
+# qwen3_8b config (remat, flash attention, bf16 compute), and loads the reference model in bf16 and
+# the actor in fp32 storage (so tiny Adam updates are not rounded away).
+# 6. Builds metrics logger options (wandb config including model id and mesh shape), AdamW with
+# constant LR chained after clipping, rollout config (vllm: hbm utilization 0.2, server mode, sync
+# scheduling, random-init weights, dp/tp from the mesh; or vanilla; else ValueError), ClusterConfig with
+# micro-batch 4 for training and logp computation, GRPOConfig with token-level truncated importance
+# sampling (threshold 2.0), RLCluster, and GRPOLearner (FrozenLakeAgent with multistep prompt,
+# FrozenLakeEnv with max_steps 8, metric_fn), then trains with the test set as eval set.
+# Side effects: downloads, device memory, logging, global MAX_STEPS in the env module set to 8.
+# KNOWN ISSUE: WARMUP_STEPS is only logged; the optimizer uses a constant learning rate.
+# KNOWN ISSUE: --shuffle_data uses type=bool, so passing "False" still enables shuffling.
+# KNOWN ISSUE: vars(args) is mutated in place when building the wandb config.
 
 import contextlib
 import logging
@@ -274,6 +304,13 @@ def create_datasets(
     train_ds_path: str = TRAIN_DATA_PATH,
     test_ds_path: str = TEST_DATA_PATH,
 ):
+  # [FUNCTION DOC]
+  # Opens the train and test Parquet files through the module's file-open function, reads them into
+  # pandas DataFrames, wraps each in a Hugging Face datasets.Dataset, optionally shuffles both with SEED
+  # when args.shuffle_data is truthy, and wraps each in a grain MapDataset that maps process_item over
+  # rows. Inputs: train_ds_path, test_ds_path (default to module constants). Output: tuple
+  # (train MapDataset, test MapDataset); each row is a FrozenLake config dict (env_name, seed, size, p)
+  # plus an empty "prompts" field. Raises: IO/parquet errors. Side effects: remote/local file reads.
   with fsspec.open(train_ds_path, "rb") as train_f, fsspec.open(
       test_ds_path, "rb"
   ) as test_f:
@@ -287,6 +324,9 @@ def create_datasets(
     test_ds = test_ds.shuffle(SEED)
 
   def process_item(item):
+    # [FUNCTION DOC]
+    # HELPER: sets item["prompts"] to the empty string (the agent builds prompts from the env) and returns
+    # the mutated item.
     item["prompts"] = ""
     return item
 
@@ -515,6 +555,17 @@ _metric_call_idx = 0
 
 
 def metric_fn(prompts, completions, rewards, advantages, **kwargs):
+  # [FUNCTION DOC]
+  # Custom metric function passed to GRPOLearner (metric_fns). Input: rewards (numpy array of the
+  # group's trajectory rewards); prompts, completions, advantages and kwargs are ignored. Computes
+  # solve_all (all rewards above 0.1), solve_none (all rewards exactly 0), solve_partial (neither) and
+  # solve_ratio (fraction of rewards above 0.1). Output: dict mapping "rewards/solve_all",
+  # "rewards/solve_none", "rewards/solve_partial" (each 1 or 0) and "rewards/solve_ratio" to
+  # (value, np.mean) pairs, the second element being the aggregation function.
+  # KNOWN ISSUE: solve_all uses a 0.1 threshold but solve_none uses exact zero, so rewards in (0, 0.1]
+  # count as neither solved nor unsolved (they land in solve_partial).
+  # Also increments the module-global call counter _metric_call_idx and logs an info line with the call
+  # index, number of rewards, solve ratio, mean and max reward, solve_all and solve_none.
   del prompts, completions, advantages, kwargs
   global _metric_call_idx
   _metric_call_idx += 1

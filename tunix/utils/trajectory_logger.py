@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utilities for persisting trajectory data (dicts, dataclasses, or lists of
+# them) as CSV files, synchronously via log_item or asynchronously via
+# AsyncTrajectoryLogger, which batches items on a background daemon thread.
+# Supports local paths and GCS ("gs://") paths through etils epath. Values are
+# first converted to plain serializable Python structures.
 """Logging utilities for trajectory data, saving as CSV."""
 
 import atexit
@@ -33,6 +39,18 @@ import numpy as np
 import pandas as pd
 
 def _make_serializable(item: Any) -> Any:
+  # [FUNCTION DOC]
+  # HELPER: Recursively converts an object into JSON/CSV-friendly Python values.
+  # Rules, checked in order: dict -> dict with converted values (keys kept);
+  # list -> list of converted elements; tuple -> tuple of converted elements;
+  # dataclass instance -> converted dataclass-to-dict result; protobuf message ->
+  # dict via protobuf JSON-format conversion; numpy array -> converted nested
+  # list; numpy integer/floating/bool/str scalars -> Python int/float/bool/str;
+  # Python float/int/bool/str -> unchanged; anything else -> its string form,
+  # logging a warning (only the first time overall) naming the type.
+  # Output: converted value. Exceptions: none deliberate.
+  # Side effects: possible one-time warning log.
+  # KNOWN ISSUE: None is not handled explicitly and becomes the string "None".
   """Makes an object serializable."""
   if isinstance(item, dict):
     return {key: _make_serializable(value) for key, value in item.items()}
@@ -68,6 +86,9 @@ def _make_serializable(item: Any) -> Any:
 
 
 def _get_item_name(item: Any) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: Returns the class name of item if it is a dataclass (instance or
+  # class), else None.
   """Returns item class name if it's a dataclass, else None."""
   if dataclasses.is_dataclass(item):
     return item.__class__.__name__
@@ -77,6 +98,29 @@ def _get_item_name(item: Any) -> str | None:
 def log_item(
     log_path: str, item: dict[str, Any] | Any, suffix: str | None = None
 ):
+  # [FUNCTION DOC]
+  # Appends item(s) as CSV rows to a file in a directory.
+  # Inputs: log_path - directory path string (local or gs://); item - a dict,
+  #   dataclass instance, or non-empty list of these; suffix - optional string
+  #   appended to the filename stem with an underscore.
+  # Behavior: ValueError if log_path is None. Empty list -> warning and return.
+  #   Non dict/list/dataclass -> ValueError. Serialize item. Create the directory
+  #   (parents ok), assert it is a directory. Filename stem: dataclass class name
+  #   of the item (or of the first list element), else "trajectory_log"; name is
+  #   stem + optional "_" + suffix + ".csv". Logs the path once (first call).
+  #   Build a DataFrame with one row per list element (or one row).
+  #   For gs:// paths (no append support): if the file exists, try reading it as
+  #   CSV and concatenating old rows before new (read failure is logged and old
+  #   data dropped); write the whole frame with header to a temporary sibling
+  #   file named with the current timestamp's nanosecond component and ".tmp",
+  #   then rename it over the target; on failure log an error and delete the
+  #   temp file if present. For local paths: open in append mode and write rows,
+  #   writing the header only if the file did not exist beforehand.
+  # Output: None. Exceptions: ValueError as above; AssertionError if not a
+  #   directory. Side effects: filesystem writes, logging.
+  # KNOWN ISSUE: the temp file suffix uses only the nanosecond field (0-999) of
+  #   a timestamp, so concurrent writers can collide; also, appending rows whose
+  #   columns differ from the existing header misaligns local CSVs.
   """Logs a dictionary, dataclass or list to a csv file.
 
   The filename is determined by item type if it is a dataclass, otherwise
@@ -152,15 +196,40 @@ def log_item(
 
 
 class AsyncTrajectoryLogger:
+  # [CLASS DOC]
+  # Background CSV logger. Items queued with log_item_async are written by a
+  # daemon worker thread that drains the queue in batches and calls log_item
+  # with the batch (a list) and a suffix equal to the logger's creation time in
+  # integer seconds, so each logger instance writes its own files. A None value
+  # in the queue is the stop sentinel. Registers stop at interpreter exit and,
+  # when constructed on the main thread, handlers for SIGINT/SIGTERM/SIGHUP
+  # that flush and then re-raise the signal with default handling.
   """A logger that logs trajectories asynchronously in a background thread."""
 
   def __init__(self, log_dir: str):
+    # [FUNCTION DOC]
+    # Inputs: log_dir - output directory. Initializes the directory, file suffix
+    # (current Unix time in whole seconds as a string), an unbounded FIFO queue
+    # and stopped flag False; starts the daemon worker thread; registers stop
+    # with atexit; installs signal handlers if on the main thread (a ValueError
+    # from installation is logged as a warning). Logs a start message.
+    # Side effects: thread creation, global atexit and signal handler changes.
     self._log_dir = log_dir
     self._file_suffix = str(int(time.time()))
     self._logging_queue = queue.Queue()
     self._stopped = False
 
     def _worker():
+      # [FUNCTION DOC]
+      # HELPER: Worker loop. Blocks for an item; if it is the sentinel, marks it
+      # done and exits. Otherwise collects it plus all immediately available
+      # items without blocking; if the sentinel is encountered while draining,
+      # it is re-queued and draining stops. Logs the batch via log_item (any
+      # exception is logged, not raised) and finally marks every batch item
+      # done on the queue.
+      # KNOWN ISSUE: a sentinel taken during draining is re-queued without its
+      # own task_done, so the queue's unfinished count is incremented twice for
+      # one sentinel; join() in stop may then wait forever.
       while True:
         item = self._logging_queue.get()
         if item is None:  # Sentinel for stopping
@@ -206,6 +275,10 @@ class AsyncTrajectoryLogger:
     logging.info('Started trajectory logging thread.')
 
   def _handle_signal(self, signum: int, frame: types.FrameType):
+    # [FUNCTION DOC]
+    # HELPER: Signal handler. Inputs: signal number and frame (ignored). Logs,
+    # calls stop to flush, restores the default handler for that signal, and
+    # sends the same signal to the current process (normally terminating it).
     """Gracefully stops the logger and exits."""
     del frame  # Unused.
     logging.info('Received signal %d, flushing trajectory logger...', signum)
@@ -215,10 +288,18 @@ class AsyncTrajectoryLogger:
     os.kill(os.getpid(), signum)
 
   def __del__(self):
+    # [FUNCTION DOC]
+    # Finalizer: calls stop so pending items are flushed on garbage collection.
+    # Side effects: may block on queue join.
     """Ensures stop is called when the object is destroyed."""
     self.stop()
 
   def stop(self):
+    # [FUNCTION DOC]
+    # Idempotent stop. If already stopped, returns. Otherwise enqueues the
+    # sentinel, waits until all queued items are processed (queue join), joins
+    # the worker thread with a 10 second timeout, sets stopped True and logs.
+    # Output: None. Side effects: blocks the caller until the queue is drained.
     """Stops the background logging thread gracefully."""
     if self._stopped:
       return
@@ -230,6 +311,10 @@ class AsyncTrajectoryLogger:
     logging.info('Stopped trajectory logging thread.')
 
   def log_item_async(self, item: dict[str, Any] | Any):
+    # [FUNCTION DOC]
+    # Enqueues item (dict, dataclass, or list thereof) for background logging.
+    # If the logger is stopped, logs a warning and drops the item.
+    # Output: None. Side effects: queue insertion.
     """Adds an item to the logging queue to be logged asynchronously."""
     if self._stopped:
       logging.warning('Trajectory logger already stopped.')

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for tunix.generate.vllm_sampler.VllmSampler. Integration tests (VllmSamplerTest) download
+# meta-llama/Llama-3.2-1B-Instruct to the temp dir, compare greedy outputs of the vanilla Tunix sampler
+# and the vLLM sampler (batch, data-parallel and server modes), check concurrent requests from an executor
+# complete out of order, and check sampling kwargs from config and call are merged into vLLM
+# SamplingParams. Unit tests (VllmSamplerConfigTest) check parallelism plumbing with a mocked LLM.
+# Side effects at import: sets environment variable SKIP_JAX_PRECOMPILE to "1". Other side effects:
+# network downloads, device memory, prints.
 
 import asyncio
 import os
@@ -36,9 +44,14 @@ os.environ["SKIP_JAX_PRECOMPILE"] = "1"
 
 
 class VllmSamplerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Hardware integration tests for VllmSampler with a Llama 3.2 1B Instruct model.
 
   @classmethod
   def setUpClass(cls) -> None:
+    # [FUNCTION DOC]
+    # HELPER: class fixture downloading the model to the temp dir under models/<repo id>, disabling LoRA
+    # (enable_lora False pending vLLM support), and creating a (1, N device) Auto mesh with axes ("fsdp", "tp").
     super().setUpClass()
     cls.repo_id = "meta-llama/Llama-3.2-1B-Instruct"
     temp_dir = tempfile.gettempdir()
@@ -59,6 +72,10 @@ class VllmSamplerTest(absltest.TestCase):
     )
 
   def load_llama3_model(self, model_version: str, enable_lora: bool = False):
+    # [FUNCTION DOC]
+    # HELPER: loads the Tunix Llama3 model for a supported repo id (3.2-1B or 3.1-8B Instruct; otherwise
+    # AssertionError) from self.model_path on self.mesh. If enable_lora, wraps it with LoRA (rank 64, alpha 64)
+    # on all attention and MLP projections and prints a message. Returns (model, model config).
     model_config = {
         "meta-llama/Llama-3.2-1B-Instruct": llama_lib.ModelConfig.llama3p2_1b,
         "meta-llama/Llama-3.1-8B-Instruct": llama_lib.ModelConfig.llama3p1_8b,
@@ -85,15 +102,33 @@ class VllmSamplerTest(absltest.TestCase):
 
   # Parametized test always fails on vLLM HBM usage exceeding limit, no matter how much HBM we allocated to it, and no matter how we clear the Jax cache (delete all the live arrays, gc collect, clear cache, clear test cache). vLLM will allocate all the assigned HBM to weights + KV cache. The conclusion is parametized test doesn't reset Jax properly, therefore the 2nd test adds on top of the previous HBM usage. This is the workaround for that.
   def test_vllm_sampler_batch_mode(self):
+    # [FUNCTION DOC]
+    # Runs the shared vLLM comparison in batch (non-server) mode. Separate test methods are used instead of
+    # parameterization because HBM is not released between parameterized runs.
     self._run_vllm_sampler(server_mode=False)
 
   def test_vllm_sampler_batch_mode_with_data_parallel(self):
+    # [FUNCTION DOC]
+    # Runs the shared vLLM comparison in batch mode with data_parallel_size 2.
     self._run_vllm_sampler(server_mode=False, data_parallel_size=2)
 
   def test_vllm_sampler_server_mode(self):
+    # [FUNCTION DOC]
+    # Runs the shared vLLM comparison in server (async driver) mode.
     self._run_vllm_sampler(server_mode=True)
 
   def _run_vllm_sampler(self, server_mode, data_parallel_size: int = -1):
+    # [FUNCTION DOC]
+    # HELPER: shared comparison body. Inputs: server_mode (bool) and data_parallel_size (default -1, meaning
+    # inferred). Loads the Tunix model and tokenizer, templatizes three prompts, runs the vanilla sampler
+    # (cache 512, greedy top_k 1, 128 steps, padded), builds a MappingConfig from the model and a VllmConfig
+    # (jax backend, 0.2 HBM, random init, optional LoRA config, max_model_len 512, prefix caching), creates
+    # the VllmSampler and asserts its mesh differs from the test mesh, loads the Tunix state with
+    # reset_prefix_cache and collective_rpc patched on the engine (driver engine in server mode, else llm),
+    # samples with the same settings, validates both outputs against expected keywords, asserts the embedding
+    # equals vLLM's embed table, and stops the sampler in server mode.
+    # KNOWN ISSUE: the tokenizer is loaded twice (the first result is overwritten), and the sampler is not
+    # stopped if an assertion fails first in server mode.
     tunix_model, model_config = self.load_llama3_model(
         self.repo_id, enable_lora=self.enable_lora
     )
@@ -225,6 +260,12 @@ class VllmSamplerTest(absltest.TestCase):
       vl_sampler.stop()
 
   def test_vllm_sampler_run_in_executor_concurrency(self):
+    # [FUNCTION DOC]
+    # Verifies concurrent calls in server mode: loads the model into a server-mode VllmSampler (stopped on
+    # cleanup), submits ten templated prompts from an asyncio loop via run_in_executor with decreasing delays
+    # (later prompts sleep less), collects results by index, validates each output against expected keywords
+    # (empty list for unlisted prompts) and asserts completion order is a permutation different from
+    # submission order.
     tunix_model, _ = self.load_llama3_model(
         self.repo_id, enable_lora=self.enable_lora
     )
@@ -292,6 +333,9 @@ class VllmSamplerTest(absltest.TestCase):
     delays = [0.05 * (len(prompts) - idx) for idx in range(len(prompts))]
 
     def _call_sampler(templated_prompt: str, delay: float):
+      # [FUNCTION DOC]
+      # HELPER: sleeps for delay seconds then calls the sampler on one templated prompt with greedy settings and
+      # returns the sampler output.
       time.sleep(delay)
       return vl_sampler(
           input_strings=[templated_prompt],
@@ -307,6 +351,9 @@ class VllmSamplerTest(absltest.TestCase):
     async def __call_sampler_async(
         index: int, templated_prompt: str, delay: float
     ):
+      # [FUNCTION DOC]
+      # HELPER: coroutine running the blocking call helper in the default executor and returning
+      # (index, result).
       loop = asyncio.get_running_loop()
       result = await loop.run_in_executor(
           None,
@@ -317,6 +364,10 @@ class VllmSamplerTest(absltest.TestCase):
       return index, result
 
     async def dispatch_requests():
+      # [FUNCTION DOC]
+      # HELPER: coroutine creating one task per templated prompt, awaiting them as they complete while
+      # recording completion order and results by index, and returning (results ordered by index, completion
+      # order list).
       loop = asyncio.get_running_loop()
       tasks = []
       for idx, templated_prompt in enumerate(templated_prompts):
@@ -357,6 +408,11 @@ class VllmSamplerTest(absltest.TestCase):
     )
 
   def test_vllm_sampler_sampling_kwargs(self):
+    # [FUNCTION DOC]
+    # Verifies config sampling_kwargs (frequency_penalty 0.5, presence_penalty 0.3) and per-call kwargs
+    # (min_tokens 10) are both applied to the SamplingParams passed to llm.generate, by wrapping generate to
+    # capture its sampling_params. Uses a dummy-weight Llama 3.2 1B model in non-server mode.
+    # KNOWN ISSUE: llm.generate is replaced by assignment and never restored.
     """Test that sampling kwargs are correctly applied to sampling_params."""
     tunix_model = create_dummy_model(
           model_class=llama_lib.Llama3,
@@ -411,6 +467,8 @@ class VllmSamplerTest(absltest.TestCase):
     captured_sampling_params = []
 
     def mock_generate(prompts, sampling_params, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: records the sampling_params and delegates to the original generate.
       captured_sampling_params.append(sampling_params)
       return original_generate(prompts, sampling_params, **kwargs)
 
@@ -442,6 +500,9 @@ class VllmSamplerTest(absltest.TestCase):
     self.assertEqual(sampling_params.min_tokens, 10)
 
   def test_vllm_sampler_sampling_kwargs_override(self):
+    # [FUNCTION DOC]
+    # Verifies a per-call kwarg (frequency_penalty 0.8) overrides the config value 0.5 while other config
+    # kwargs (presence_penalty 0.3) still apply.
     """Test that method kwargs override config sampling_kwargs."""
     tunix_model = create_dummy_model(
           model_class=llama_lib.Llama3,
@@ -496,6 +557,8 @@ class VllmSamplerTest(absltest.TestCase):
     captured_sampling_params = []
 
     def mock_generate(prompts, sampling_params, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: records the sampling_params and delegates to the original generate.
       captured_sampling_params.append(sampling_params)
       return original_generate(prompts, sampling_params, **kwargs)
 
@@ -527,9 +590,14 @@ class VllmSamplerTest(absltest.TestCase):
 
 
 class VllmSamplerConfigTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Hardware-free tests of how VllmConfig parallelism settings are translated into vLLM engine args.
   """Unit tests for VllmSampler config plumbing (no hardware required)."""
 
   def _make_mock_mesh(self, total_devices):
+    # [FUNCTION DOC]
+    # HELPER: returns a MagicMock mesh whose shape is one axis of total_devices and whose flattened device ids
+    # list is 0..total_devices-1.
     mesh = mock.MagicMock()
     mesh.shape = {"axis": total_devices}
     mesh.device_ids.flatten.return_value.tolist.return_value = list(
@@ -538,12 +606,17 @@ class VllmSamplerConfigTest(absltest.TestCase):
     return mesh
 
   def _make_sampler(self, config):
+    # [FUNCTION DOC]
+    # HELPER: constructs a VllmSampler with a mock tokenizer while vllm_sampler.LLM is patched, and returns it.
     with mock.patch("tunix.generate.vllm_sampler.LLM"):
       return vllm_sampler.VllmSampler(
           tokenizer=mock.MagicMock(), config=config
       )
 
   def test_expert_parallel_size_plumbed_to_sharding(self):
+    # [FUNCTION DOC]
+    # Verifies expert_parallel_size 2 on 8 devices sets expert_parallelism 2 in
+    # additional_config.sharding.sharding_strategy and infers tensor_parallel_size 4 and data_parallel_size 1.
     mesh = self._make_mock_mesh(8)
     config = vllm_sampler.VllmConfig(
         mesh=mesh,
@@ -562,6 +635,9 @@ class VllmSamplerConfigTest(absltest.TestCase):
     self.assertEqual(sampler.args["data_parallel_size"], 1)
 
   def test_reserved_keys_in_engine_kwargs_raise_value_error(self):
+    # [FUNCTION DOC]
+    # Verifies passing expert_parallel_size, tensor_parallel_size or data_parallel_size in engine_kwargs
+    # raises ValueError naming the key when constructing VllmConfig.
     # Reserved VllmConfig fields (e.g. tp, dp, ep) must be set directly on
     # VllmConfig, not smuggled through engine_kwargs. Passing them via
     # engine_kwargs should raise a ValueError at config construction time
@@ -577,6 +653,8 @@ class VllmSamplerConfigTest(absltest.TestCase):
           )
 
   def test_default_expert_parallel_size_is_one(self):
+    # [FUNCTION DOC]
+    # Verifies defaults on 8 devices give expert_parallelism 1, tensor_parallel_size 8, data_parallel_size 1.
     mesh = self._make_mock_mesh(8)
     config = vllm_sampler.VllmConfig(
         mesh=mesh,

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: small utility module for placing host input batches onto the
+#   current device mesh with a data-parallel PartitionSpec.
+# Uses the mesh from the active "with mesh:" context
+#   (pxla.thread_resources.env.physical_mesh). No side effects at import.
 """Utilities for sharding tensors."""
 
 from typing import Tuple
@@ -25,6 +30,21 @@ import numpy as np
 def shard_input(
     input_data: jax.Array, data_sharding_axis: Tuple[str, ...]
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Shards a pytree of input arrays over the active mesh.
+  # Inputs: input_data (any pytree of arrays, e.g. a TrainingInput),
+  #   data_sharding_axis (tuple of mesh axis names forming the
+  #   PartitionSpec, e.g. ("fsdp",)).
+  # Steps: if there is no active mesh return input unchanged. Build pspec.
+  #   If every leaf is a jax.Array already sharded on this mesh with this
+  #   exact spec, return unchanged. If any leaf is a jax.Array that is not
+  #   fully addressable by this process, return unchanged. Otherwise,
+  #   within transfer_guard("allow"), map each leaf to
+  #   make_array_from_process_local_data(get_sharding(leaf), leaf).
+  # Output: pytree of the same structure with global sharded arrays.
+  # Exceptions: from JAX array creation. Side effects: host-to-device copy.
+  # KNOWN ISSUE: type hint and docstring disagree (jax.Array vs
+  #   TrainingInput); any pytree works.
   """Shards the input data across the available devices.
 
   Args:
@@ -75,6 +95,17 @@ def shard_input(
 
 def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
   """Get a sharding for an tensor given a mesh and partition spec."""
+  # [FUNCTION DOC]
+  # HELPER: chooses a NamedSharding for one leaf. Inputs: x, mesh, pspec.
+  # Returns fully replicated sharding if x is not a numpy/jax array, is a
+  #   scalar (ndim 0), has fewer dims than pspec entries, or any sharded
+  #   dimension i is not divisible by the product... more precisely by
+  #   each individual mesh axis size named for that dimension (a tuple
+  #   entry is checked axis by axis). Otherwise NamedSharding(mesh, pspec).
+  # Exceptions: KeyError if pspec names an axis absent from the mesh.
+  # KNOWN ISSUE: for tuple entries divisibility is checked per axis, not
+  #   against the product of the axis sizes, so a dimension divisible by
+  #   each but not by their product is still sharded and may fail later.
   # Only shard arrays with rank > 0.
   if not isinstance(x, (np.ndarray, jax.Array)) or x.ndim == 0:
     return shd.NamedSharding(mesh, shd.PartitionSpec())  # Replicated

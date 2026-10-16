@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# DPO (Direct Preference Optimization) and ORPO (Odds Ratio Preference
+#   Optimization) trainer built on PeftTrainer.
+# Data flow: a batch arrives as a dict, DataInput (raw strings, tokenized
+#   here) or TrainingInput (pre-tokenized: left-padded prompts,
+#   right-padded chosen/rejected responses). _prepare_inputs stacks the
+#   chosen and rejected examples along the batch axis (first half chosen,
+#   second half rejected, prompts duplicated), builds attention mask and
+#   positions, optionally computes frozen reference-model log-probs, and
+#   returns a TrainExample. dpo_loss_fn computes the summed completion
+#   log-probs of the policy and the DPO or ORPO loss plus reward metrics,
+#   which the trainer buffers and logs (mean over steps).
+# Also defines RawImageType (accepted raw image forms), compute_logps,
+#   tokenization helpers, process_dpo_record (usable as a Grain map fn), and
+#   aliases DpoTrainingConfig/ORPOTrainingConfig/OrpoTrainingConfig ->
+#   DPOTrainingConfig and DpoTrainer/ORPOTrainer/OrpoTrainer -> DPOTrainer.
+# No side effects at import beyond jitting compute_logps lazily.
 """DPO trainer."""
 
 from __future__ import annotations
@@ -42,6 +59,11 @@ RawImageType = (
 
 @flax.struct.dataclass(frozen=True)
 class DataInput:
+  # [CLASS DOC]
+  # Frozen flax struct of raw (untokenized) DPO data: prompts, chosen_responses,
+  # rejected_responses (lists of strings, equal length) and optional images
+  # (RawImageType). Tokenized by DPOTrainer._prepare_inputs via
+  # process_dpo_record.
   """Training data input for DPO.
 
   This can be used when inputs are raw strings. Tokenization, padding and
@@ -63,6 +85,11 @@ class DataInput:
 
 @flax.struct.dataclass(frozen=True)
 class TrainingInput:
+  # [CLASS DOC]
+  # Frozen flax struct of tokenized DPO data (arrays shaped [B, L]):
+  # prompt_ids/prompt_mask (left-padded, length P), chosen_ids/chosen_mask
+  # and rejected_ids/rejected_mask (right-padded, same length R for both so
+  # they can be concatenated), optional images (batch-leading array).
   """Tokenized training input for DPO.
 
   This can be used when inputs are already tokenized, padded and preprocessed.
@@ -92,6 +119,14 @@ class TrainingInput:
 
 @flax.struct.dataclass(frozen=True)
 class TrainExample:
+  # [CLASS DOC]
+  # Frozen flax struct passed to the loss. For a batch of B preference pairs
+  # all arrays have leading dim 2B (chosen first, then rejected):
+  # input_ids [2B, P+R] (prompt then completion), positions [2B, P+R],
+  # attention_mask (as produced by the model or causal helper),
+  # ref_chosen_logps / ref_rejected_logps ([B] summed reference log-probs or
+  # None), completion_mask [2B, R], logits_to_keep (static int R; not a
+  # pytree leaf), images (optional, duplicated to 2B).
   input_ids: jax.Array  # Concatenated [prompt_ids, completion_ids]
   positions: jax.Array
   attention_mask: jax.Array
@@ -104,6 +139,12 @@ class TrainExample:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class DPOTrainingConfig(peft_trainer.TrainingConfig):
+  # [CLASS DOC]
+  # Keyword-only slotted dataclass extending peft_trainer.TrainingConfig.
+  # Fields: algorithm ("dpo" or "orpo"; anything else behaves as DPO),
+  # beta (0.1, DPO temperature), lambda_orpo (0.1, ORPO odds-ratio weight),
+  # label_smoothing (0.0, used by both), max_prompt_length and
+  # max_response_length (required only for raw-string inputs).
   """DPO/ORPO Training Config."""
 
   algorithm: str = "dpo"  # "dpo" or "orpo"
@@ -128,6 +169,15 @@ def compute_logps(
     completion_mask,
     images=None,
 ):
+  # [FUNCTION DOC]
+  # nnx.jit-compiled (logits_to_keep static, argnum 4). Inputs: model,
+  #   input_ids, positions, attention_mask, logits_to_keep (int R),
+  #   completion_mask [2B, R], images (optional).
+  # Steps: per-token log-probs of the last R target tokens via
+  #   common.get_per_token_logps; multiply by completion_mask and sum over
+  #   the sequence axis; split the batch in half.
+  # Output: (chosen_logps [B], rejected_logps [B]) summed log-probs.
+  # Exceptions: from the model. Side effects: none.
   """Computes the log probabilities for chosen and rejected tokens."""
   token_logps = common.get_per_token_logps(
       model,
@@ -147,6 +197,16 @@ def compute_logps(
 
 class DPOTrainer(peft_trainer.PeftTrainer):
   """Direct Preference Optimization (DPO) and ORPO trainer.
+  # [CLASS DOC]
+  # Preference trainer supporting DPO and ORPO selected by
+  # training_config.algorithm. State beyond PeftTrainer: ref_model (frozen
+  # reference or None), dpo_config, algorithm, tokenizer (TokenizerAdapter
+  # or None), image_processor, _ref_model_exists, _aux_metrics_to_log
+  # (metric name -> aggregation fn, np.mean for all: rewards/chosen,
+  # rewards/rejected, rewards/margin, rewards/accuracy, log_probs/chosen,
+  # log_probs/rejected, plus odds_ratio for ORPO). Loss is dpo_loss_fn with
+  # aux output; the model-input fn passes the TrainExample and algorithm
+  # hyperparameters as keyword arguments to the loss.
 
   DPO is a preference tuning method for aligning large language models with
   human or AI preferences. It is a more efficient, performant alternative
@@ -176,6 +236,21 @@ class DPOTrainer(peft_trainer.PeftTrainer):
       tokenizer: Any | None = None,
       image_processor: Any | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: model (policy), ref_model (optional), optimizer,
+    #   training_config (DPOTrainingConfig), tokenizer (optional; wrapped in
+    #   TokenizerAdapter), image_processor (optional callable).
+    # Steps: store model/ref_model/config/algorithm; init PeftTrainer; wrap
+    #   tokenizer; set loss fn dpo_loss_fn with has_aux; set the model
+    #   input fn to map a TrainExample x to {"train_example": x,
+    #   "algorithm": "orpo", "lambda_orpo", "label_smoothing"} for ORPO, or
+    #   {"train_example": x, "algorithm": "dpo", "beta", "label_smoothing"}
+    #   otherwise (set both via with_gen_model_input_fn and by direct
+    #   assignment); set _has_aux; record whether ref_model exists; set up
+    #   aux metric aggregation (adding odds_ratio for ORPO).
+    # Exceptions: from parent init. Side effects: none beyond state.
+    # Note: for ORPO a provided ref_model is still run every step though
+    #   the ORPO loss ignores its outputs.
     """Initializes the DPO/ORPO trainer.
 
     Args:
@@ -261,6 +336,22 @@ class DPOTrainer(peft_trainer.PeftTrainer):
       self,
       training_input: dict[str, Any] | DataInput | TrainingInput,
   ) -> Any:
+    # [FUNCTION DOC]
+    # Converts a batch into a TrainExample.
+    # Input: training_input (dict, DataInput or TrainingInput).
+    # Steps: dict -> _preprocess_dict. DataInput -> require tokenizer
+    #   (else ValueError) and both max lengths (else ValueError), then
+    #   process_dpo_record. Then: prompt ids/mask duplicated along batch;
+    #   completion ids/mask = chosen then rejected along batch;
+    #   input_ids = [prompt | completion] along the sequence axis and the
+    #   same for the mask; images duplicated if present. Attention mask:
+    #   model.get_attention_mask(input_ids, inputs_mask=mask) if the model
+    #   has that method, else common.make_causal_attn_mask(mask).
+    #   logits_to_keep = R; positions = common.build_positions_from_mask.
+    #   If a reference model exists, compute ref chosen/rejected summed
+    #   log-probs via compute_logps (also in eval).
+    # Output: TrainExample. Exceptions: ValueError as above; shape errors
+    #   if chosen and rejected lengths differ. Side effects: ref forward.
     if isinstance(training_input, dict):
       training_input = _preprocess_dict(training_input)
 
@@ -356,6 +447,14 @@ class DPOTrainer(peft_trainer.PeftTrainer):
 
   @override
   def _post_process_train_step(self, aux: Any) -> None:
+    # [FUNCTION DOC]
+    # Input: aux (metrics dict from dpo_loss_fn for a train step). For each
+    #   metric in _aux_metrics_to_log, append aux[name] to the buffered
+    #   train metrics' additional_metrics[name] list, creating the entry
+    #   (values list, aggregation fn) if absent.
+    # Exceptions: AssertionError if no train metrics buffer; KeyError if aux
+    #   lacks a metric. Side effects: mutates the buffer.
+    # Note: ORPO's sft_loss and or_loss aux values are never logged.
     assert self._buffered_train_metrics is not None
     for metric_name, op in self._aux_metrics_to_log.items():
       if metric_name not in self._buffered_train_metrics.additional_metrics:
@@ -370,6 +469,9 @@ class DPOTrainer(peft_trainer.PeftTrainer):
 
   @override
   def _post_process_eval_step(self, aux: Any) -> None:
+    # [FUNCTION DOC]
+    # Same as _post_process_train_step but appends into the buffered eval
+    # metrics. AssertionError if no eval metrics buffer exists.
     assert self._buffered_eval_metrics is not None
     for metric_name, op in self._aux_metrics_to_log.items():
       if metric_name not in self._buffered_eval_metrics.additional_metrics:
@@ -391,6 +493,30 @@ def dpo_loss_fn(
     lambda_orpo: float = 0.1,
     label_smoothing: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
+  # [FUNCTION DOC]
+  # DPO/ORPO loss. Inputs: model, train_example (TrainExample), algorithm,
+  #   beta, lambda_orpo, label_smoothing (ls).
+  # First compute policy summed log-probs chosen (c) and rejected (r) via
+  #   compute_logps.
+  # ORPO branch (algorithm == "orpo"): B = half of the batch; chosen
+  #   lengths = sum of chosen completion mask, floored at 1; sft = -c /
+  #   length; log_odds = (c - r) - (log1p(-exp(c)) - log1p(-exp(r)));
+  #   or_loss = -(log_sigmoid(log_odds)*(1-ls) + log_sigmoid(-log_odds)*ls);
+  #   per-example total = sft + lambda_orpo*or_loss; rewards =
+  #   lambda_orpo * c and lambda_orpo * r; odds_ratio = exp(log_odds).
+  #   Returns (mean total, aux) with aux keys rewards/chosen,
+  #   rewards/rejected, rewards/margin, rewards/accuracy (fraction chosen
+  #   reward > rejected), log_probs/chosen, log_probs/rejected, odds_ratio,
+  #   sft_loss, or_loss (all batch means).
+  # DPO branch (otherwise): chosen ratio = c minus ref chosen if present;
+  #   rejected ratio likewise; delta = difference; losses =
+  #   -(log_sigmoid(beta*delta)*(1-ls) + log_sigmoid(-beta*delta)*ls);
+  #   rewards = beta * ratios. Returns (mean loss, aux with the first six
+  #   keys above).
+  # Exceptions: none explicit. Side effects: none.
+  # KNOWN ISSUE: ORPO uses summed (not length-averaged) log-probs in
+  #   log1p(-exp(.)), which is NaN/inf when a summed log-prob is >= 0 or
+  #   numerically 0 (e.g. empty completions); see the inline note.
   """DPO/ORPO loss function.
 
   Args:
@@ -502,6 +628,16 @@ def _generate_ids_and_masks(
     max_length: int,
     left_pad: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
+  # [FUNCTION DOC]
+  # HELPER: tokenizes and pads a list of strings. Inputs: input_strings,
+  #   tokenizer (TokenizerAdapter-like), max_length, left_pad (default True).
+  # Each string -> _tokenize, truncated to its first max_length tokens,
+  #   padded with tokenizer.pad_id() to max_length (left or right) via
+  #   common.pad_to_length. Output: (ids [N, max_length], mask int32 where
+  #   ids != pad id).
+  # KNOWN ISSUE: the mask is derived by comparing to the pad id, so real
+  #   tokens equal to the pad id (e.g. when pad == eos) are masked out;
+  #   truncation keeps the head, so left-padded prompts lose their end.
   """Generates ids and masks for a list of strings."""
   tokens = [_tokenize(x, tokenizer) for x in input_strings]
   all_input_ids = jnp.array([
@@ -520,6 +656,11 @@ def _generate_ids_and_masks(
 
 
 def _tokenize(input_string: str, tokenizer: Any) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: Inputs: input_string, tokenizer. Encodes the string, prepends
+  #   [bos_id] if bos_id() is truthy, removes duplicate leading BOS via
+  #   tokenizer.dedup_bos_ids, returns an int32 array.
+  # KNOWN ISSUE: a BOS id of 0 is treated as "no BOS".
   """Tokenizes the input string."""
   input_ids = tokenizer.encode(input_string)
   bos_tok = [tokenizer.bos_id()] if tokenizer.bos_id() else []
@@ -533,6 +674,12 @@ def _preprocess_dict(
     training_input: dict[str, Any],
 ) -> DataInput | TrainingInput:
   """Wraps input dict with either DataInput or TrainingInput."""
+  # [FUNCTION DOC]
+  # HELPER: Input: training_input dict. If it contains every TrainingInput
+  #   field except images, returns TrainingInput built from those fields
+  #   (missing images -> None). Else if it contains every DataInput field
+  #   except images, returns DataInput similarly. Otherwise raises
+  #   ValueError listing both field sets and the received keys.
 
   data_input_fields = [field.name for field in dataclasses.fields(DataInput)]
   tokenized_input_fields = [
@@ -571,6 +718,23 @@ def process_dpo_record(
     *,
     image_processor: Any = None,
 ) -> TrainingInput:
+  # [FUNCTION DOC]
+  # Tokenizes one record (or a batch) for DPO.
+  # Inputs: record dict with "prompts", "chosen_responses",
+  #   "rejected_responses" (string or list of strings) and optional
+  #   "images"; tokenizer; max_prompt_length; max_response_length;
+  #   image_processor (keyword-only, optional callable).
+  # Steps: unbatched if prompts is a str or dict; wrap single strings in
+  #   lists. Prompts -> left-padded ids/masks of max_prompt_length; chosen
+  #   and rejected -> right-padded of max_response_length. If images given:
+  #   warn if no image_processor (images assumed preprocessed), else images
+  #   = array(image_processor(images)). If unbatched, squeeze the leading
+  #   axis of every array (images too).
+  # Output: TrainingInput. Exceptions: KeyError for missing keys; squeeze
+  #   errors if unbatched images lack a leading size-1 axis. Side effects:
+  #   warnings.
+  # KNOWN ISSUE: a dict prompt is treated as unbatched but then passed to
+  #   the string tokenizer as is.
   """Processes and tokenizes a single record for DPO training.
 
   This function takes a dictionary containing a prompt, a chosen response,

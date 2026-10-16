@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [PACKAGE DOC]
+# Package tunix.distillation: knowledge-distillation training for Tunix.
+# Behavior: re-exports the public trainer API from distillation_trainer:
+#   DistillationTrainer (a PeftTrainer subclass that trains a student model
+#   against a frozen teacher via a pluggable strategy), TrainingConfig and
+#   TrainingInput (input record that additionally carries teacher_output).
+# Subpackages: strategies (loss strategies: logit, attention, feature pooling,
+#   feature projection) and feature_extraction (sowing/pooling/projection
+#   utilities used by the feature strategies).
+# Inputs/outputs: none at import time. Exceptions: only import errors.
+# Side effects: importing loads distillation_trainer (and transitively
+#   tunix.sft.peft_trainer, flax, optax, jax).
 """Module containing the distillation trainers."""
 
 # pylint: disable=g-importing-member

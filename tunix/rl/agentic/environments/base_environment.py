@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Environment base classes for agentic RL. EnvStepResult is a dataclass returned
+# by per-step hooks. BaseEnv is the gym-like abstract interface (reset, step,
+# async step via thread executor, close, from_dict factory, assignable idx).
+# BaseTaskEnv is a template that stores a task dict, optional reward_fn and
+# max_steps, counts steps and forces done once max_steps is reached, delegating
+# the actual logic to _initial_observation and _step_impl. Module alias
+# abstractmethod is defined. No import-time side effects.
 """Base classes for reinforcement learning environments.
 
 This module defines:
@@ -36,6 +44,9 @@ abstractmethod = abc.abstractmethod
 
 @dataclasses.dataclass
 class EnvStepResult:
+  # [CLASS DOC]
+  # Dataclass with required fields observation (any), reward (float), done (bool)
+  # and info (dict), describing the outcome of one logical step.
   """Container for the result of a single environment step.
 
   This is used internally by `BaseTaskEnv`'s `_step_impl` template method,
@@ -56,6 +67,10 @@ class EnvStepResult:
 
 
 class BaseEnv(abc.ABC):
+  # [CLASS DOC]
+  # Abstract environment interface. State: _idx (identifier assigned by rollout
+  # code, None initially). Subclasses implement reset and step; step_async, close
+  # and from_dict have defaults.
   """Abstract base class for reinforcement learning environments.
 
   This class defines the minimal standard interface for environments used in
@@ -68,6 +83,8 @@ class BaseEnv(abc.ABC):
   """
 
   def __init__(self):
+    # [FUNCTION DOC]
+    # Initialize _idx to None. No inputs, no outputs.
     """Initialize the base environment.
 
     Sets up the environment index as None, which can be assigned later
@@ -78,6 +95,8 @@ class BaseEnv(abc.ABC):
 
   @property
   def idx(self) -> Any:
+    # [FUNCTION DOC]
+    # Property getter returning the stored index (any type, None if unset).
     """Get the environment's assigned index.
 
     The index is used to identify this environment instance within a batch
@@ -90,6 +109,8 @@ class BaseEnv(abc.ABC):
 
   @idx.setter
   def idx(self, value: Any):
+    # [FUNCTION DOC]
+    # Property setter storing value as the index. Side effect: sets _idx.
     """Set the environment's index.
 
     This setter allows external systems (like rollout managers) to assign
@@ -102,6 +123,9 @@ class BaseEnv(abc.ABC):
 
   @abstractmethod
   def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Abstract. Reset to a new episode and return (initial observation, info dict).
+    # Base raises NotImplementedError.
     """Reset the environment to its initial state for a new episode.
 
     This method should restore the environment to a clean starting condition,
@@ -119,6 +143,9 @@ class BaseEnv(abc.ABC):
 
   @abstractmethod
   def step(self, action: Any) -> tuple[Any, float, bool, Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Abstract. Apply an action and return (next observation, reward, done, info).
+    # Base raises NotImplementedError.
     """Execute one interaction step in the environment.
 
     Takes an action from the agent (typically a model response or tool call),
@@ -144,6 +171,10 @@ class BaseEnv(abc.ABC):
   async def step_async(
       self, action: Any
   ) -> tuple[Any, float, bool, Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Async step: runs the synchronous step(action) in the current event loop's
+    # default thread-pool executor and returns its tuple. Exceptions from step
+    # propagate. Side effects: those of step, run on a worker thread.
     """Asynchronous version of the step method.
 
     Provides non-blocking execution of environment steps by wrapping the
@@ -161,6 +192,8 @@ class BaseEnv(abc.ABC):
     return await loop.run_in_executor(None, self.step, action)
 
   def close(self):
+    # [FUNCTION DOC]
+    # Resource cleanup hook; base does nothing and returns None.
     """Clean up environment resources.
 
     Override this method in subclasses to perform any necessary cleanup
@@ -172,6 +205,9 @@ class BaseEnv(abc.ABC):
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "BaseEnv":
+    # [FUNCTION DOC]
+    # Classmethod factory: constructs cls with env_args unpacked as keyword arguments.
+    # Exceptions: TypeError for unexpected keys.
     """Create an environment instance from a configuration dictionary.
 
     This factory method enables environment creation from configuration files
@@ -202,6 +238,11 @@ class BaseEnv(abc.ABC):
 
 
 class BaseTaskEnv(BaseEnv):
+  # [CLASS DOC]
+  # Template environment for tasks. Attributes: task (dict), reward_fn (callable or
+  # None), max_steps (int), step_count (int), extra_kwargs (dict of extra
+  # constructor kwargs). Subclasses implement _initial_observation and _step_impl;
+  # reset and step here handle counting and truncation.
   """Template base class for task-based RL environments.
 
   This class extends `BaseEnv` with common episode management logic for
@@ -238,6 +279,10 @@ class BaseTaskEnv(BaseEnv):
       max_steps: int = 1,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Initialize base state then store task (empty dict if task is falsy), reward_fn
+    # (keyword-only, default None), max_steps (keyword-only, default 1), step_count 0
+    # and any extra keyword arguments in extra_kwargs.
     """Initialize the task-based environment.
 
     Args:
@@ -260,6 +305,9 @@ class BaseTaskEnv(BaseEnv):
   # ---------- Template methods to be implemented by subclasses ----------
 
   def _initial_observation(self) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Template hook returning the initial observation. Base raises
+    # NotImplementedError.
     """Return the initial observation for a new episode.
 
     Subclasses must override this to provide the observation returned
@@ -271,6 +319,9 @@ class BaseTaskEnv(BaseEnv):
     raise NotImplementedError
 
   def _step_impl(self, action: Any) -> EnvStepResult:
+    # [FUNCTION DOC]
+    # HELPER: Template hook implementing one logical step and returning an
+    # EnvStepResult; must not touch step_count. Base raises NotImplementedError.
     """Per-step environment logic.
 
     Subclasses must override this to implement a single logical step given
@@ -289,6 +340,8 @@ class BaseTaskEnv(BaseEnv):
   # --------------------- Public BaseEnv interface -----------------------
 
   def reset(self) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Reset step_count to 0 and return (_initial_observation(), empty dict).
     """Reset the environment and return the initial observation.
 
     This implementation resets the internal step counter and delegates
@@ -302,6 +355,10 @@ class BaseTaskEnv(BaseEnv):
     return obs, {}
 
   def step(self, action: Any) -> tuple[Any, float, bool, Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Increment step_count, call _step_impl(action), and return (observation, reward,
+    # done, info) where done is the result's done OR step_count has reached
+    # max_steps. Side effects: increments step_count (even if _step_impl raises).
     """Execute one interaction step in the environment.
 
     This implementation increments the step counter, delegates the per-step
@@ -324,6 +381,9 @@ class BaseTaskEnv(BaseEnv):
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "BaseTaskEnv":
+    # [FUNCTION DOC]
+    # Classmethod factory: constructs cls with env_args unpacked as keyword arguments
+    # (same as BaseEnv.from_dict); subclasses override to split arguments.
     """Create a task-based environment from a configuration dictionary.
 
     The default implementation assumes that `env_args` can be passed directly

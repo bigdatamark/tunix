@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Attention-map distillation strategies, thin specializations of the
+#   feature strategies where the captured "feature layer" is an attention
+#   module type.
+# Defines AttentionTransferStrategy (FeaturePoolingStrategy with the
+#   attention layer; default loss = mean cosine distance over last axis) and
+#   AttentionProjectionStrategy (FeatureProjectionStrategy with the
+#   attention layer; default loss = MSE). Both default alpha to 0.75.
+# No side effects at import.
 """Implements Attention Based Distillation Strategy."""
 
 from typing import Callable
@@ -26,6 +35,11 @@ ModelForwardCallable = base_strategy.ModelForwardCallable
 
 
 class AttentionTransferStrategy(feature_pooling.FeaturePoolingStrategy):
+  # [CLASS DOC]
+  # Attention transfer distillation: captures outputs of every submodule of
+  # type attention_layer in both models, average-pools teacher maps to the
+  # student shape, and blends attention loss with student task CE loss.
+  # All behavior is inherited from FeaturePoolingStrategy.
   """Implements Attention Transfer distillation.
 
   This strategy minimizes the difference (typically Cosine Distance) between
@@ -45,6 +59,15 @@ class AttentionTransferStrategy(feature_pooling.FeaturePoolingStrategy):
           Callable[[jax.Array, jax.Array], jax.Array] | None
       ) = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: student/teacher forward fns, labels_fn, attention_layer (nnx
+    #   module class to capture), alpha (default 0.75), attention_loss_fn
+    #   (optional (student_map, teacher_map) -> scalar).
+    # Behavior: forwards to FeaturePoolingStrategy with feature_layer =
+    #   attention_layer and feature_loss_fn = attention_loss_fn (None means
+    #   mean cosine distance along axis -1). cosine_distance_axis left at -1.
+    # Exceptions: ValueError if alpha outside [0, 1]. No side effects.
+    # KNOWN ISSUE: docstring has a stray trailing "Error." line.
     """Initializes the AttentionTransfer strategy.
 
     Args:
@@ -68,6 +91,12 @@ class AttentionTransferStrategy(feature_pooling.FeaturePoolingStrategy):
 
 
 class AttentionProjectionStrategy(feature_projection.FeatureProjectionStrategy):
+  # [CLASS DOC]
+  # Attention projection distillation: captures attention-layer outputs,
+  # projects the student's stacked maps to the teacher's shape with a
+  # learned linear layer, and blends attention loss (default MSE) with the
+  # student task CE loss. All behavior inherited from
+  # FeatureProjectionStrategy.
   """Implements Attention Projection distillation.
 
   This strategy minimizes the difference (typically MSE) between
@@ -89,6 +118,14 @@ class AttentionProjectionStrategy(feature_projection.FeatureProjectionStrategy):
           Callable[[jax.Array, jax.Array], jax.Array] | None
       ) = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: student/teacher forward fns, labels_fn, attention_layer,
+    #   dummy_input (kwargs for one forward pass used to infer feature
+    #   shapes), rngs (for projection init), alpha (default 0.75),
+    #   attention_loss_fn (optional; None means MSE).
+    # Behavior: forwards to FeatureProjectionStrategy with feature_layer =
+    #   attention_layer and feature_loss_fn = attention_loss_fn.
+    # Exceptions: ValueError if alpha outside [0, 1]. No side effects.
     """Initializes the AttentionProjection strategy.
 
     Args:

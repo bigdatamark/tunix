@@ -53,6 +53,24 @@ Usage:
   #   - full evaluation split
   python3 examples/deepswe/eval_deepswe.py
 """
+# [MODULE DOC]
+# DeepSWE evaluation script (top-level code). Configuration comes from environment variables (see the
+# docstring above). On import it: configures root logging to stdout; initializes pathwaysutils when
+# JAX_PLATFORMS is "proxy"; loads the dataset (32 processes) and keeps entries with a docker_image,
+# truncated to TASKS_LIMIT if positive; sets Kubernetes env defaults, loads the kube config and verifies
+# connectivity by listing namespaces (raises on failure); downloads the model to /scratch/models/<id>
+# if missing; builds tokenizer, tokenizer adapter, Qwen chat parser and the im_end EOS id; builds a
+# 1 x 8 ("fsdp","tp") mesh on the first 8 devices; loads the Qwen3 model (only Qwen3-4B-Instruct-2507
+# and Qwen3-32B supported, else ValueError) in float32; and creates a sampler for ROLLOUT_ENGINE
+# (vanilla with cache 16384; vllm with mapping config, optional server mode, and weights synced from
+# the model; sglang_jax with weights synced when random-init; else ValueError). A threading lock
+# serializes sampler calls for vanilla and non-server vLLM. When run as main, evaluates all entries
+# concurrently with RolloutOrchestrator, logs Pass@1 and statistics, and saves a JSONL file.
+# Imports guarded_swe_env, swe_agent and swe_env as top-level modules, so the script directory must be
+# on sys.path. Side effects: network, Kubernetes pods/containers, device memory, files in OUTPUT_DIR.
+# KNOWN ISSUE: sys.path entries for /usr/github/rllm and pathways-utils are inserted after all imports,
+# so they cannot affect the earlier imports. Fewer than 8 devices makes the mesh reshape fail.
+# KNOWN ISSUE: the output file name says "deepscaler_style" although this evaluates DeepSWE.
 
 import asyncio
 import collections
@@ -340,10 +358,16 @@ if ROLLOUT_ENGINE == "vanilla" or (
 
 
 class PromptTooLongError(ValueError):
+  # [CLASS DOC]
+  # ValueError subclass signalling that a prompt exceeds the model context before or during sampling.
   """Raised when a prompt exceeds the model context limit before sampling."""
 
 
 def _is_prompt_overflow_error(exc: Exception) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: returns True if str(exc) contains "maximum input length", "context length is only",
+  # "Prompt too long before sampler call", or both "input_tokens" and "max_model_len" (the last two
+  # grouped by operator precedence). Output: bool.
   message = str(exc)
   return (
       "maximum input length" in message
@@ -355,6 +379,14 @@ def _is_prompt_overflow_error(exc: Exception) -> bool:
 
 
 def model_call(chat_completions, env_unused):
+  # [FUNCTION DOC]
+  # Model call used by the trajectory engine. Reads pair_index from env.extra_kwargs and instance_id from
+  # env.entry (defaults None / "unknown") for logging. Renders chat_completions to a prompt string via the
+  # chat parser (generation prompt, first message), counts tokens, and raises PromptTooLongError if the
+  # count is at least MAX_MODEL_LEN. Calls the sampler (holding sampler_lock if set) with
+  # MAX_RESPONSE_LENGTH generation steps, no echo, im_end EOS. Sampler exceptions recognized by
+  # _is_prompt_overflow_error are re-raised as PromptTooLongError; others propagate. Logs start/end and
+  # returns the sampler output object (with .text).
   """Model inference via tunix sampler."""
   pair_index = None
   instance_id = "unknown"
@@ -419,9 +451,17 @@ def model_call(chat_completions, env_unused):
 class EvalTrajectoryCollectEngine(
     trajectory_collect_engine.TrajectoryCollectEngine
 ):
+  # [CLASS DOC]
+  # TrajectoryCollectEngine that turns PromptTooLongError into a clean trajectory termination: status
+  # MAX_CONTEXT_LIMIT_REACHED, last step marked done, final reward skipped and trajectory reward 0.0.
+  # Uses the instance flag _skip_final_reward.
   """Trajectory engine that converts prompt overflows into per-trajectory termination."""
 
   async def _one_step(self) -> bool:
+    # [FUNCTION DOC]
+    # Async. Runs the parent single step; on PromptTooLongError logs a warning, sets the trajectory status
+    # to MAX_CONTEXT_LIMIT_REACHED, sets _skip_final_reward, marks the last step done if any, and returns
+    # True (episode finished). Other exceptions propagate. Output: bool done flag from the parent otherwise.
     try:
       return await super()._one_step()
     except PromptTooLongError as exc:
@@ -441,11 +481,17 @@ class EvalTrajectoryCollectEngine(
       return True
 
   async def _append_final_reward(self):
+    # [FUNCTION DOC]
+    # Async. Skips the parent's final reward computation when _skip_final_reward is set; otherwise
+    # delegates to it.
     if getattr(self, "_skip_final_reward", False):
       return
     await super()._append_final_reward()
 
   def compute_trajectory_reward(self):
+    # [FUNCTION DOC]
+    # Returns the trajectory with reward forced to 0.0 when _skip_final_reward is set; otherwise returns
+    # the parent's computed trajectory.
     if getattr(self, "_skip_final_reward", False):
       self.agent.trajectory.reward = 0.0
       return self.agent.trajectory
@@ -453,9 +499,15 @@ class EvalTrajectoryCollectEngine(
 
 
 class _EvalLoggingEnvMixin:
+  # [CLASS DOC]
+  # HELPER: mixin for env classes (must precede the env in the MRO) that logs start/end and duration of
+  # reset and step, tagged with pair index and instance id. Requires extra_kwargs, entry and step_count
+  # attributes from the env.
   """Adds phase-level reset/step logs for eval debugging."""
 
   def reset(self):
+    # [FUNCTION DOC]
+    # Logs start, calls the next class's reset, logs elapsed time, and returns its (observation, info).
     """Resets the environment and logs the timing.
 
     This method calls the superclass's reset and logs the start and end of the
@@ -478,6 +530,10 @@ class _EvalLoggingEnvMixin:
     return obs, info
 
   def step(self, action):
+    # [FUNCTION DOC]
+    # Logs start with step index step_count + 1 and the action (first line of a string action, at most
+    # 120 chars), calls the next class's step, logs reward, done and elapsed time, and returns
+    # (obs, reward, done, info). Raises TypeError in logging formatting if reward is not numeric.
     """Steps the environment and logs the action and timing."""
     pair_index = self.extra_kwargs.get("pair_index")
     instance_id = self.entry.get("instance_id", "unknown")
@@ -508,14 +564,22 @@ class _EvalLoggingEnvMixin:
 
 
 class LoggedSWEEnv(_EvalLoggingEnvMixin, SWEEnv):
+  # [CLASS DOC]
+  # HELPER: SWEEnv with reset/step logging.
   pass
 
 
 class LoggedGuardedSWEEnv(_EvalLoggingEnvMixin, GuardedSWEEnv):
+  # [CLASS DOC]
+  # HELPER: GuardedSWEEnv with reset/step logging.
   pass
 
 
 def pairs_generator():
+  # [FUNCTION DOC]
+  # Generator yielding (SWEAgent(), env) per dataset entry, where env is LoggedGuardedSWEEnv if
+  # ENABLE_GUARD else LoggedSWEEnv, built with the entry, MAX_STEPS, and pair_index = group_id = the
+  # entry index.
   """Yield one full (agent, env) trajectory task per dataset entry."""
   for pair_index, entry in enumerate(entries):
     agent = SWEAgent()
@@ -530,6 +594,14 @@ def pairs_generator():
 
 
 async def run_evaluation():
+  # [FUNCTION DOC]
+  # Async. Creates OUTPUT_DIR and a RolloutOrchestrator using EvalTrajectoryCollectEngine (model_call,
+  # TIMEOUT, MAX_CONTEXT_LIMIT, tokenizer adapter, chat parser) with MAX_CONCURRENT and a rollout sync
+  # lock. Starts the producer task over pairs_generator (group size 1, grouped by group_id, trajectory
+  # collect mode) and consumes batches of size 1: for each finished item builds a result dict with
+  # pair_index, instance_id, float reward, num_steps, status name, number of steps whose info has
+  # guard_blocked, and sorted unique guard reasons; logs progress. Awaits the producer (propagating its
+  # errors) and returns the list of results.
   """Run evaluation with orchestrator-managed task-level parallelism."""
   os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -611,6 +683,11 @@ async def run_evaluation():
 
 
 def compute_pass_at_k(results):
+  # [FUNCTION DOC]
+  # Logs summary metrics for result dicts: totals, resolved count (reward > 0), Pass@1 = resolved/total,
+  # average reward and steps, status counts, number and percentage of trajectories with guard blocks,
+  # total guard blocks and per-reason counts (each reason counted once per trajectory). Warns and returns
+  # early when results is empty. Returns None.
   """Computes and logs evaluation metrics such as Pass@1 and average reward.
 
   Args:
@@ -662,6 +739,10 @@ def compute_pass_at_k(results):
 
 
 def save_results(results):
+  # [FUNCTION DOC]
+  # Writes one JSON line per result to OUTPUT_DIR/eval_deepscaler_style_<timestamp>.jsonl with
+  # instance_id, docker_image (from the dataset entry), reward, num_steps, status, guard_blocked_steps and
+  # guard_reasons. Creates OUTPUT_DIR. Returns the file path. Raises OSError on write failures.
   """Saves the evaluation results to a JSONL file.
 
   The results are saved in a timestamped file within the OUTPUT_DIR. Each line

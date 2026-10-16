@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loading and saving utilities for Gemma 3 parameters.
+# - GCS path constants for upstream Orbax checkpoints (270M/1B/4B/12B/27B,
+#   pretrained and instruction-tuned) and the SentencePiece tokenizer.
+# - create_model_from_checkpoint: restores an upstream (google-deepmind/gemma)
+#   Orbax checkpoint, remaps its parameter tree to the NNX model.Gemma3 layout
+#   (map_from_upstream_checkpoint), casts/shards and loads it.
+# - PROMPT_TEMPLATE: single-turn chat template with one '{}' slot for the
+#   user message.
+# - create_tokenizer: loads a SentencePiece model from any epath location.
+# - save_lora_merged_model_as_safetensors: merges LoRA weights into a base
+#   HF safetensors checkpoint via the shared safetensors_saver, using
+#   Gemma3-specific key renaming, kv-splitting and transpose rules
+#   (_GEMMA3_HUGGINGFACE_TRANSPOSE_RULES transposes every q/k/v/o and MLP
+#   projection by swapping the two axes).
 """Gemma3 model parameters.
 
 This provides a mapping from the upstream checkpoints[1] to our implementation.
@@ -52,6 +67,12 @@ def _get_param_dtype(
     path: tuple[Any, ...],
     default_dtype: jnp.dtype,
 ) -> jnp.dtype:
+  # [FUNCTION DOC]
+  # HELPER: chooses the dtype for one parameter from its pytree path (only
+  # DictKey entries are considered). Returns float32 for anything under
+  # 'vision_encoder' and for embedder sub-keys starting with 'mm_' (vision
+  # projection and norm); otherwise default_dtype (also when the path has no
+  # dict keys).
   """Get dtype for a parameter based on its path.
 
   All vision components are necessarily kept in fp32.
@@ -85,6 +106,19 @@ def create_model_from_checkpoint(
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> model_lib.Gemma3:
+  # [FUNCTION DOC]
+  # Builds a Gemma3 from an upstream Orbax checkpoint.
+  # Inputs: checkpoint_path, model_config, optional mesh, dtype (default
+  # bfloat16) for non-vision params.
+  # Steps: abstractly instantiate model.Gemma3 (nnx.eval_shape, no allocation);
+  # restore the checkpoint with StandardCheckpointer (reads storage); remap
+  # with map_from_upstream_checkpoint (text_only when the config has no vision
+  # config); convert each leaf to a jnp array with the dtype from
+  # _get_param_dtype, placed with the model's NamedSharding on mesh when given
+  # (the remapped tree must match the model state structure); nnx.update the
+  # abstract model in place with these arrays.
+  # Output: the populated model. Exceptions from Orbax or tree mismatches
+  # propagate.
   """Load a Gemma3 model from a checkpoint."""
   abs_model = nnx.eval_shape(
       lambda: model_lib.Gemma3(model_config, rngs=nnx.Rngs(0))
@@ -121,6 +155,10 @@ PROMPT_TEMPLATE = """\
 def create_tokenizer(
     path: str = GEMMA3_TOKENIZER,
 ) -> spm.SentencePieceProcessor:
+  # [FUNCTION DOC]
+  # Reads the serialized SentencePiece model bytes from path (default
+  # GEMMA3_TOKENIZER, any epath-supported location such as gs://) and returns a
+  # loaded SentencePieceProcessor.
   spm_processor = spm.SentencePieceProcessor()
   model_proto = epath.Path(path).read_bytes()
   spm_processor.LoadFromSerializedProto(model_proto)
@@ -130,6 +168,30 @@ def create_tokenizer(
 def map_from_upstream_checkpoint(
     params, model_type: str = 'gemma3', *, text_only: bool = True
 ):
+  # [FUNCTION DOC]
+  # Converts an upstream Gemma 3 parameter dict to the NNX Gemma3 nested
+  # layout (see the From/To listing in the body).
+  # Inputs: params (nested dict whose flattened keys are
+  # (module_path_with_slashes, param_name)), model_type (default 'gemma3'),
+  # keyword text_only (default True: skip all vision weights).
+  # Rules, after dropping the first module path segment ('transformer' or the
+  # SigLIP root): siglip_encoder entries (skipped if text_only) map under
+  # ('vision_encoder', 'siglip_encoder'): patch 'embedding' kernel/bias;
+  # 'pos_embedding'; 'encoder_norm' under 'transformer'; encoderblock_i
+  # LayerNorm_j -> blocks[i].ln{j+1}; MlpBlock Dense_j -> mlp.fc{j+1};
+  # MultiHeadDotProductAttention query/key/value/out -> attn.<name>_proj with
+  # kernels reshaped to 2D ([D, N*H] for q/k/v, [N*H, D] for out) and biases
+  # flattened. Embedder 'mm_*' sub-modules are copied (skipped if text_only),
+  # other embedder params go to ('embedder', name). final_norm copied. Layer
+  # 'layer_i' maps to ('layers', i): mlp gating_einsum [2, F, D] splits into
+  # gate_proj and up_proj kernels (each transposed to [D, F]); mlp linear ->
+  # down_proj kernel; post_attention_norm renamed to post_attn_norm only when
+  # model_type is not 'gemma3'; all other paths copied unchanged.
+  # Output: nested dict (flax unflatten_dict). Raises ValueError/IndexError on
+  # unexpected key formats.
+  # KNOWN ISSUE: the "To" comment lists ('layers', 0, 'post_attn_norm') but
+  # for model_type 'gemma3' the key stays 'post_attention_norm' (which is what
+  # model.Gemma3 uses).
   """Map from upstream checkpoint to our implementation."""
   # From:
   #
@@ -301,6 +363,12 @@ def map_from_upstream_checkpoint(
 def _extract_gemma3_lora_layers(
     lora_layers: dict[str, list[Any]],
 ) -> dict[str, list[Any]]:
+  # [FUNCTION DOC]
+  # HELPER: adapts LoRA layer entries for export. Input maps layer path to a
+  # list [lora_a, lora_b]. For keys containing 'kv_einsum', emits two entries
+  # with 'k_einsum' and 'v_einsum' sharing lora_a and taking lora_b[:, 0] and
+  # lora_b[:, 1] respectively (assumes the second axis of lora_b is the k/v
+  # axis); other entries are copied. Returns the new dict.
   """Extract LoRA layers from a Gemma3 model."""
   updated_lora_layers = {}
   for k, v in lora_layers.items():
@@ -319,6 +387,11 @@ def _extract_gemma3_lora_layers(
 
 
 def _gemma3_state_key_to_safetensors_key(lora_name: str) -> str:
+  # [FUNCTION DOC]
+  # HELPER: converts an NNX layer path (e.g. 'layers.0.attn.q_einsum') to the
+  # HF safetensors key: prefix 'model.', suffix '.weight', '.attn.' becomes
+  # '.self_attn.', and q/k/v_einsum and attn_vec_einsum become q/k/v/o_proj.
+  # Other names (e.g. mlp projections) are kept.
   """Transform Gemma3 layer path to safetensors state dict key.
 
   Args:
@@ -354,6 +427,11 @@ def save_lora_merged_model_as_safetensors(
     rank: int,
     alpha: float,
 ):
+  # [FUNCTION DOC]
+  # Merges the LoRA weights of lora_model (with given rank and alpha) into the
+  # base safetensors checkpoint at local_model_path and writes the result to
+  # output_dir, delegating to safetensors_saver with the Gemma3 key transform,
+  # LoRA extractor and transpose rules. Side effects: file writes. Returns None.
   """Saves a Gemma3 model with LoRA weights merged in safetensors format.
 
   Args:

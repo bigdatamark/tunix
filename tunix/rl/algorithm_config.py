@@ -12,11 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Base configuration dataclass shared by all RL algorithms (GRPO, PPO, DAPO,
+# ...). Provides validated string selectors for the algorithm variant, the
+# advantage estimator and the policy loss function (looked up by name in
+# function_registry), the reward-manager name, and an optional KL clamp.
+# Uses absl logging to print the config on construction.
 import dataclasses
 from absl import logging
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class AlgorithmConfig:
+  # [CLASS DOC]
+  # Slotted, keyword-only dataclass. Fields: algo_variant (default "grpo"),
+  # advantage_estimator (default "grpo"), policy_loss_fn (default "grpo"),
+  # reward_manager (default "sequence-level", name of a registered reward
+  # manager), kl_clamp_value (float or None; when set, per-token KL is clamped
+  # symmetrically to plus/minus this value in common.compute_kl_divergence).
+  # Construction validates selectors and logs all fields (see __post_init__).
   """Configuration for RL algorithms.
 
   Parameters:
@@ -39,6 +52,17 @@ class AlgorithmConfig:
   kl_clamp_value: float | None = None
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Validation hook run after dataclass init. Checks algo_variant is one of
+    # grpo, gspo-token, ppo, dapo; advantage_estimator is one of grpo, gae;
+    # policy_loss_fn is one of grpo, ppo. Raises ValueError naming the allowed
+    # values and the received value on the first failing check. Then calls
+    # print_config (side effect: info logs). reward_manager and kl_clamp_value are
+    # not validated.
+    # KNOWN ISSUE: the allowed lists are hardcoded and narrower than what
+    # function_registry supports (e.g. "drgrpo", "dapo" estimators); subclasses
+    # such as GRPOConfig override __post_init__ without calling this, so the
+    # validation and logging are silently skipped there.
     valid_algo_variants = [
         "grpo",
         "gspo-token",
@@ -67,6 +91,11 @@ class AlgorithmConfig:
     self.print_config()
 
   def print_config(self):
+    # [FUNCTION DOC]
+    # Logs, via absl info logging, a header line with the concrete class name and
+    # then one line per dataclass field with its name and current value. Works
+    # for subclasses since it iterates the dataclass fields of the instance.
+    # Returns None.
     """Prints all configuration fields, working dynamically for child classes."""
     logging.info(f"Initializing {self.__class__.__name__}:")
     for field in dataclasses.fields(self):

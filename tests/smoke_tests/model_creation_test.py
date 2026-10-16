@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Smoke/integration tests for tunix.cli.utils.model.create_model, downloading real checkpoints
+# from HuggingFace, GCS and Kaggle and verifying a model and resolved tokenizer path are returned.
+# Inputs: network access, credentials and JAX devices. Outputs: test results.
+# Side effects: downloads model files into a per-test temporary directory (deleted in tearDown);
+# may patch kagglesdk.kaggle_env by adding get_web_endpoint as an alias of get_endpoint.
 
 import os
 import tempfile
@@ -22,13 +28,19 @@ from tunix.cli.utils import model
 
 
 class ModelIntegrationTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized integration test of CLI model creation across model sources.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture creating a TemporaryDirectory and storing its path as download_dir.
     super().setUp()
     self.temp_dir = tempfile.TemporaryDirectory()
     self.download_dir = self.temp_dir.name
 
   def tearDown(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture cleaning up the temporary directory created in setUp.
     self.temp_dir.cleanup()
     super().tearDown()
 
@@ -75,6 +87,17 @@ class ModelIntegrationTest(parameterized.TestCase):
       expected_tokenizer_path,
       model_path=None,
   ):
+    # [FUNCTION DOC]
+    # Verifies create_model for one parameter set (Qwen2.5-0.5B from HuggingFace, gemma-3-270m from
+    # GCS, gemma-2-2b-it from Kaggle). Inputs: model_name, model_source, model_id, tokenizer_path,
+    # tokenizer_type, expected_tokenizer_path (regex), and optional model_path. For Kaggle it first
+    # tries to patch the kagglesdk env compatibility alias (ignoring any error) and skips the test if
+    # kagglehub cannot be imported. Builds a model config dict (download path and intermediate ckpt
+    # dir under the temp dir, no LoRA, no display) and a tokenizer config (no bos/eos), a 1x1 mesh
+    # with axes ("tp", "fsdp") on the first device, calls create_model, and asserts the model is
+    # non-None and the returned tokenizer path matches the expected regex.
+    # KNOWN ISSUE: the Kaggle expected path regex hardcodes a "/tmp/" prefix, which depends on the
+    # system temporary directory location.
     if model_source == "kaggle":
       try:
         import kagglesdk.kaggle_env  # pylint: disable=g-import-not-at-top # pytype: disable=import-error

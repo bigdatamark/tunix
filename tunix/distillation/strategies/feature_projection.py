@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Feature projection distillation strategy.
+# Defines FeatureProjectionStrategy: before training, wraps feature layers
+#   in both models with SowedModule and wraps the student in
+#   ModelWithFeatureProjection (a learned LinearGeneral mapping the
+#   student's stacked feature array to the teacher's stacked feature
+#   shape, both inferred from a forward pass on dummy_input). Per step the
+#   student returns (logits, projected features); the teacher's sown
+#   features are stacked; loss = alpha*feature_loss (default MSE) +
+#   (1-alpha)*student softmax CE. No side effects at import.
 """Implements Feature Projection Distillation Strategy."""
 
 from typing import Callable
@@ -28,6 +38,13 @@ ModelForwardCallable = base_strategy.ModelForwardCallable
 
 
 class FeatureProjectionStrategy(base_strategy.BaseStrategy):
+  # [CLASS DOC]
+  # Feature projection distillation. Attributes: alpha, feature_loss_fn,
+  # feature_layer (module class captured in both models), dummy_input
+  # (kwargs dict used for shape inference, same for both models), rngs.
+  # The student forward fn is called on the ModelWithFeatureProjection
+  # wrapper and must return that wrapper's (logits, projected_features)
+  # tuple unchanged. Losses return a bare scalar (no metrics dict).
   """Implements Feature Projection distillation.
 
   This strategy captures the feature maps and computes loss (typically mse)
@@ -49,6 +66,13 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
           Callable[[jax.Array, jax.Array], jax.Array] | None
       ) = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: student/teacher forward fns, labels_fn, feature_layer,
+    #   dummy_input, rngs, alpha (default 0.75), feature_loss_fn (optional;
+    #   None means mean of squared difference over all elements).
+    # Behavior: init BaseStrategy (jits fns), validate alpha, store all
+    #   arguments. Exceptions: ValueError if alpha not in [0.0, 1.0].
+    # Side effects: none.
     """Initializes the FeatureProjection strategy.
 
     Args:
@@ -87,6 +111,13 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       teacher_model: nnx.Module,
   ) -> tuple[nnx.Module, nnx.Module]:
+    # [FUNCTION DOC]
+    # Inputs: student, teacher. Returns
+    #   setup_models_with_feature_projection(student, teacher, feature_layer,
+    #   feature_layer, dummy_input, dummy_input, rngs=rngs), i.e.
+    #   (ModelWithFeatureProjection wrapping the sown student, sown teacher).
+    # Exceptions: from the setup helper. Side effects: mutates both models
+    #   in place (sowing wrappers) and runs one forward pass on each.
     """Pre-processes the models for distillation."""
     return feature_extraction.setup_models_with_feature_projection(
         student_model,
@@ -104,6 +135,11 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       teacher_model: nnx.Module,
   ) -> tuple[nnx.Module, nnx.Module]:
+    # [FUNCTION DOC]
+    # Inputs: (possibly wrapped) student, teacher. Returns
+    #   remove_feature_projection_from_models(student, teacher): the
+    #   student unwrapped from the projection wrapper (projection weights are
+    #   discarded) and both with sowing wrappers removed in place.
     """Post-processes the models after distillation."""
     return feature_extraction.remove_feature_projection_from_models(
         student_model, teacher_model
@@ -115,6 +151,12 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       teacher_model: nnx.Module,
       inputs: dict[str, jax.Array],
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Inputs: teacher_model, inputs. Runs the jitted teacher forward fn
+    #   (output discarded), pops the teacher's nnx.Intermediate state and
+    #   returns jnp.stack of its leaves (leading axis = captured layer).
+    # Side effect: clears teacher intermediates. Exceptions: stacking errors.
+    # No stop_gradient is applied (harmless; teacher is not differentiated).
     """Computes the teacher model outputs."""
     _ = self._teacher_forward_fn(teacher_model, **inputs)
     teacher_features = feature_extraction.pop_sowed_intermediate_outputs(
@@ -128,6 +170,12 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       inputs: dict[str, jax.Array],
   ) -> dict[str, jax.Array]:
+    # [FUNCTION DOC]
+    # Inputs: student_model (ModelWithFeatureProjection), inputs. Calls the
+    #   jitted student forward fn, unpacks its result as (logits,
+    #   projected_features) and returns {"logits": ..., "features": ...}.
+    # Exceptions: unpacking error if the forward fn does not return a
+    #   2-tuple. Side effect: the wrapper pops student intermediates.
     """Computes the student model outputs."""
     student_logits, student_features = self._student_forward_fn(
         student_model, **inputs
@@ -139,6 +187,10 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       student_output: dict[str, jax.Array],
       labels: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Eval loss. Inputs: student_output dict (needs "logits"), labels.
+    #   Returns mean softmax cross-entropy (bare scalar). Exceptions:
+    #   KeyError if "logits" missing. No side effects.
     """Computes the task loss.
 
     Args:
@@ -162,6 +214,14 @@ class FeatureProjectionStrategy(base_strategy.BaseStrategy):
       teacher_output: jax.Array,
       labels: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Training loss. Inputs: student_output with "logits" and "features",
+    #   teacher_output (stacked teacher features), labels.
+    # Steps: TypeError if a key is missing; feature_loss =
+    #   feature_loss_fn(student projected features, teacher_output) (shapes
+    #   must match; no pooling); task_loss = mean softmax CE(student logits,
+    #   labels); return alpha*feature_loss + (1-alpha)*task_loss.
+    # Exceptions: TypeError; shape errors from the loss fn. No side effects.
     """Computes the combined feature projection and task loss.
 
     Args:

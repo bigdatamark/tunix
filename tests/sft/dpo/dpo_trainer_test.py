@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.sft.dpo.dpo_trainer: DPOTrainer training on
+# pre-tokenized TrainingInput and on raw-string DataInput / dict inputs
+# (tokenized with a tokenizer), the DPO loss (sigmoid loss with beta and
+# label smoothing), and _prepare_inputs (concatenates prompt with chosen and
+# rejected completions into a 2B batch, builds attention masks, computes
+# reference log-probs, completion mask and logits_to_keep).
+# Module setup: disables jax_threefry_partitionable globally so random init
+# matches the hard-coded expected values.
 from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -30,14 +39,23 @@ jax.config.update("jax_threefry_partitionable", False)
 
 
 class MySource(grain.RandomAccessDataSource):
+  # [CLASS DOC]
+  # HELPER: minimal grain RandomAccessDataSource wrapping an indexable
+  # sequence; its length controls how many dataset elements exist.
 
   def __init__(self, data):
+    # [FUNCTION DOC]
+    # HELPER: stores the backing sequence.
     self._data = data
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the element at idx.
     return self._data[idx]
 
   def __len__(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the number of elements.
     return len(self._data)
 
 
@@ -50,6 +68,10 @@ def _dummy_dataset(
     rejected_ids: np.ndarray,
     rejected_mask: np.ndarray,
 ):
+  # [FUNCTION DOC]
+  # HELPER: builds a grain MapDataset over source where every element (the
+  # source value is ignored) is the same TrainingInput batch built from the
+  # given prompt/chosen/rejected id and mask arrays.
   return grain.MapDataset.source(source).map(
       lambda x: dpo_lib.TrainingInput(
           prompt_ids=prompt_ids,
@@ -69,6 +91,10 @@ def _dummy_string_dataset(
     rejected_responses: list[str],
     return_dict=False,
 ):
+  # [FUNCTION DOC]
+  # HELPER: builds a grain MapDataset over source where each element is the
+  # same batch of strings, either as a DataInput or (return_dict True) as a
+  # dict with keys prompts, chosen_responses and rejected_responses.
   ds = grain.MapDataset.source(source)
   if return_dict:
     return ds.map(
@@ -89,6 +115,8 @@ def _dummy_string_dataset(
 
 
 class DPOTrainerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for DPOTrainer and its loss/input preparation.
 
   @parameterized.named_parameters(
       dict(
@@ -122,6 +150,12 @@ class DPOTrainerTest(parameterized.TestCase):
       rejected_mask,
       use_ref_model,
   ):
+    # [FUNCTION DOC]
+    # Verifies DPO training (10 steps, eval every 5 on a 2-element eval set)
+    # updates params, with and without a reference model, and logs
+    # rewards/chosen, rewards/rejected, rewards/margin, rewards/accuracy,
+    # log_probs/chosen and log_probs/rejected once per train step and 3 times
+    # for eval.
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
     ref_model = None
@@ -203,6 +237,11 @@ class DPOTrainerTest(parameterized.TestCase):
       ),
   )
   def test_dpo_trainer_with_string_inputs(self, train_ds):
+    # [FUNCTION DOC]
+    # Verifies training from string inputs (dataclass or dict) with MockVocab
+    # tokenizer and max prompt/response length 3 updates the policy but leaves
+    # the reference model unchanged, and logs reward metrics once per step.
+    # KNOWN ISSUE: the 'ref_model is not None' guard is always true here.
     tokenizer = tc.MockVocab()
     model = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=tokenizer.GetPieceSize()),
@@ -253,6 +292,11 @@ class DPOTrainerTest(parameterized.TestCase):
       )
 
   def test_dpo_loss_fn(self):
+    # [FUNCTION DOC]
+    # Verifies dpo_loss_fn against reference values: with get_per_token_logps
+    # mocked to fixed seeded normal values for 8 sequences (first 4 chosen, last
+    # 4 rejected) and fixed reference log-probs, beta 0.1 gives loss 0.753059
+    # and label_smoothing 0.3 gives 0.925447.
     np.random.seed(0)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     per_token_logps = np.random.normal(0, 5, size=(8, 4))
@@ -281,6 +325,11 @@ class DPOTrainerTest(parameterized.TestCase):
       np.testing.assert_allclose(loss, 0.925447, atol=1e-5)
 
   def test_dpo_prepare_inputs_for_strings(self):
+    # [FUNCTION DOC]
+    # Verifies _prepare_inputs on strings: prompts are left-padded and
+    # responses right-padded to length 3 using MockVocab ids, producing input_ids
+    # rows (chosen rows then rejected rows), attention-mask sums, approximate
+    # reference log-probs, completion mask and logits_to_keep 3.
     tokenizer = tc.MockVocab()
 
     model = tc.ToyTransformer(
@@ -342,6 +391,12 @@ class DPOTrainerTest(parameterized.TestCase):
     self.assertEqual(out.logits_to_keep, 3)
 
   def test_dpo_prepare_inputs(self):
+    # [FUNCTION DOC]
+    # Verifies _prepare_inputs on token inputs: input_ids are prompt ids followed
+    # by chosen (first B rows) then rejected (last B rows) completions; checks
+    # attention-mask sums (causal mask over valid tokens), reference log-probs
+    # (rtol 1e-2), completion mask equal to the completion masks, and
+    # logits_to_keep equal to completion length 4.
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     ref_model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     dpo_trainer = dpo_lib.DPOTrainer(

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Integration test verifying that SglangJaxSampler.update_params transfers LoRA weights from a Tunix
+# trainer model (Llama 3.2 1B with dummy weights and qwix LoRA on gate_proj) into the SGLang-JAX rollout
+# engine's LoRA buffers with the expected transpose. Requires accelerators, sglang-jax and HF access to
+# download the tokenizer. Side effects: prints, device memory use.
 
 """Unit test for LoRA update_params in SGLangJax sampler.
 
@@ -38,10 +43,18 @@ from tunix.models.dummy_model_creator import create_dummy_model
 
 
 class SglangJaxLoRATest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test suite for LoRA parameter syncing into the SGLang-JAX sampler.
   """Test LoRA parameter updates in SGLangJax sampler."""
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: class fixture. Sets LoRA rank 64 and alpha 64.0, uses up to 4 devices in a (1, n) mesh with
+    # axes ("fsdp", "tp"), sets the Llama 3.2 1B config, uses the HF repo id as model_path, and loads the
+    # tokenizer from HuggingFace.
+    # KNOWN ISSUE: a comment says a temporary directory is created for model files, but model_path is just
+    # the repo id string.
     """Set up test fixtures."""
     super().setUpClass()
 
@@ -70,6 +83,17 @@ class SglangJaxLoRATest(absltest.TestCase):
     cls.tokenizer = transformers.AutoTokenizer.from_pretrained(model_version)
 
   def test_lora_update_params(self):
+    # [FUNCTION DOC]
+    # Verifies LoRA transfer. Inside the mesh: creates a dummy bfloat16 Llama3 (seed 3), applies qwix LoRA to
+    # modules matching ".*gate_proj", builds an sglang_jax mapping config, and creates the sampler with static
+    # LoRA on gate_proj (max rank 64, scaling alpha/rank, precompile batch padding 2 and token padding 512,
+    # dummy load format). It finds the first trainer state entry whose path contains gate_proj and
+    # kernel_lora_a, sets it to all 42s, calls update_params, locates the mapped target path in the sampler's
+    # transformer_state, and asserts the target equals the source with a leading axis added and the last two
+    # axes swapped. Raises assertion failures if the source or target parameter is missing or values differ.
+    # KNOWN ISSUE: the in-loop sanity check is inverted: it asserts the new value equals itself, then raises a
+    # ValueError that is always caught by a broad except and prints a misleading "not equal" message, so it
+    # verifies nothing.
     """Test that update_params correctly transfers LoRA weights."""
 
     # Create base model with dummy weights
@@ -210,6 +234,14 @@ class SglangJaxLoRATest(absltest.TestCase):
   def _get_target_path(
       self, src_path: str, mapping_config: mappings.MappingConfig
   ) -> str:
+    # [FUNCTION DOC]
+    # HELPER: maps a source parameter path to the target path. Uses lora_to_hf_mappings if the path contains
+    # "lora_a" or "lora_b" and that mapping is non-empty, else to_hf_mappings, else raises ValueError. For each
+    # (pattern, (target, sharding)) entry: if the pattern contains "*", escapes dots, turns each "*" into a
+    # digit-capturing group, regex-matches from the start of the path, and on match substitutes captured
+    # numbers into successive "*" in the target; otherwise requires exact equality. Returns the target path
+    # or raises ValueError if nothing matches.
+    # KNOWN ISSUE: the regex is not anchored at the end, so a pattern can match a longer path prefix.
     """Convert source path to target path using mappings."""
     # Determine if this is a LoRA parameter
     is_lora_param = "lora_a" in src_path or "lora_b" in src_path

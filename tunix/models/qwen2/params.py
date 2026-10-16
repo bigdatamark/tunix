@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Checkpoint loading for Qwen2: defines the regex mapping from Hugging Face
+# safetensors keys to tunix Qwen2 parameter paths (with optional axis permutation
+# and reshape), and a thin wrapper around safetensors_loader.load_and_create_model.
 """Utils for loading and converting Qwen2 PT weights."""
 
 import jax
@@ -21,6 +25,19 @@ from tunix.models.qwen2 import model as model_lib
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: Returns a dict mapping regex patterns of HF checkpoint keys to a tuple
+  # (tunix target path with backreference to the layer index, transform). The
+  # transform is None or (permutation, reshape-shape-or-None). Mapping: token
+  # embedding -> embedder.input_embedding; q/k/v/o projection weights are
+  # transposed (HF stores [out, in]) and reshaped to (embed, heads, head_dim) for
+  # q, (embed, kv_heads, head_dim) for k/v and (heads, head_dim, embed) for o;
+  # MLP gate/up/down weights are transposed into Linear kernels; final norm,
+  # input and post-attention layernorm weights copied as-is; lm_head weight is
+  # transposed into lm_head.w.
+  # Also maps q/k/v projection biases to attn.q_bias/k_bias/v_bias unchanged
+  # (their flat length is reshaped later by the model, not here).
+  # Input: cfg supplies embed_dim, num_heads, num_kv_heads, head_dim. No side effects.
   # Mapping of torch_keys -> (nnx_keys, (permute_rule, reshape_rule)).
   return {
       r"model\.embed_tokens\.weight": ("embedder.input_embedding", None),
@@ -88,6 +105,12 @@ def create_model_from_safe_tensors(
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ) -> model_lib.Qwen2:
+  # [FUNCTION DOC]
+  # Loads safetensors files from file_dir and returns a populated Qwen2 model.
+  # Delegates to safetensors_loader.load_and_create_model with model_class Qwen2,
+  # the given config, the key mapping above, optional mesh (sharding), dtype
+  # override, no preprocessing, and mode (passed through; 'auto' by default).
+  # Raises/side effects: those of the loader (file I/O, device allocation).
   """Load tensors from the safetensors file and create a Qwen2 model."""
   return safetensors_loader.load_and_create_model(
       file_dir=file_dir,

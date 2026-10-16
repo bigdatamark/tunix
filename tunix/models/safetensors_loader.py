@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Generic loader that builds a tunix NNX model and fills its parameters from
+# Hugging Face style safetensors files. Model packages supply a key-mapping
+# function (config -> dict of regex on checkpoint key -> (tunix key template,
+# transform)), resolved per key by torch_utils.torch_key_to_jax_key; transform
+# is None or (permutation or None, reshape-shape or None) applied in that
+# order. Two strategies: 'original' (safetensors library, threaded per-key
+# reads, per-file processing, works with GCS/internal/pathways) and
+# 'optimized' (manual header parse + mmap of the raw data block, zero-copy
+# numpy views, one pass over all files). load_and_create_model selects one.
+# Aliases: load_file_from_gcs (tunix.oss.utils; downloads a gs:// directory
+# and returns a local path) and torch_key_to_jax_key.
 """Common utilities for loading OSS model weights from safetensors files.
 
 Not compatible with GOOGLE_INTERNAL_PACKAGE_PATH.
@@ -44,6 +56,8 @@ torch_key_to_jax_key = torch_utils.torch_key_to_jax_key
 
 
 def stoi(s):
+  # [FUNCTION DOC]
+  # HELPER: Returns int(s) if s parses as an int, else s unchanged.
   """Convert string to int if possible, otherwise return as is."""
   try:
     return int(s)
@@ -52,6 +66,11 @@ def stoi(s):
 
 
 def path_to_key(path):
+  # [FUNCTION DOC]
+  # HELPER: Converts a JAX tree path (sequence of key entries) to a dot-joined
+  # string, using each entry's .key attribute when present (else the entry
+  # itself), normalizing numeric strings to ints before str(). E.g. a path to
+  # layers -> 0 -> attn -> q_proj -> w becomes 'layers.0.attn.q_proj.w'.
   """Convert path to string key."""
   return '.'.join(
       str(stoi(key.key if hasattr(key, 'key') else key)) for key in path
@@ -59,6 +78,12 @@ def path_to_key(path):
 
 
 def to_np_dtype(dtype):
+  # [FUNCTION DOC]
+  # HELPER: Maps a safetensors dtype string ('BF16','F16','F32','F64') or the
+  # equivalent jnp dtype to the numpy/ml_dtypes type. Returns None for anything
+  # else (e.g. integer or FP8 dtypes).
+  # KNOWN ISSUE: unsupported dtypes silently yield None, which later makes numpy
+  # use float64 or fail in confusing ways.
   if dtype == 'BF16' or dtype == jnp.bfloat16:
     return ml_dtypes.bfloat16
   elif dtype == 'F16' or dtype == jnp.float16:
@@ -70,6 +95,20 @@ def to_np_dtype(dtype):
 
 
 def load_safetensors_with_offsets(filepath):
+  # [FUNCTION DOC]
+  # HELPER: Parses a safetensors file without the library. Reads the 8-byte
+  # little-endian header length and the JSON header, then for every tensor
+  # (skipping '__metadata__') records name, element offset and count (byte
+  # offsets divided by the item size), shape and dtype. The item size is taken
+  # from the FIRST tensor's dtype and assumed common to all tensors. Opens the
+  # file again, memory-maps it read-only and creates one numpy view over the
+  # whole data block with that common dtype.
+  # Returns (contiguous_array, tensor_metadata list, mmap object, open file
+  # handle); the caller must close the handle (and mmap).
+  # Raises: struct/JSON/IO errors on malformed files.
+  # KNOWN ISSUE: files mixing dtypes (or with byte offsets not divisible by the
+  # common item size) are decoded incorrectly; the docstring describes metadata
+  # correctly but does not mention that dtype is assumed uniform.
   """Loads safetensors file and returns tensor metadata with offsets.
 
   Args:
@@ -146,6 +185,30 @@ def load_and_create_model_orig(
     preprocess_fn=None,
     dtype: jnp.dtype | None = None,
 ):
+  # [FUNCTION DOC]
+  # 'Original' loading strategy. Inputs as load_and_create_model (minus mode).
+  # Steps: if file_dir is gs://, download it locally; glob '*.safetensors'
+  # (ValueError if none). Under compat.set_mesh(mesh) (or a null context),
+  # shape-evaluate the model to get an abstract model; split into graph def and
+  # abstract state; pure-dict state; optional named shardings from the mesh;
+  # build key_map = key_mapping(config). For each file: open with
+  # safetensors.safe_open (numpy) and, in a thread pool of cpu_count workers,
+  # process every key (see process_key) into a per-file dict of tunix key ->
+  # jnp array (cast to dtype if given); re-raise the first worker exception;
+  # apply preprocess_fn to the per-file dict; log a warning listing unmapped
+  # keys; then tree-map over the state (with shardings) replacing each leaf whose
+  # path key (or key + '.value') is in the per-file dict with the loaded array
+  # placed via device_put (onto its sharding, after pulling to host, or onto
+  # the first device). Leaves not loaded stay abstract.
+  # Returns nnx.merge(graph_def, state) i.e. the model.
+  # Raises: ValueError (no files, duplicate key within a file, shape mismatch),
+  # RuntimeError wrapping per-key failures.
+  # Side effects: file/GCS I/O, device allocation, logging.
+  # KNOWN ISSUE: preprocess_fn is applied per file (breaks expert stacking when
+  # a layer's experts span files); skipped_keys accumulates across files so the
+  # warning repeats earlier keys; params never found remain ShapeDtypeStructs
+  # without any error; the jnp.array conversion places every tensor on the
+  # default device first, which is then pulled back to host.
   """Generic function to load model from safetensors files.
 
   Args:
@@ -197,6 +260,14 @@ def load_and_create_model_orig(
       keys = sf.keys()
 
       def process_key(k_name, f, sf_file, file_loaded_tensors):
+        # [FUNCTION DOC]
+        # HELPER: Worker for one checkpoint key: reads the tensor under a lock (the
+        # safetensors handle is not thread-safe), maps the key (ValueError from the
+        # mapper means unmapped: appended to skipped_keys and returned), applies the
+        # optional permutation then reshape, converts to a jnp array cast to dtype if
+        # needed, and stores it in file_loaded_tensors. Raises ValueError for a
+        # duplicate mapped key, and wraps any exception in RuntimeError naming the
+        # tensor and file. Side effects: mutates the shared dict and list.
         try:
           with file_lock:
             v = sf_file.get_tensor(k_name)  # get_tensor is not thread-safe
@@ -256,7 +327,15 @@ def load_and_create_model_orig(
       )
 
     def make_update_tensor_fn(current_file_tensors):
+      # [FUNCTION DOC]
+      # HELPER: Returns an update_tensor closure bound to one file's loaded tensors.
       def update_tensor(path, param, shard=None):
+        # [FUNCTION DOC]
+        # HELPER: Tree-map callback for one state leaf. Computes the path key and
+        # checks it and key + '.value' against the loaded tensors; on a hit, raises
+        # ValueError on shape mismatch, else returns the array device_put onto the
+        # given sharding (after device_get to host) or onto the first device. Returns
+        # the original leaf when not found.
         current_path_key = path_to_key(path)
 
         # nnx.Param adds a .value suffix to the key
@@ -306,6 +385,27 @@ def load_and_create_model_opt(
     preprocess_fn=None,
     dtype: jnp.dtype | None = None,
 ):
+  # [FUNCTION DOC]
+  # 'Optimized' loading strategy (Linux, local or downloaded files). Same
+  # inputs as the original strategy. Steps: resolve gs:// paths; glob files
+  # (ValueError if none); shape-evaluate the model under the mesh; split; pure
+  # dict; shardings from the mesh, or every leaf mapped to the first device when
+  # no mesh. Memory-map every file via load_safetensors_with_offsets, then for
+  # every tensor map its name (unmapped names collected and warned about),
+  # slice the flat view by element offset/count, reshape to its shape, apply the
+  # optional permutation and reshape (still zero-copy where possible), store in
+  # one global dict. Apply preprocess_fn once to the whole dict. Tree-map over
+  # the sharding dict: look up path key or key + '.value', optionally cast to
+  # dtype (via to_np_dtype) and device_put onto the leaf's sharding. Assert
+  # every resulting leaf's shape equals the abstract shape. Close file handles
+  # and merge into the model.
+  # Returns the model. Raises: ValueError (no files), AssertionError (shape
+  # mismatch).
+  # KNOWN ISSUE: a parameter missing from the checkpoint becomes
+  # device_put(None) and then fails in the shape assertion with an
+  # AttributeError instead of a clear error; mmap objects are never explicitly
+  # closed; the skipped-keys warning is emitted once per file with the cumulative
+  # list; dtype values unsupported by to_np_dtype cast to None (float64).
   """Loads safetensors files and creates an NNX model.
 
   This version is optimized for linux file systems.
@@ -399,7 +499,13 @@ def load_and_create_model_opt(
     state_dict = preprocess_fn(state_dict)
 
   def shard_state(state_dict):
+    # [FUNCTION DOC]
+    # HELPER: Returns a tree-map callback closed over the loaded state dict.
     def _shard_state(path, sharding):
+      # [FUNCTION DOC]
+      # HELPER: For a sharding leaf at path, finds the tensor by path key or key +
+      # '.value', casts it to dtype if requested, and returns it device_put onto the
+      # sharding (None if not found).
       key = path_to_key(path)
       possible_keys = [
           key,
@@ -421,6 +527,9 @@ def load_and_create_model_opt(
   state_dict = jax.tree.map_with_path(shard_function, sharding_dict)
 
   def _assert_shapes_match(path, x, y):
+    # [FUNCTION DOC]
+    # HELPER: Asserts that a loaded leaf x has the abstract leaf y's shape
+    # (AssertionError with path otherwise); returns x.
     assert (
         x.shape == y.shape
     ), f'Shape mismatch for {path}: expected {y.shape}, got {x.shape}'
@@ -444,6 +553,18 @@ def load_and_create_model(
     dtype: jnp.dtype | None = None,
     mode: str = 'auto',
 ):
+  # [FUNCTION DOC]
+  # Public entry point: loads safetensors from file_dir into a new model.
+  # Inputs: file_dir (local or gs:// directory), model_class (called as
+  # model_class(config, rngs=...)), config, key_mapping (config -> regex map),
+  # mesh (optional), preprocess_fn (optional dict -> dict transform of loaded
+  # tensors keyed by tunix keys), dtype (optional cast), mode ('auto',
+  # 'optimized', 'original').
+  # 'auto' picks 'original' in Google-internal environments or when Pathways is
+  # initialized, else 'optimized'. Explicit 'optimized' in those environments
+  # raises ValueError. 'original' outside them logs a recommendation to use
+  # optimized. Any mode other than 'optimized' (including unknown strings) runs
+  # the original strategy. Returns the loaded model.
   """Loads safetensors files and creates an NNX model.
 
   Args:

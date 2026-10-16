@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.examples.data.math_dataset: apply_template (renders prompts from question
+# records with a tokenizer chat template or a built-in Gemma-style fallback template, strips the
+# "#### " prefix from answers yielding None when absent, decodes bytes to str, and keeps only
+# prompts/question/answer fields), _parse_huggingface_dataset_name (splits "name:config", defaulting
+# config to "default"), and create_dataset with a HuggingFace source. Uses in-file fakes for the
+# tokenizer and dataset. No side effects beyond mocks.
 
 """Tests for tunix.examples.data.math_dataset.apply_template."""
 
@@ -24,14 +31,23 @@ from tunix.examples.data import math_dataset
 
 
 class _FakeTokenizer:
+  # [CLASS DOC]
+  # HELPER: fake tokenizer recording apply_chat_template calls and returning a recognizable string.
 
   def __init__(self, template_suffix=""):  # suffix helps distinguish calls
+    # [FUNCTION DOC]
+    # HELPER: input template_suffix (string appended to rendered output, default empty). Initialises an
+    # empty calls list.
     self.calls = []
     self.template_suffix = template_suffix
 
   def apply_chat_template(
       self, msgs, tokenize=False, add_generation_prompt=True
   ):
+    # [FUNCTION DOC]
+    # HELPER: records a dict of msgs, tokenize and add_generation_prompt in calls, then returns
+    # "templated:" followed by the first user-role message content and the template suffix. Raises
+    # StopIteration if no message has role "user".
     # Capture call arguments for assertion
     self.calls.append({
         "msgs": msgs,
@@ -44,23 +60,41 @@ class _FakeTokenizer:
 
 
 class _BaseDataset:
+  # [CLASS DOC]
+  # HELPER: list-backed dataset fake supporting map, iteration and indexing.
 
   def __init__(self, records):
+    # [FUNCTION DOC]
+    # HELPER: stores the records as a list.
     self._records = list(records)
 
   def map(self, fn):
+    # [FUNCTION DOC]
+    # HELPER: returns a new fake dataset whose records are fn applied to each record (eager).
     return _BaseDataset([fn(x) for x in self._records])
 
   def __iter__(self):
+    # [FUNCTION DOC]
+    # HELPER: iterates over the stored records.
     return iter(self._records)
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the record at the given index.
     return self._records[idx]
 
 
 class ApplyTemplateTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests math_dataset.apply_template behavior.
 
   def test_with_tokenizer_uses_apply_chat_template_and_preserves_fields(self):
+    # [FUNCTION DOC]
+    # Verifies that with a tokenizer, prompts come from apply_chat_template (called once with tokenize and
+    # add_generation_prompt passed through, two messages: a system message containing SYSTEM_PROMPT and the
+    # user question), question is kept, answer has "#### " stripped, and extra fields are dropped.
+    # KNOWN ISSUE: an inline comment says original fields are preserved, while the test asserts the extra
+    # field is dropped (only the named fields are kept).
     ds = _BaseDataset([
         {"question": "Q1", "answer": "#### A1", "extra": 7},
     ])
@@ -89,6 +123,9 @@ class ApplyTemplateTest(parameterized.TestCase):
     self.assertIn(math_dataset.SYSTEM_PROMPT, call["msgs"][0]["content"])
 
   def test_without_tokenizer_falls_back_to_plain_template(self):
+    # [FUNCTION DOC]
+    # Verifies that without a tokenizer the fallback template is used: prompts contain
+    # "<start_of_turn>user", the question and SYSTEM_PROMPT, and the answer is extracted.
     ds = _BaseDataset([
         {"question": "Q2", "answer": "#### A2"},
     ])
@@ -105,6 +142,8 @@ class ApplyTemplateTest(parameterized.TestCase):
     self.assertEqual(result["answer"], "A2")
 
   def test_no_valid_answer(self):
+    # [FUNCTION DOC]
+    # Verifies that an answer lacking the "####" marker yields answer None while prompts still render.
     ds = _BaseDataset([
         {"question": "Q2", "answer": "A2"},
     ])
@@ -122,6 +161,9 @@ class ApplyTemplateTest(parameterized.TestCase):
 
   @parameterized.parameters(True, False)
   def test_bytes_are_decoded_to_str(self, use_tokenizer):
+    # [FUNCTION DOC]
+    # Verifies byte-string question and answer are decoded to str (answer also stripped of "#### "), both
+    # with and without a tokenizer.
     ds = _BaseDataset([
         {"question": b"byte-q", "answer": b"#### byte-a"},
     ])
@@ -139,8 +181,12 @@ class ApplyTemplateTest(parameterized.TestCase):
 
 
 class HuggingFaceDatasetTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests HuggingFace dataset name parsing and loading in math_dataset.
 
   def test_parse_huggingface_dataset_name_supports_gsm8k_alias(self):
+    # [FUNCTION DOC]
+    # Verifies "openai/gsm8k" parses to dataset "openai/gsm8k" with config "default".
     dataset_name, config_name = math_dataset._parse_huggingface_dataset_name(
         "openai/gsm8k"
     )
@@ -149,6 +195,8 @@ class HuggingFaceDatasetTest(absltest.TestCase):
     self.assertEqual(config_name, "default")
 
   def test_parse_huggingface_dataset_name_supports_explicit_config(self):
+    # [FUNCTION DOC]
+    # Verifies "openai/gsm8k:main" parses to dataset "openai/gsm8k" with config "main".
     dataset_name, config_name = math_dataset._parse_huggingface_dataset_name(
         "openai/gsm8k:main"
     )
@@ -157,6 +205,10 @@ class HuggingFaceDatasetTest(absltest.TestCase):
     self.assertEqual(config_name, "main")
 
   def test_create_dataset_uses_huggingface_loader(self):
+    # [FUNCTION DOC]
+    # Verifies create_dataset with data_source "huggingface" calls get_huggingface_dataset once with
+    # dataset_name and split keywords, and applies the template to the result (question kept, answer "42",
+    # prompt containing the question).
     raw_dataset = _BaseDataset([
         {"question": "Q3", "answer": "#### 42"},
     ])

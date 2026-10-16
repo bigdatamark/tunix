@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Sampler backend that runs generation on vLLM (TPU JAX backend, a.k.a.
+# tpu-inference) inside the current process and exposes the tunix BaseSampler
+# interface, plus in-place synchronization of trainer weights into the vLLM
+# model state.
+# Two execution modes: offline mode uses vllm.LLM with batched generate;
+# server mode uses VLLMInProcessDriver (continuous batching on a background
+# thread) and submits one request per prompt.
+# Contents: VllmConfig (configuration dataclass) and VllmSampler.
+# Import-time side effect: sets environment variable
+# VLLM_ENABLE_V1_MULTIPROCESSING to 0 so engine and worker share this process
+# (also importing vllm_async_driver applies the same setting).
 """Sampler for vLLM-style autoregressive decoding using JAX and NNX models."""
 
 import atexit
@@ -46,6 +58,22 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 @dataclasses.dataclass
 class VllmConfig:
   """Vllm rollout configuations."""
+  # [CLASS DOC]
+  # Mutable dataclass of vLLM rollout settings.
+  # Sampler fields: server_mode (use the in-process driver), mapping_config
+  # (MappingConfig, default empty), return_logprobs.
+  # Environment fields: init_with_random_weights (load dummy weights since real
+  # weights are synced later), tpu_backend_type (default jax).
+  # Processed engine fields: additional_config dict, enable_dp_attention,
+  # hbm_utilization (maps to gpu_memory_utilization, default 0.5), lora_config,
+  # mesh (device mesh, required in practice), data/tensor parallel sizes (-1
+  # means infer from mesh), expert_parallel_size (1), delete_dst_buffers (True),
+  # reshard_chunk_size.
+  # engine_kwargs is an init-only pass-through dict of raw vLLM EngineArgs
+  # stored as _processed_engine_kwargs. _RESERVED_KEYS (not an init field) lists
+  # tensor_parallel_size, data_parallel_size and expert_parallel_size, which may
+  # not appear in engine_kwargs. sampling_kwargs is a dict of default extra
+  # SamplingParams attributes.
 
   # Sampler related
   server_mode: bool = False
@@ -92,6 +120,14 @@ class VllmConfig:
   sampling_kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
   def __post_init__(self, engine_kwargs: Optional[Dict[str, Any]]):
+    # [FUNCTION DOC]
+    # Dataclass post-init hook receiving the init-only engine_kwargs (None means
+    # empty). Raises ValueError listing any reserved keys present. Stores the dict
+    # as _processed_engine_kwargs, then for each item logs it and sets an
+    # attribute of that name on the config.
+    # KNOWN ISSUE: every engine kwarg is also set as an attribute on the config,
+    # which can silently overwrite a same-named config field (e.g.
+    # hbm_utilization) or add arbitrary new attributes.
     engine_kwargs = engine_kwargs or {}
     illegal = self._RESERVED_KEYS & engine_kwargs.keys()
     if illegal:
@@ -109,6 +145,11 @@ class VllmConfig:
 
 
 class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
+  # [CLASS DOC]
+  # BaseSampler implementation backed by vLLM. Holds a TokenizerAdapter, the
+  # config, the engine argument dict (args), either an LLM (offline mode) or a
+  # VLLMInProcessDriver (server mode), a request id counter, and the effective
+  # weight key mappings, transpose keys and hook functions.
   """A sampler for vLLM-style autoregressive decoding using JAX and NNX models.
 
   This class wraps an NNX model and tokenizer for performing inference
@@ -123,6 +164,18 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       tokenizer: Any,
       config: VllmConfig,
   ):
+    # [FUNCTION DOC]
+    # Side effects on process environment: sets TPU_BACKEND_TYPE to the config's
+    # backend type when non-empty; sets NEW_MODEL_DESIGN to 1 when
+    # data_parallel_size is greater than 1; sets JAX_RANDOM_WEIGHTS to 1 when
+    # init_with_random_weights.
+    # Wraps the tokenizer in a TokenizerAdapter if needed, stores config, builds
+    # args via the config translator, and creates the engine: in server mode a
+    # driver (and registers stop with atexit), otherwise an LLM built from args
+    # (loads/initializes the model and KV cache on device).
+    # Copies the config's to_hf_mappings into a new dict (empty if None), stores
+    # transpose keys and hook fns, and if lora_config and LoRA mappings are both
+    # set, merges the LoRA mappings into the key mappings.
     """Initializes the VllmSampler.
 
     Args:
@@ -169,6 +222,9 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   @property
   def mesh(self) -> jax.sharding.Mesh:
+    # [FUNCTION DOC]
+    # Property returning the model runner's mesh if it is a jax.sharding.Mesh,
+    # otherwise raises AttributeError. Raises RuntimeError if no engine exists.
     if hasattr(self._model_runner, "mesh") and isinstance(
         self._model_runner.mesh, jax.sharding.Mesh
     ):
@@ -185,6 +241,25 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       updated_weights: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
   ):
+    # [FUNCTION DOC]
+    # Synchronizes trainer weights into the vLLM model. filter_types is ignored.
+    # Steps:
+    # 1. Reset the prefix cache and call collective_rpc delete_kv_cache on the LLM
+    #    or the driver's engine to free HBM.
+    # 2. jax.effects_barrier to finish outstanding device work.
+    # 3. If key mappings exist: optionally run the config's preprocess_src_state
+    #    on the weights, then utils.transfer_state_with_mappings into the current
+    #    transformer_state with key mappings, hook fns, transpose keys,
+    #    reshard.reshard_pytree, delete_dst_buffers and reshard_chunk_size from
+    #    config, KV head count and head size from the model config, and tp_size
+    #    from args (default 1).
+    #    Otherwise (direct sync, e.g. MaxText to MaxText) require a maxtext_config
+    #    key in additional_config (ValueError if missing) and call
+    #    utils.transfer_state_directly with destination buffers deleted.
+    # 4. If the model runner has a state_leaves attribute, refresh it from the
+    #    runner state (tuple of leaves for an nnx.State, else the state itself).
+    # 5. collective_rpc reinitialize_kv_cache to reallocate the KV cache.
+    # Raises RuntimeError if no engine is initialized.
     del filter_types
 
     if self.llm is not None:
@@ -261,6 +336,11 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       self._driver.llm_engine.collective_rpc("reinitialize_kv_cache")
 
   def load_checkpoint(self, path_or_weights: str | jaxtyping.PyTree):
+    # [FUNCTION DOC]
+    # If the argument is a PyTree, forwards to update_params; otherwise raises
+    # NotImplementedError.
+    # KNOWN ISSUE: jaxtyping.PyTree accepts essentially any object (including a
+    # path string), so the NotImplementedError branch is effectively unreachable.
     # TODO(b/434741253): Consider support orbax checkpoint loading
     if isinstance(path_or_weights, jaxtyping.PyTree):
       self.update_params(updated_weights=path_or_weights, filter_types=None)
@@ -268,6 +348,21 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       raise NotImplementedError("Only support in memory weight sync as of now.")
 
   def _vllm_config(self, config: VllmConfig):
+    # [FUNCTION DOC]
+    # HELPER: translates VllmConfig into keyword arguments for vLLM LLM or
+    # EngineArgs. Starts from a copy of the processed engine kwargs; sets
+    # load_format dummy when init_with_random_weights; gpu_memory_utilization from
+    # hbm_utilization; additional_config from config (or a new empty dict) with
+    # lora_config added when set; resolves tensor, data and expert parallel sizes
+    # via utils.resolve_parallelism_sizes using the mesh; sets
+    # tensor_parallel_size and data_parallel_size; and sets
+    # additional_config.sharding.sharding_strategy with expert_parallelism, the
+    # flattened mesh device id list and enable_dp_attention. Returns the dict.
+    # Raises AttributeError if mesh is None; propagates errors from parallelism
+    # resolution.
+    # KNOWN ISSUE: when config.additional_config is provided, the same dict is
+    # mutated in place (lora_config and sharding keys are added to the user's
+    # config).
     """Setup vllm config from Tunix Vllm config."""
     args = config._processed_engine_kwargs.copy()
 
@@ -304,17 +399,27 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     return args
 
   def _build_engine_args(self) -> EngineArgs:
+    # [FUNCTION DOC]
+    # HELPER: copies args, defaults disable_log_stats to True, and returns an
+    # EngineArgs built from them (TypeError on unknown keys).
     engine_kwargs = dict(self.args)
     engine_kwargs.setdefault("disable_log_stats", True)
     return EngineArgs(**engine_kwargs)
 
   def _create_driver(self) -> VLLMInProcessDriver:
+    # [FUNCTION DOC]
+    # HELPER: builds EngineArgs and returns VLLMInProcessDriver.from_engine_args
+    # (auto-started, which spawns its threads).
     engine_args = self._build_engine_args()
     return VLLMInProcessDriver.from_engine_args(
         engine_args,
     )
 
   def stop(self):
+    # [FUNCTION DOC]
+    # Shuts down the server-mode driver if present (fails pending requests, stops
+    # threads, shuts down the engine core) and clears it. No-op in offline mode
+    # or when already stopped; registered with atexit in server mode.
     logging.debug("Shutting down VLLMInProcessDriver.")
     if self._driver is not None:
       self._driver.shutdown()
@@ -322,6 +427,10 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   @property
   def _model_runner(self):
+    # [FUNCTION DOC]
+    # HELPER property: returns the vLLM model runner from the LLM's or driver's
+    # engine, following model_executor, driver_worker, model_runner. Raises
+    # RuntimeError when no engine is initialized.
     if self.llm is not None:
       return self.llm.llm_engine.model_executor.driver_worker.model_runner
     if self._driver is not None:
@@ -330,17 +439,25 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   @property
   def transformer(self):
+    # [FUNCTION DOC]
+    # Property; always returns None because vLLM does not expose the model module.
     # vLLM doesn't expose the underlying model
     return None
 
   @property
   def transformer_state(self):
+    # [FUNCTION DOC]
+    # Property returning the model runner's state (parameter pytree). Raises
+    # AttributeError if the runner has no state attribute.
     if hasattr(self._model_runner, "state"):
       return self._model_runner.state
     else:
       raise AttributeError("vLLM model runner doesn't have state.")
 
   def tokenize(self, input_string: str) -> jax.Array | list[int]:
+    # [FUNCTION DOC]
+    # Encodes the string, prepends BOS if the BOS id is truthy, and removes
+    # duplicated leading BOS ids. Returns a list of ints.
     """Tokenizes the input string."""
     input_ids = self.tokenizer.encode(input_string)
     bos_tok = [self.tokenizer.bos_id()] if self.tokenizer.bos_id() else []
@@ -349,6 +466,15 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
   def detokenize(
       self, input_strings: List[str], request_outputs: List[RequestOutput]
   ) -> Tuple[List[str], List[float], List[int]]:
+    # [FUNCTION DOC]
+    # Converts vLLM RequestOutputs into per-sample lists. The number of
+    # generations is taken from the first output's completion count. Returns
+    # three lists indexed first by sample index then by prompt: decoded strings
+    # (tokenizer decode of the full token ids), log-probability lists from
+    # utils.get_logprobs_from_vllm_output, and int32 numpy token id arrays. Token
+    # ids keep the trailing EOS/stop token on purpose (needed for exact multi-turn
+    # reconstruction). Logs prompt and text at debug level.
+    # Raises IndexError for an empty output list.
     """Detokenize the vllm outputs."""
     generations = len(request_outputs[0].outputs)
     decoded_outputs = [[] for _ in range(generations)]
@@ -388,6 +514,13 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       prompts: List[TokensPrompt],
       sampling_params: Union[SamplingParams, BeamSearchParams],
   ) -> List[RequestOutput]:
+    # [FUNCTION DOC]
+    # HELPER: server-mode generation. Raises RuntimeError if no driver. Submits
+    # each prompt with a fresh numeric request id from the counter, cloning the
+    # params for prompts after the first when clone is available, then waits for
+    # each Future in order and returns the outputs. Raises TypeError if a result
+    # is not a RequestOutput; Future exceptions (driver errors, shutdown)
+    # propagate.
     """Generate the response in server mode."""
     if self._driver is None:
       raise RuntimeError("vLLM in-process driver is not initialized.")
@@ -431,6 +564,38 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       pad_output: bool = False,
       **kwargs,
   ) -> base_sampler.SamplerOutput:
+    # [FUNCTION DOC]
+    # Main generation entry point. Normalizes a single string to a list. Raises
+    # ValueError if max_generation_steps exceeds args max_model_len.
+    # Beam path (beam_size given): uses BeamSearchParams with beam width, max
+    # tokens, ignore_eos False and temperature.
+    # Sampling path: starts from model default params (server mode: the model
+    # config's diff sampling params via SamplingParams.from_optional, or plain
+    # SamplingParams; offline: the LLM's defaults), then sets detokenize False,
+    # max_tokens, n = multi_sampling, temperature, logprobs and prompt_logprobs to
+    # 1 if return_logprobs else 0, stop_token_ids to EOS, skip_special_tokens
+    # True, include_stop_str_in_output True, and top_p, top_k, seed when given.
+    # Then applies config.sampling_kwargs overlaid with call kwargs as attributes
+    # (logged; AttributeError/TypeError logged and ignored).
+    # Stores the params on self.sampling_params (side effect). Tokenizes prompts,
+    # generates via the driver or LLM.generate (with a progress bar), detokenizes,
+    # raises ValueError if logprobs were requested but missing, and left-pads
+    # prompts with the pad id to max_prompt_length (bumped to the next power of
+    # two of the longest prompt when missing or too small).
+    # Returns SamplerOutput with the first sample's texts and tokens for each
+    # prompt, logits None, logprobs for the first sample when requested.
+    # Ignored inputs: return_logits, echo, pad_output.
+    # KNOWN ISSUE: with multi_sampling greater than 1 only sample index 0 per
+    # prompt is returned; the other samples are generated and discarded, despite
+    # the comment about supporting multisampling.
+    # KNOWN ISSUE: max_model_len is read from args without a default, raising
+    # KeyError unless supplied through engine_kwargs.
+    # KNOWN ISSUE: BeamSearchParams is passed to LLM.generate / submit_request,
+    # which expect SamplingParams; vLLM beam search requires a separate API, so
+    # the beam path is likely broken.
+    # KNOWN ISSUE: the logprobs-missing check can never fire since the
+    # per-sample lists are never None; the seed comment says per-request seed is
+    # unsupported yet the seed is still set.
     """The entry point API for vLLM Sampler"""
     if isinstance(input_strings, str):
       input_strings = [input_strings]

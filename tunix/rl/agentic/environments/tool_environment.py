@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines ToolEnvironment, a multi-step BaseTaskEnv in which the agent's actions
+# are lists of OpenAI-style tool-call dicts ({"id", "type", "function": {"name",
+# "arguments" as JSON string}}). Non-finish calls are executed through a
+# ToolManager and their string outputs returned as the next observation; a string
+# action or any call named "finish" ends the episode and triggers reward
+# computation. Imports reward (unused) and uses absl logging.
 """RL Environment for tool-based agent interactions.
 
 This module defines the `ToolEnvironment`, a reinforcement learning environment
@@ -33,6 +40,11 @@ from tunix.rl.agentic.tools import tool_manager
 
 
 class ToolEnvironment(base_environment.BaseTaskEnv):
+  # [CLASS DOC]
+  # Tool-execution environment. Attributes: those of BaseTaskEnv (task, reward_fn,
+  # max_steps default 10, step_count, extra_kwargs) plus tool_manager (ToolManager
+  # built from tool_map). Observations: the task dict on reset, {"tool_outputs":
+  # {call_id: output_string}} on intermediate steps, {} on the final step.
   """Reinforcement learning environment for tool-based agent interactions.
 
   This environment enables agents to execute external tools and receive
@@ -55,6 +67,16 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
       max_steps: int = 10,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Initialize. Inputs: task (dict or None); keyword-only tool_map (required,
+    # name-to-BaseTool-class), reward_fn (callable taking task= and action= keyword
+    # args, or None), max_steps (default 10), extra kwargs forwarded to BaseTaskEnv.
+    # Behavior: if reward_fn is None, logs a warning once per process; calls the base
+    # constructor; builds the ToolManager.
+    # Exceptions: TypeError from ToolManager for abstract tool classes; AttributeError
+    # if tool_map is None.
+    # KNOWN ISSUE: docstring says a missing reward_fn defaults to dummy_reward, but
+    # the code just yields a reward of 0.0 at episode end.
     """Initialize the tool environment with task configuration and constraints.
 
     Args:
@@ -88,6 +110,8 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
     self.tool_manager = tool_manager.ToolManager(tool_map)
 
   def _initial_observation(self) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Return the task dict itself (not a copy) as the initial observation.
     """Reset the environment to initial state for a new episode.
 
     Clears step counter (in BaseTaskEnv) and returns the task specification as
@@ -100,6 +124,21 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
     return self.task
 
   def _step_impl(self, action: Any) -> base_environment.EnvStepResult:
+    # [FUNCTION DOC]
+    # HELPER: One logical step.
+    # Inputs: action, which may be an Action (unwrapped to its payload), None
+    # (treated as empty list), a single dict (wrapped in a list), a string, or a list
+    # of call dicts.
+    # Behavior: done is True if the action is a string, or if it is a list containing
+    # a call whose function name is "finish". When done: extracts the answer with
+    # _extract_llm_answer, computes reward_fn(task=task, action=answer) if a reward_fn
+    # exists else 0.0, and returns EnvStepResult(observation {}, that reward, done
+    # True, info {"response": action}). Otherwise executes all calls via
+    # _execute_tool_calls and returns EnvStepResult(observation {"tool_outputs":
+    # outputs}, reward 0.0, done False, info {"response": action}).
+    # Note the reward value is whatever reward_fn returns (may be a RewardOutput, not
+    # a float). An empty list action is executed as zero calls (not done).
+    # Exceptions: errors from reward_fn, JSON decoding or malformed call dicts.
     """Execute one logical step of tool interaction based on agent's action.
 
     Processes the agent's action which can be a string response (indicating
@@ -161,6 +200,14 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
 
   @staticmethod
   def _extract_llm_answer(action: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Static. Get the final answer text from an action. A string is returned
+    # as is. For a list, the first call named "finish" returns its function
+    # "arguments" mapping's "response" value (default ""). Otherwise returns
+    # str(action).
+    # KNOWN ISSUE: if the finish call's arguments are a JSON string (as produced by
+    # ToolAgent for parsed tool calls), calling get on a string raises
+    # AttributeError; only the dict form produced by ToolAgent's fallback works.
     """Extract the final answer string from various action formats.
 
     Handles multiple action types including direct string responses,
@@ -187,6 +234,15 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
   def _execute_tool_calls(
       self, tool_calls: List[Dict[str, Any]]
   ) -> Dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Execute non-finish tool calls.
+    # Inputs: list of call dicts. Behavior: for each, reads function name, decodes
+    # function arguments from a JSON string, uses the dict's "id" or a new uuid4,
+    # builds a ToolCall and attaches the id as an extra attribute "id"; then runs all
+    # via tool_manager.execute_calls with parallel True.
+    # Outputs: dict of call id to output string.
+    # Exceptions: KeyError for missing keys; JSONDecodeError / TypeError if
+    # arguments are not a valid JSON string.
     """Execute a list of tool calls and return their outputs.
 
     Converts raw tool call dictionaries to ToolCall objects, assigns
@@ -215,6 +271,12 @@ class ToolEnvironment(base_environment.BaseTaskEnv):
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "ToolEnvironment":
+    # [FUNCTION DOC]
+    # Classmethod factory. Pops "tool_map" (default None), "reward_fn" (default None)
+    # and "max_steps" (default 10) from env_args; the remaining dict is used as the
+    # task. Returns cls(task=..., tool_map=..., reward_fn=..., max_steps=...).
+    # Side effects: mutates the caller's env_args dict (keys popped, and the same
+    # dict object becomes the task).
     """Create ToolEnvironment instance from configuration dictionary.
 
     Factory method that extracts environment-specific parameters from

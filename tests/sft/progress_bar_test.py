@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for tunix.sft.progress_bar.ProgressBar, a tqdm wrapper that
+# displays metrics read from a MetricsLogger under keys
+# '<prefix>_<mode>_<metric>' (values rounded to 3 decimals), and disables
+# itself when stderr is not a TTY and not running in IPython.
+# Side effects: writes metrics logs into a temporary directory.
 """Unit tests for `progress_bar`."""
 
 import tempfile
@@ -10,8 +16,17 @@ from tunix.sft import progress_bar
 
 
 class ProgressBarTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for ProgressBar. Fixture builds a MetricsLogger with a temp
+  # log_dir and a ProgressBar (initial_steps 0, max_steps 2, prefix 'test').
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture. Creates self.log_dir (absltest tempdir, falling back to
+    # a tempfile.TemporaryDirectory name), self.metrics_prefix, self.metrics_logger
+    # and self.progress_bar.
+    # KNOWN ISSUE: the fallback TemporaryDirectory object is discarded at once,
+    # so its directory may be deleted immediately; only its name is kept.
     super().setUp()
     try:
       self.log_dir = self.create_tempdir().full_path
@@ -32,9 +47,14 @@ class ProgressBarTest(absltest.TestCase):
     )
 
   def test_initial_state(self):
+    # [FUNCTION DOC]
+    # Verifies a fresh ProgressBar has an empty metrics dict.
     self.assertDictEqual(self.progress_bar.metrics, {})
 
   def test_update_metric(self):
+    # [FUNCTION DOC]
+    # Verifies the private _update_metric reads the latest logged value for a
+    # metric/mode and stores it as 'test_train_loss' / 'test_eval_loss'.
     self.metrics_logger.log(
         self.metrics_prefix, "loss", np.array(0.5), metrics_logger.Mode.TRAIN, 1
     )
@@ -51,6 +71,9 @@ class ProgressBarTest(absltest.TestCase):
     )
 
   def test_update_metrics(self):
+    # [FUNCTION DOC]
+    # Verifies update_metrics updates several metrics per mode and that values
+    # are rounded to 3 decimals (2.2255 -> 2.225, 2.4596 -> 2.46).
     # update `metrics_logger`.
     self.metrics_logger.log(
         self.metrics_prefix, "loss", np.array(0.8), metrics_logger.Mode.TRAIN, 2
@@ -86,9 +109,17 @@ class ProgressBarTest(absltest.TestCase):
     self.assertDictEqual(self.progress_bar.metrics, exp_output)
 
   def test_close(self):
+    # [FUNCTION DOC]
+    # Verifies metrics are empty on a fresh bar.
+    # KNOWN ISSUE: despite the name, close() is never called; this duplicates
+    # test_initial_state.
     self.assertDictEqual(self.progress_bar.metrics, {})
 
   def test_disable_logic(self):
+    # [FUNCTION DOC]
+    # Verifies tqdm_bar.disable: enabled if stderr is a TTY or running in
+    # IPython, disabled only when neither (patches sys.stderr.isatty and
+    # progress_bar._is_in_ipython per subTest).
     test_cases = [
         (True, False, False),  # Terminal, not notebook -> enabled
         (False, True, False),  # Not terminal, notebook -> enabled

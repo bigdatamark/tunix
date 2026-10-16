@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.utils: mesh discovery from a pytree's shardings,
+# weight-sharing detection between models, slice chunking, batch slicing of
+# nested pytrees, merging micro-batches by concatenation, critic model
+# creation from an actor, moving params to a memory kind, and sequence
+# packing of TrainExamples into fixed token budgets with segment ids and
+# positions. Uses 4 simulated CPU devices.
+# Side effects: sets XLA_FLAGS env var at import and calls
+# chex.set_n_cpu_devices in setUp.
+# KNOWN ISSUE: XLA_FLAGS is set after jax is imported, so it may have no
+# effect; the device count relies on chex.set_n_cpu_devices instead.
+
 import os
 from absl.testing import absltest
 import chex
@@ -28,14 +40,22 @@ os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
 
 
 class UtilsTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests for tunix.rl.utils helpers.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: forces 4 CPU devices via chex and records jax.device_count.
     super().setUp()
     self.num_cpus = 4
     chex.set_n_cpu_devices(self.num_cpus)
     self.device_count = jax.device_count()
 
   def test_get_pytree_mesh_info(self):
+    # [FUNCTION DOC]
+    # Verifies get_pytree_mesh_info returns the mesh a LoRA toy model was
+    # sharded on (two disjoint half-device meshes give distinct results) and
+    # None for an unsharded model.
     mesh1 = sharding.Mesh(
         np.array(jax.devices()[: self.device_count // 2]).reshape(
             1, self.device_count // 2
@@ -77,6 +97,13 @@ class UtilsTest(absltest.TestCase):
     self.assertIsNone(utils.get_pytree_mesh_info(nnx.state(model3)))
 
   def test_is_sharing_weights(self):
+    # [FUNCTION DOC]
+    # Verifies is_sharing_weights is False for two independently built
+    # models (even with the same seed) and True for a model and its
+    # nnx.clone, even though their state objects are distinct.
+    # KNOWN ISSUE: the expectation that a clone "shares weights" suggests
+    # the helper compares by value or underlying buffers, not identity;
+    # the name may mislead.
     m1 = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=tc.MockVocab().GetPieceSize()),
         rngs=nnx.Rngs(0),
@@ -94,11 +121,17 @@ class UtilsTest(absltest.TestCase):
     self.assertTrue(utils.is_sharing_weights(m1, m3))
 
   def test_chunk_slices_by_size(self):
+    # [FUNCTION DOC]
+    # Verifies chunk_slices_by_size(stop 5, step 2) yields slices covering
+    # [0,2), [2,4), [4,5).
     x = [0, 1, 2, 3, 4]
     y = [x[s] for s in utils.chunk_slices_by_size(stop=len(x), step=2)]
     self.assertEqual(y, [[0, 1], [2, 3], [4]])
 
   def test_get_batch_slice(self):
+    # [FUNCTION DOC]
+    # Verifies get_batch_slice applies a slice to the leading dim of every
+    # leaf in a nested dict pytree.
     x = {
         'a': np.array([[1], [2], [3], [4], [5], [6]]),
         'b': {'c': np.array([[7], [8], [9], [10], [11], [12]])},
@@ -115,6 +148,10 @@ class UtilsTest(absltest.TestCase):
     jax.tree_util.tree_map(np.testing.assert_array_equal, expected, y)
 
   def test_merge_micro_batches(self):
+    # [FUNCTION DOC]
+    # Verifies merge_micro_batches concatenates matching leaves across a
+    # list of batch dicts: lists are extended and arrays concatenated, with
+    # varying per-batch lengths allowed, recursing into nested dicts.
     batches = [
         {
             'a': [1, 2],
@@ -139,6 +176,10 @@ class UtilsTest(absltest.TestCase):
     )
 
   def test_create_critic_model(self):
+    # [FUNCTION DOC]
+    # Verifies create_critic_model turns an actor toy transformer into a
+    # model whose output for a (2, 3) token batch with causal mask has
+    # shape (2, 3, 1), i.e. a scalar value per token.
     actor_model = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=tc.MockVocab().GetPieceSize()),
         rngs=nnx.Rngs(0),
@@ -152,6 +193,11 @@ class UtilsTest(absltest.TestCase):
     self.assertEqual(out.shape, (2, 3, 1))
 
   def test_put_params_on_memory_kind(self):
+    # [FUNCTION DOC]
+    # Verifies put_params_on_memory_kind moves all leaves to pinned_host,
+    # returns the same object when already there, returns an empty tree
+    # unchanged, and raises ValueError "memory_kind must be one of" for an
+    # unknown kind.
     # Test valid memory kind
     params = {'a': jnp.array([1.0, 2.0]), 'b': jnp.array([3.0])}
     updated_params = utils.put_params_on_memory_kind(params, 'pinned_host')
@@ -176,9 +222,22 @@ class UtilsTest(absltest.TestCase):
       utils.put_params_on_memory_kind(params, 'invalid_kind')
 
   def test_pack_sequences(self):
+    # [FUNCTION DOC]
+    # Verifies pack_sequences greedily packs sequences (prompt plus
+    # completion lengths 5, 3, 7) into rows of budget 10: the first pack
+    # holds the first two, the second holds the third. In each pack prompt
+    # ids are empty, completion ids hold concatenated prompt and completion
+    # tokens padded to 10, segment ids are 1-based per sequence with 0 for
+    # padding, positions restart at 0 per sequence (0 for padding), and the
+    # completion mask is 1 only on completion tokens.
+
     def _create_mock_train_example(
         prompt_len: int, completion_len: int
     ) -> common.TrainExample:
+      # [FUNCTION DOC]
+      # HELPER: builds a single-row TrainExample with prompt ids of ones,
+      # completion ids of twos, all-ones masks, advantage 1.5 and all
+      # optional fields None.
       return common.TrainExample(
           prompt_ids=jnp.ones((1, prompt_len), dtype=jnp.int32),
           prompt_mask=jnp.ones((1, prompt_len), dtype=jnp.int32),

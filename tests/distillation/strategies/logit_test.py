@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.strategies.logit.LogitStrategy: classic
+# logit distillation combining alpha times the temperature-softened KL
+# divergence between teacher and student (optionally restricted to the
+# teacher's top-k logits via distill_top_k; 0 means full vocab) with
+# (1 - alpha) times the hard-label cross entropy; temperature must be > 0 and
+# alpha in [0, 1] else ValueError. compute_loss returns (loss, metrics with
+# distill/soft_loss, distill/hard_loss, distill/kl_div, distill/teacher_loss);
+# compute_eval_loss returns (task loss, empty dict).
+# Module setup disables jax_threefry_partitionable.
 """Tests for distillation strategies."""
 
 from absl.testing import absltest
@@ -28,21 +38,33 @@ LogitStrategy = logit.LogitStrategy
 
 
 class DummyModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: identity nnx module (returns its input).
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # HELPER: returns x unchanged.
     return x
 
 
 class LogitStrategyTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for LogitStrategy.
 
   def _get_dummy_logits(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: standard normal logits (batch_size, num_classes) from key.
     return jax.random.normal(key, (batch_size, num_classes))
 
   def _get_dummy_labels(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: random one-hot labels (batch_size, num_classes) from key.
     labels_int = jax.random.randint(key, (batch_size,), 0, num_classes)
     return jax.nn.one_hot(labels_int, num_classes)
 
   def dummy_fn(self):
+    # [FUNCTION DOC]
+    # HELPER: placeholder forward/labels function that does nothing.
     pass
 
   @parameterized.named_parameters(
@@ -52,6 +74,9 @@ class LogitStrategyTest(parameterized.TestCase):
       ("top_k", 2.0, 0.5, 50),
   )
   def test_init_valid(self, temp, alpha, top_k):
+    # [FUNCTION DOC]
+    # Verifies valid construction stores temperature (as float), alpha and
+    # distill_top_k.
     strategy = LogitStrategy(
         student_forward_fn=self.dummy_fn,
         teacher_forward_fn=self.dummy_fn,
@@ -71,6 +96,8 @@ class LogitStrategyTest(parameterized.TestCase):
       ("alpha_over", 2.0, 1.1),
   )
   def test_init_invalid(self, temp, alpha):
+    # [FUNCTION DOC]
+    # Verifies ValueError for non-positive temperature or alpha outside [0, 1].
     with self.assertRaises(ValueError):
       LogitStrategy(
           student_forward_fn=self.dummy_fn,
@@ -86,6 +113,10 @@ class LogitStrategyTest(parameterized.TestCase):
       ("alpha_zero", 0.0, 2.242127),
   )
   def test_logit_distillation_compute_loss(self, alpha, expected_loss):
+    # [FUNCTION DOC]
+    # Verifies compute_loss with temperature 3 on seeded random logits/labels
+    # matches reference losses for alpha 1, 0.5, 0 (tolerance 1e-4) and that the
+    # four distill/* metrics are returned.
     s_key, t_key, l_key = jax.random.split(jax.random.key(0), 3)
     batch_size, num_classes = 4, 10
     student_logits = self._get_dummy_logits(s_key, batch_size, num_classes)
@@ -115,6 +146,9 @@ class LogitStrategyTest(parameterized.TestCase):
     self.assertIn("distill/teacher_loss", metrics)
 
   def test_top_k_distillation_logic(self):
+    # [FUNCTION DOC]
+    # Verifies distill_top_k=2 yields a different loss than full-vocabulary
+    # distillation on 20 classes.
     """Verifies that setting distill_top_k changes the computed loss."""
     s_key, t_key, l_key = jax.random.split(jax.random.key(42), 3)
     batch_size, num_classes = 2, 20
@@ -164,6 +198,9 @@ class LogitStrategyTest(parameterized.TestCase):
       ("alpha_zero", 0.0),
   )
   def test_compute_eval_loss(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies compute_eval_loss returns 2.49732 regardless of alpha and an empty
+    # metrics dict.
     s_key, l_key = jax.random.split(jax.random.key(0), 2)
     batch_size, num_classes = 4, 10
     student_logits = self._get_dummy_logits(s_key, batch_size, num_classes)
@@ -188,6 +225,10 @@ class LogitStrategyTest(parameterized.TestCase):
     self.assertEqual(metrics, {})
 
   def test_get_train_loss(self):
+    # [FUNCTION DOC]
+    # Verifies get_teacher_outputs and get_train_loss route inputs through the
+    # forward/labels functions (pass-through lambdas reading keyword inputs) so
+    # the result equals compute_loss on the same arrays with the same metric keys.
     strategy = LogitStrategy(
         student_forward_fn=lambda _, student_output, **kwargs: student_output,
         teacher_forward_fn=lambda _, teacher_output, **kwargs: teacher_output,
@@ -221,6 +262,9 @@ class LogitStrategyTest(parameterized.TestCase):
     self.assertEqual(expected_metrics.keys(), computed_metrics.keys())
 
   def test_get_eval_loss(self):
+    # [FUNCTION DOC]
+    # Verifies get_eval_loss equals compute_eval_loss on the same inputs with
+    # equal metrics.
     strategy = LogitStrategy(
         student_forward_fn=lambda _, student_output, **kwargs: student_output,
         teacher_forward_fn=lambda _, teacher_output, **kwargs: teacher_output,

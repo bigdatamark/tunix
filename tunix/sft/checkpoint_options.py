@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Checkpointing options for Tunix, compatible with both Orbax v0
+#   (CheckpointManagerOptions) and Orbax v1 (orbax.checkpoint.v1, aliased
+#   ocp) configuration styles.
+# Defines structural Protocols (NameFormat, AsyncOptions,
+#   CheckpointingOptions), a frozen TunixCheckpointingOptions dataclass,
+#   DEFAULT_CHECKPOINTING_OPTIONS (continuous saving at most every 180 s,
+#   keep latest 3, standard integer step names, async enabled, async
+#   timeout 1200 s), create_checkpointing_options, and
+#   resolve_checkpointing_defaults which fills unset fields with defaults
+#   (including v0 legacy fallbacks). MetadataT is a TypeVar.
+# Side effects at import: constructs the default Orbax policy objects.
 """Checkpointing options for Tunix."""
 
 import dataclasses
@@ -28,16 +40,30 @@ MetadataT = TypeVar("MetadataT")
 # MetadataT types diverge across v0 and v1. We use Protocols to remain
 # structurally compatible with both versions for a smooth transition.
 class NameFormat(Protocol, Generic[MetadataT]):
+  # [CLASS DOC]
+  # Empty generic Protocol standing in for Orbax step NameFormat types
+  # (which differ between Orbax v0 and v1); any object satisfies it.
   ...
 
 
 class AsyncOptions(Protocol):
+  # [CLASS DOC]
+  # Protocol for async options: any object with a timeout_secs property
+  # (int or None).
   @property
   def timeout_secs(self) -> int | None:
+    # [FUNCTION DOC]
+    # Protocol property: async operation timeout in seconds, or None.
     ...
 
 
 class CheckpointingOptions(Protocol):
+  # [CLASS DOC]
+  # Structural protocol for checkpointing configuration exposing five
+  # read-only properties: save_decision_policy, preservation_policy,
+  # step_name_format, enable_async_checkpointing, async_options (each may
+  # be None meaning "use default"). Satisfied by TunixCheckpointingOptions,
+  # Orbax v0 CheckpointManagerOptions or custom objects.
   """Structural protocol for representing checkpointing options.
 
   Any configuration object that fulfills this protocol (such as legacy v0
@@ -49,6 +75,9 @@ class CheckpointingOptions(Protocol):
   def save_decision_policy(
       self,
   ) -> ocp.training.save_decision_policies.SaveDecisionPolicy | None:
+    # [FUNCTION DOC]
+    # Protocol property: Orbax SaveDecisionPolicy deciding when to save,
+    # or None.
     """Returns the policy that defines when to save a checkpoint."""
     ...
 
@@ -56,6 +85,9 @@ class CheckpointingOptions(Protocol):
   def preservation_policy(
       self,
   ) -> ocp.training.preservation_policies.PreservationPolicy | None:
+    # [FUNCTION DOC]
+    # Protocol property: Orbax PreservationPolicy deciding which
+    # checkpoints to keep, or None.
     """Returns the policy that defines when to preserve a checkpoint."""
     ...
 
@@ -63,22 +95,32 @@ class CheckpointingOptions(Protocol):
   def step_name_format(
       self,
   ) -> NameFormat | None:
+    # [FUNCTION DOC]
+    # Protocol property: step directory NameFormat, or None.
     """Returns the format for step names."""
     ...
 
   @property
   def enable_async_checkpointing(self) -> bool | None:
+    # [FUNCTION DOC]
+    # Protocol property: whether to save asynchronously, or None.
     """Returns whether to use async checkpointing."""
     ...
 
   @property
   def async_options(self) -> AsyncOptions | None:
+    # [FUNCTION DOC]
+    # Protocol property: AsyncOptions-like object, or None.
     """Returns the options for async operations."""
     ...
 
 
 @dataclasses.dataclass(frozen=True)
 class TunixCheckpointingOptions:
+  # [CLASS DOC]
+  # Frozen dataclass implementing CheckpointingOptions with Orbax v1 types.
+  # Fields (all default None): save_decision_policy, preservation_policy,
+  # step_name_format, enable_async_checkpointing, async_options.
   save_decision_policy: (
       ocp.training.save_decision_policies.SaveDecisionPolicy | None
   ) = None
@@ -123,6 +165,10 @@ def create_checkpointing_options(
     enable_async_checkpointing: bool | None = None,
     async_options: ocp.options.AsyncOptions | None = None,
 ) -> TunixCheckpointingOptions:
+  # [FUNCTION DOC]
+  # Keyword-only factory. Inputs: the five option fields (default None).
+  # Returns TunixCheckpointingOptions with exactly those values (no default
+  # filling). No exceptions or side effects.
   """Creates a TunixCheckpointingOptions instance."""
   return TunixCheckpointingOptions(
       save_decision_policy=save_decision_policy,
@@ -136,6 +182,24 @@ def create_checkpointing_options(
 def resolve_checkpointing_defaults(
     options: CheckpointingOptions | None = None,
 ) -> TunixCheckpointingOptions:
+  # [FUNCTION DOC]
+  # Normalizes any CheckpointingOptions to a fully populated
+  # TunixCheckpointingOptions.
+  # Input: options (or None). If None, return DEFAULT_CHECKPOINTING_OPTIONS.
+  # Otherwise resolve each field:
+  #   - save policy: options.save_decision_policy; if None and the object has
+  #     a non-None save_interval_steps (v0), warn deprecation and use
+  #     FixedIntervalPolicy(save_interval_steps); else default policy.
+  #   - preservation: options.preservation_policy; if None and a non-None
+  #     max_to_keep exists (v0), warn and use LatestN(max_to_keep); else
+  #     default.
+  #   - step_name_format and enable_async_checkpointing: option value or
+  #     default when None.
+  #   - async options: if options.async_options and its timeout_secs are
+  #     non-None, build a fresh v1 AsyncOptions with only that timeout;
+  #     otherwise default async options (other async fields are dropped).
+  # Output: new TunixCheckpointingOptions. Exceptions: AttributeError if
+  #   the object lacks a protocol property. Side effects: warning logs.
   """Resolves options adhering to CheckpointingOptions protocol.
 
   This function accepts any object fulfilling the `CheckpointingOptions`

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: small utility module for SFT: attention-mask and position
+#   construction from padding masks, LoRA detection, a timing context
+#   manager, and device HBM usage reporting (Pathways-aware via
+#   tunix.oss.utils.pathways_available). No side effects at import.
 """Simple utils used by SFT."""
 
 import collections
@@ -30,6 +35,15 @@ from tunix.oss import utils as google_utils
 
 
 def make_causal_attn_mask(input_mask: jax.Array) -> jax.Array:
+  # [FUNCTION DOC]
+  # Builds a causal attention mask combined with key padding.
+  # Input: input_mask [B, L] (True for real tokens).
+  # Output: [B, L, L] array where entry (b, i, j) is input_mask[b, j] AND
+  #   (j <= i); dtype follows input_mask.
+  # Exceptions: ValueError if input_mask is not 2-D. No side effects.
+  # KNOWN ISSUE: the inline comment "Prefixes can be attended by all tokens"
+  #   and the T5 prefix-LM reference do not match the code, which builds a
+  #   plain causal mask; padded query rows are not masked out.
   """Makes a causal attention mask.
 
   I.e., as in middle diagram of Figure 3 in https://arxiv.org/pdf/1910.10683.
@@ -54,6 +68,12 @@ def make_causal_attn_mask(input_mask: jax.Array) -> jax.Array:
 
 
 def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:
+  # [FUNCTION DOC]
+  # Input: input_mask [..., L] (True/1 for real tokens). Output: positions
+  #   = cumulative sum of the mask along the last axis minus 1 wherever the
+  #   cumsum is >= 1, so the first real token gets 0, subsequent real
+  #   tokens increment, padding before the first real token stays 0 and
+  #   padding afterwards repeats the last position. No exceptions.
   """Computes `positions` from the `input_mask`.
 
   Args:
@@ -70,6 +90,9 @@ def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:
 
 
 def is_lora_enabled(model: nnx.Module) -> bool:
+  # [FUNCTION DOC]
+  # Input: model. Returns True if any node in nnx.iter_graph(model) is an
+  #   nnx.LoRAParam (i.e. LoRA adapters are present), else False.
   for _, value in nnx.iter_graph(model):
     if isinstance(value, nnx.LoRAParam):
       return True
@@ -78,6 +101,12 @@ def is_lora_enabled(model: nnx.Module) -> bool:
 
 @contextlib.contextmanager
 def time_measure(context: str = "", suppress_logging: bool = False):
+  # [FUNCTION DOC]
+  # Context manager timing a block. Inputs: context (label), suppress_logging.
+  # Records perf_counter at entry and yields a zero-arg callable returning
+  #   elapsed seconds so far. On exit (even on exception), unless
+  #   suppress_logging, logs "<context> finished in: <seconds> seconds".
+  # Exceptions: propagates those from the block.
   start = time.perf_counter()
   try:
     yield lambda: time.perf_counter() - start
@@ -89,6 +118,15 @@ def time_measure(context: str = "", suppress_logging: bool = False):
 
 
 def _pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, Optional[float]]]:
+  # [FUNCTION DOC]
+  # HELPER: HBM usage under Pathways. Input: devices list.
+  # Iterates jax.live_arrays(); asserts each has sharding.device_set
+  #   (AssertionError if called inside a tracer); skips deleted arrays; for
+  #   each addressable shard sums data.nbytes per device, deduplicating
+  #   buffers by id(shard.data). Output: list of (bytes used, None) in the
+  #   order of devices (limit unknown).
+  # KNOWN ISSUE: despite the "_gb" name the values are bytes; id-based
+  #   dedup on freshly created shard objects may not detect shared buffers.
   """Returns the HBM usage for each device when using Pathways.
 
   Args:
@@ -130,6 +168,13 @@ def _pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, Optional[float]]]:
 
 
 def _jax_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
+  # [FUNCTION DOC]
+  # HELPER: HBM usage via device.memory_stats(). Input: devices.
+  # For each device: if its platform is "cpu" log a warning and return an
+  #   empty list immediately; else append (bytes_in_use, bytes_limit).
+  # Output: list of (used bytes, limit bytes). KeyError if stats lack keys.
+  # KNOWN ISSUE: "_gb" name but values are bytes; return type claims
+  #   floats but values are ints.
   """Returns the HBM usage for each device when using JAX."""
   hbm_used = []
   for device in devices:
@@ -148,6 +193,14 @@ def _jax_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
 
 
 def show_hbm_usage(title=""):
+  # [FUNCTION DOC]
+  # Logs current HBM usage. Input: title (log prefix).
+  # Formats sizes with humanize.naturalsize(binary=True) after a forced
+  #   gc.collect(). If Pathways is available, uses _pathways_hbm_usage_gb
+  #   over jax.devices() and logs "Using <used> on <device>"; else uses
+  #   _jax_hbm_usage_gb over jax.local_devices() and logs used, limit and
+  #   used/limit ratio per device. Output: None. Side effects: GC, logging.
+  # Exceptions: ZeroDivisionError if a device reports limit 0.
   """Prints the current HBM usage.
 
   Args:

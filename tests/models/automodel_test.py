@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for tunix.models.automodel: AutoModel.from_pretrained (MaxText source with faked maxtext
+# modules, missing model_path validation for Kaggle/GCS/internal sources, and config override handling),
+# call_model_config, get_model_module for params/params-safetensors/model modules, the dynamic
+# create_model_from_safe_tensors dispatch, Gemma creation from params, and Gemma NNX conversion
+# checkpoint directory naming. Model names are a fixed list of gemma, llama, qwen2.5, deepseek and qwen3
+# names. Side effects: temporary patches of sys.modules, os.environ and module attributes.
 import dataclasses
 import os
 import sys
@@ -12,6 +19,9 @@ from tunix.models import naming
 
 
 def _get_all_models_test_parameters():
+  # [FUNCTION DOC]
+  # HELPER: returns a tuple of named-parameter dicts (testcase_name equal to model_name) covering all
+  # supported model names, including a mixed-case "Qwen3-32B".
   return (
       dict(testcase_name="gemma-2b", model_name="gemma-2b"),
       dict(testcase_name="gemma-2b-it", model_name="gemma-2b-it"),
@@ -104,6 +114,8 @@ def _get_all_models_test_parameters():
 
 
 def _get_gemma_models_test_parameters():
+  # [FUNCTION DOC]
+  # HELPER: returns the subset of all-model parameters whose model_name starts with "gemma".
   return [
       p
       for p in _get_all_models_test_parameters()
@@ -112,6 +124,8 @@ def _get_gemma_models_test_parameters():
 
 
 def _get_non_gemma_models_test_parameters():
+  # [FUNCTION DOC]
+  # HELPER: returns the subset of all-model parameters whose model_name does not start with "gemma".
   return [
       p
       for p in _get_all_models_test_parameters()
@@ -120,12 +134,24 @@ def _get_non_gemma_models_test_parameters():
 
 
 class AutoModelTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test suite for AutoModel and related automodel helpers.
 
   @mock.patch(
       "tunix.models.automodel.download_model",
       return_value="gs://my-bucket/my-model",
   )
   def test_from_pretrained_maxtext(self, mock_download):
+    # [FUNCTION DOC]
+    # Verifies MaxText loading. With download_model patched to return a GCS path, installs fake maxtext,
+    # maxtext.configs(.pyconfig/.types) and maxtext.utils(.model_creation_utils) modules into sys.modules, a
+    # fake MaxTextConfig declaring only skip_jax_distributed_system and hf_access_token fields, and HF_TOKEN in
+    # the environment. Calls from_pretrained for "qwen2.5-0.5b" with MAXTEXT source and extra kwargs, then
+    # asserts pyconfig.initialize was called once with an argv containing model_name, no
+    # load_parameters_path, hf_access_token from HF_TOKEN, skip_jax_distributed_system=false (lowercased
+    # boolean), no use_flash_attention and no unknown tunix argument (fields not in the config are dropped),
+    # and that model_creation_utils.from_pretrained was called with the config, mesh and
+    # wrap_with_tunix_adapter True.
 
     m_maxtext = types.ModuleType("maxtext")
     m_maxtext_configs = types.ModuleType("maxtext.configs")
@@ -166,6 +192,8 @@ class AutoModelTest(parameterized.TestCase):
       m_maxtext_utils_model_creation_utils.from_pretrained = mock.MagicMock()
 
       class MockMaxTextConfig:
+        # [CLASS DOC]
+        # HELPER: fake MaxTextConfig exposing model_fields with the two accepted override names.
         model_fields = {
             "skip_jax_distributed_system": True,
             "hf_access_token": "mock",
@@ -208,10 +236,14 @@ class AutoModelTest(parameterized.TestCase):
 
   @parameterized.named_parameters(*_get_all_models_test_parameters())
   def test_obtain_model_params_valid(self, model_name: str):
+    # [FUNCTION DOC]
+    # Verifies call_model_config succeeds (does not raise) for every supported model name.
     automodel.call_model_config(model_name)
 
   @parameterized.named_parameters(*_get_gemma_models_test_parameters())
   def test_get_params_module_gemma_valid(self, model_name: str):
+    # [FUNCTION DOC]
+    # Verifies gemma models resolve a PARAMS_SAFETENSORS module exposing create_model_from_safe_tensors.
     params_module = automodel.get_model_module(
         model_name, automodel.ModelModule.PARAMS_SAFETENSORS
     )
@@ -219,6 +251,8 @@ class AutoModelTest(parameterized.TestCase):
 
   @parameterized.named_parameters(*_get_non_gemma_models_test_parameters())
   def test_get_params_module_non_gemma_valid(self, model_name: str):
+    # [FUNCTION DOC]
+    # Verifies non-gemma models resolve a PARAMS module exposing create_model_from_safe_tensors.
     params_module = automodel.get_model_module(
         model_name, automodel.ModelModule.PARAMS
     )
@@ -226,12 +260,16 @@ class AutoModelTest(parameterized.TestCase):
 
   @parameterized.named_parameters(*_get_all_models_test_parameters())
   def test_get_model_module_valid(self, model_name: str):
+    # [FUNCTION DOC]
+    # Verifies every model resolves a MODEL module exposing ModelConfig.
     model_lib_module = automodel.get_model_module(
         model_name, automodel.ModelModule.MODEL
     )
     self.assertTrue(hasattr(model_lib_module, "ModelConfig"))
 
   def test_get_model_module_invalid(self):
+    # [FUNCTION DOC]
+    # Verifies get_model_module raises ValueError for an unknown model family.
     with self.assertRaisesRegex(
         ValueError, "Could not determine model family for: invalid-model"
     ):
@@ -242,6 +280,10 @@ class AutoModelTest(parameterized.TestCase):
   def test_create_model_dynamically(
       self, mock_get_model_module, model_name: str
   ):
+    # [FUNCTION DOC]
+    # Verifies create_model_from_safe_tensors fetches the params module via get_model_module (PARAMS_SAFETENSORS
+    # for gemma, gemma1p1, gemma2 and gemma3 families, PARAMS otherwise) and calls its
+    # create_model_from_safe_tensors once with file_dir, config, mesh, dtype and mode keywords.
     mock_create_fn = mock.Mock()
     mock_params_module = mock.Mock()
     mock_params_module.create_model_from_safe_tensors = mock_create_fn
@@ -293,6 +335,9 @@ class AutoModelTest(parameterized.TestCase):
       model_name,
       expected_version,
   ):
+    # [FUNCTION DOC]
+    # Verifies create_gemma_model_from_params loads params via the params module's load_and_format_params and
+    # builds the model with Gemma.from_params using the expected version string derived from the model name.
     mock_params_lib = mock.Mock()
     mock_model_lib = mock.Mock()
     mock_get_model_module.side_effect = [mock_params_lib, mock_model_lib]
@@ -340,6 +385,10 @@ class AutoModelTest(parameterized.TestCase):
       model_name,
       expected_dir_name,
   ):
+    # [FUNCTION DOC]
+    # Verifies create_gemma_model_with_nnx_conversion (with no existing intermediate checkpoint, mocked
+    # checkpointer and base model lookup) calls create_gemma_model_from_params once with the checkpoint path
+    # joined with the expected subdirectory ("2b" for gemma-2b, otherwise the full model name).
     del mock_exists, mock_checkpointer, mock_get_gemma_base_model
     mock_create_gemma_model_from_params.return_value = (
         mock.Mock(),
@@ -367,6 +416,9 @@ class AutoModelTest(parameterized.TestCase):
       ),
   )
   def test_from_pretrained_missing_model_path(self, model_source):
+    # [FUNCTION DOC]
+    # Verifies from_pretrained raises ValueError "model_path is required for model_source: <source>" when
+    # model_path is None for Kaggle, GCS and internal sources.
     mesh = jax.sharding.Mesh(jax.devices(), ("devices",))
     with self.assertRaisesRegex(
         ValueError,
@@ -390,8 +442,15 @@ class AutoModelTest(parameterized.TestCase):
       mock_call_model_config,
       mock_model_naming,
   ):
+    # [FUNCTION DOC]
+    # Verifies from_pretrained applies keyword overrides that match config dataclass fields
+    # (use_flash_attention True, flash_attention_block_size 512) to the config passed to
+    # create_model_from_safe_tensors and ignores unknown kwargs (invalid_param is not set).
     @dataclasses.dataclass
     class FakeConfig:
+      # [CLASS DOC]
+      # HELPER: fake model config dataclass with use_flash_attention (default False) and
+      # flash_attention_block_size (default 1024).
       use_flash_attention: bool = False
       flash_attention_block_size: int = 1024
 

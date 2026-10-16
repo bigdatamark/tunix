@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Flax NNX implementation of the Gemma 3 decoder-only transformer (text and
+# optional SigLIP vision input). Structure mirrors the Gemma/Gemma 2 module
+# with these differences: per-layer attention pattern of 5 LOCAL_SLIDING
+# layers followed by 1 GLOBAL layer (cycled); RMSNorm on queries and keys
+# (QK-norm) before RoPE; separate RoPE base frequency and scale factor for
+# local vs global layers; configurable query pre-attention scaling; always-on
+# post-attention and post-FFW norms; no logit soft-capping; parameters created
+# in a configurable param_dtype (default bfloat16); optional vision encoder
+# whose image embeddings are projected into the text embedding space and
+# scattered into the token sequence at placeholder positions.
+# Contents: RematConfig, ShardingConfig, QueryPreAttentionNormalisation,
+# ModelConfig (with preset factories for 270m/1b/4b/12b/27b), Embedder, Einsum,
+# apply_rope, AttentionType, GEMMA3_ATTENTION_PATTERN, find_last_one_index,
+# create_sliding_window_mask, Attention, FeedForward, DecoderLayer, RMSNorm,
+# Gemma3.
+# Types: LayerCache is a dict with 'k', 'v' ([B, cache_size, K, H]) and
+# 'end_index' (int32 [B]); Cache maps 'layer_<i>' to LayerCache.
+# K_MASK is a very large negative logit used for masking.
+# Side effect at import: env_utils.setup_sharding_environment().
 """Gemma3 model."""
 
 import dataclasses
@@ -42,6 +62,9 @@ Cache = dict[str, LayerCache]
 
 
 class RematConfig(enum.Enum):
+  # [CLASS DOC]
+  # Enum selecting rematerialization: NONE (store activations), BLOCK (remat
+  # attention and FFN blocks separately), DECODER (remat whole decoder layers).
   NONE = enum.auto()  # No remat, all activations will be stored in HBM.
   BLOCK = enum.auto()  # Remat the entire attn block.
   DECODER = enum.auto()
@@ -49,6 +72,11 @@ class RematConfig(enum.Enum):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardingConfig:
+  # [CLASS DOC]
+  # Frozen dataclass of partition-spec tuples for each weight/activation (same
+  # fields as the Gemma ShardingConfig minus score head) plus vision_proj
+  # (vision-to-text projection weight), vision_soft_emb_norm_weight and siglip
+  # (a vision.SigLIPShardingConfig or None) for the vision tower.
   """Sharding configuration for gemma transformer."""
 
   emb_vd: Tuple[str | None, ...]
@@ -68,6 +96,11 @@ class ShardingConfig:
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False):
+    # [FUNCTION DOC]
+    # Static factory: default sharding. When is_sampling is True, 'fsdp' is
+    # dropped from all weights and act_btd's last dim is not 'tp'-sharded.
+    # Vision sharding comes from vision.SigLIPShardingConfig.get_default_sharding
+    # with the same flag. Returns a new ShardingConfig.
     fsdp = 'fsdp' if not is_sampling else None
 
     return ShardingConfig(
@@ -89,6 +122,12 @@ class ShardingConfig:
 
 
 class QueryPreAttentionNormalisation(enum.Enum):
+  # [CLASS DOC]
+  # Enum choosing the query scaling factor applied before attention:
+  # BY_ONE_OVER_SQRT_HEAD_DIM (head_dim^-0.5) or
+  # BY_ONE_OVER_SQRT_EMBED_DIM_DIV_NUM_HEADS ((embed_dim // num_heads)^-0.5).
+  # KNOWN ISSUE: the class docstring says "Initialization strategy", which does
+  # not describe what the enum controls.
   """Initialization strategy."""
 
   # Whether to scale the query by 1/sqrt(head_dim)
@@ -100,6 +139,16 @@ class QueryPreAttentionNormalisation(enum.Enum):
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ModelConfig:
+  # [CLASS DOC]
+  # Keyword-only, slotted dataclass of Gemma 3 hyperparameters: num_layers,
+  # num_embed, embed_dim, hidden_dim, num_heads, head_dim, num_kv_heads,
+  # sliding_window_size, local/global RoPE base frequencies (default 10000),
+  # local/global RoPE scale factors (default 1.0), query_pre_attn_norm,
+  # vision_config (SigLIPConfig or None for text-only), shd_config,
+  # remat_config (default NONE), param_dtype (default bfloat16).
+  # Classmethod presets accept a sharding_config and (for 4b and larger) a
+  # text_only flag that leaves vision_config None when True (default) or sets
+  # a default SigLIPConfig otherwise.
   """Transformer config."""
 
   num_layers: int
@@ -129,6 +178,10 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: Gemma3 270M text config: 18 layers, vocab 262144, embed 640,
+    # hidden 2048, 4 heads, head_dim 256, 1 kv head, sliding window 512, local
+    # base freq 10k, global base freq 1M, given sharding.
     """Gemma3-270M text-only config."""
     return cls(
         num_layers=18,
@@ -149,6 +202,8 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: instruction-tuned 270M; same as gemma3_270m.
     """Gemma3-270M instruction-tuned text-only config."""
     return cls.gemma3_270m(sharding_config=sharding_config)
 
@@ -157,6 +212,10 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # HELPER: classmethod building the Gemma3 1B text config: 26 layers, vocab
+    # 262144, embed 1152, hidden 6912, 4 heads, head_dim 256, 1 kv head, window
+    # 512, base freqs 10k / 1M.
     return cls(
         num_layers=26,
         num_embed=262144,
@@ -176,6 +235,8 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 1B instruction-tuned; returns _gemma3_1b.
     """Gemma3-1B instruction-tuned text-only config."""
     return cls._gemma3_1b(sharding_config=sharding_config)
 
@@ -184,6 +245,8 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 1B pretrained; returns _gemma3_1b.
     """Gemma3-1B text-only config."""
     return cls._gemma3_1b(sharding_config=sharding_config)
 
@@ -193,6 +256,12 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # HELPER: classmethod building Gemma3 4B: 34 layers, vocab 262144, embed
+    # 2560, hidden 10240, 8 heads, head_dim 256, 4 kv heads, window 1024, base
+    # freqs 10k / 1M, global scale factor 8.0, vision config unless text_only.
+    # KNOWN ISSUE: docstring says "text-only" but the config is multimodal when
+    # text_only is False (same for the 4b/12b/27b public variants).
     """Gemma3-4B text-only config."""
     return cls(
         num_layers=34,
@@ -216,6 +285,8 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 4B instruction-tuned; returns _gemma3_4b(sharding, text_only).
     """Gemma3-4B instruction-tuned text-only config."""
     return cls._gemma3_4b(sharding_config=sharding_config, text_only=text_only)
 
@@ -225,6 +296,8 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 4B pretrained; returns _gemma3_4b(sharding, text_only).
     """Gemma3-4B text-only config."""
     return cls._gemma3_4b(sharding_config=sharding_config, text_only=text_only)
 
@@ -234,6 +307,11 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # HELPER: classmethod building Gemma3 12B: 48 layers, vocab 262144, embed
+    # 3840, hidden 15360, 16 heads, head_dim 256, 8 kv heads, query scaling by
+    # 1/sqrt(head_dim), window 1024, base freqs 10k / 1M, global scale 8.0,
+    # vision config unless text_only.
     """Gemma3-12B text-only config."""
     return cls(
         num_layers=48,
@@ -258,6 +336,8 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 12B instruction-tuned; returns _gemma3_12b.
     """Gemma3-12B instruction-tuned text-only config."""
     return cls._gemma3_12b(sharding_config=sharding_config, text_only=text_only)
 
@@ -267,6 +347,8 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 12B pretrained; returns _gemma3_12b.
     """Gemma3-12B text-only config."""
     return cls._gemma3_12b(sharding_config=sharding_config, text_only=text_only)
 
@@ -276,6 +358,11 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # HELPER: classmethod building Gemma3 27B: 62 layers, vocab 262144, embed
+    # 5376, hidden 21504, 32 heads, head_dim 128, 16 kv heads, query scaling by
+    # 1/sqrt(embed_dim // num_heads) (=1/sqrt(168)), window 1024, base freqs
+    # 10k / 1M, global scale 8.0, vision config unless text_only.
     """Gemma3-27B text-only config."""
     return cls(
         num_layers=62,
@@ -300,6 +387,8 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 27B instruction-tuned; returns _gemma3_27b.
     """Gemma3-27B instruction-tuned text-only config."""
     return cls._gemma3_27b(sharding_config=sharding_config, text_only=text_only)
 
@@ -309,11 +398,18 @@ class ModelConfig:
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       text_only: bool = True,
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: 27B pretrained; returns _gemma3_27b.
     """Gemma3-27B text-only config."""
     return cls._gemma3_27b(sharding_config=sharding_config, text_only=text_only)
 
 
 class Embedder(nnx.Module):
+  # [CLASS DOC]
+  # Token embedder with tied unembedding, plus optional multimodal projection:
+  # when vision_proj_dim is truthy it owns mm_soft_embedding_norm (RMSNorm over
+  # vision width) and mm_input_projection (Einsum '...TM,MD->...TD', weight
+  # [vision_proj_dim, embed_dim]).
   """Embedder module."""
 
   def __init__(
@@ -326,6 +422,11 @@ class Embedder(nnx.Module):
       shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
       param_dtype: jnp.dtype = jnp.bfloat16,
   ):
+    # [FUNCTION DOC]
+    # Creates input_embedding [vocab_size, embed_dim] (normal init, param_dtype,
+    # sharding emb_vd); if vision_proj_dim is given, creates the vision norm
+    # (sharding vision_soft_emb_norm_weight) and projection (sharding
+    # vision_proj). Stores shd_config.
     self.input_embedding = nnx.Param(
         nnx.initializers.normal(dtype=param_dtype)(
             rngs.params(), (vocab_size, embed_dim)
@@ -350,6 +451,9 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_encode')
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Looks up token ids x [B, L], multiplies by sqrt(embed_dim) in the
+    # embedding dtype, applies act_btd sharding constraint. Returns [B, L, D].
     x = self.input_embedding[(x,)]
     x *= jnp.sqrt(x.shape[-1]).astype(x.dtype)
     x = sharding_utils.shard(x, self.shd_config.act_btd)
@@ -357,24 +461,37 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_decode')
   def decode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Returns logits x @ input_embedding^T ([..., vocab]).
     return jnp.dot(x, self.input_embedding.value.T)
 
   @jax.named_scope('embedder_encode_vision')
   def encode_vision(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Maps vision encoder outputs [..., T, vision_width] into text embedding
+    # space: RMSNorm then projection to [..., T, D]. Raises AttributeError if
+    # the embedder was built without vision_proj_dim.
     x = self.mm_soft_embedding_norm(x)
     x = self.mm_input_projection(x)
     return x
 
   @property
   def embed_dim(self):
+    # [FUNCTION DOC]
+    # Property: embedding dim (table dim 1).
     return self.input_embedding.value.shape[1]
 
   @property
   def num_embed(self):
+    # [FUNCTION DOC]
+    # Property: vocab size (table dim 0).
     return self.input_embedding.value.shape[0]
 
 
 class Einsum(nnx.Module):
+  # [CLASS DOC]
+  # Parameterized einsum: weight w of the given shape (normal init in
+  # param_dtype, given sharding) contracted with the input by einsum_str.
   """Einsum is a convenience module for parameterized tensor multiplication."""
 
   def __init__(
@@ -386,6 +503,8 @@ class Einsum(nnx.Module):
       sharding: Tuple[str | None, ...],
       param_dtype: jnp.dtype = jnp.bfloat16,
   ):
+    # [FUNCTION DOC]
+    # Stores einsum_str and shape and creates the weight parameter w.
     self.einsum_str = einsum_str
     self.shape = shape
     self.w = nnx.Param(
@@ -394,6 +513,8 @@ class Einsum(nnx.Module):
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Returns einsum(einsum_str, x, w).
     return jnp.einsum(self.einsum_str, x, self.w.value)
 
 
@@ -406,6 +527,12 @@ def apply_rope(
     base_frequency: int,
     scale_factor: float = 1.0,
 ) -> jaxtyping.Array:
+  # [FUNCTION DOC]
+  # Applies half-split rotary embeddings to inputs [B, L, N, H] at positions
+  # [B, L]. Angle = position / base_frequency^(2i/H) for i < H/2, then divided
+  # by scale_factor (linear position interpolation). Rotation:
+  # first*cos - second*sin, second*cos + first*sin; output cast to input dtype.
+  # Raises ValueError if scale_factor < 1.0.
   """Applies RoPE."""
   fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
   timescale = base_frequency**fraction
@@ -432,6 +559,10 @@ K_MASK = -2.3819763e38  # Set to a large negative number.
 
 
 class AttentionType(enum.Enum):
+  # [CLASS DOC]
+  # Enum of attention kinds: GLOBAL (=1) and LOCAL_SLIDING (=2). The module
+  # constant GEMMA3_ATTENTION_PATTERN defines five LOCAL_SLIDING followed by one
+  # GLOBAL; layers cycle through it.
   GLOBAL = 1
   LOCAL_SLIDING = 2
 
@@ -447,6 +578,12 @@ GEMMA3_ATTENTION_PATTERN = (
 
 
 def find_last_one_index(attn_mask: jnp.ndarray) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # For attn_mask [B, T, S], returns the index of the rightmost true/1 entry
+  # along the last axis (0 for all-zero rows), computed via argmax on the
+  # reversed rows; the trailing T axis is squeezed, so the result is [B].
+  # Raises an error if T != 1 (squeeze of a non-unit axis); intended only for
+  # single-token decoding.
   """Finds the index of the last (rightmost) '1' from attn_mask."""
   cache_len = attn_mask.shape[-1]
 
@@ -476,6 +613,12 @@ def create_sliding_window_mask(
     attn_mask: jnp.ndarray,  # [B, seq_len, cache_len] seq_len=1 for decoding
     sliding_window_size: int,
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: decode-time sliding window mask. upper = last allowed key index per
+  # row (find_last_one_index); returns a [B, 1, S] mask true for key indices in
+  # [upper - sliding_window_size + 1, upper].
+  # KNOWN ISSUE: works on cache slot indices, so it assumes the cache has not
+  # wrapped around; requires seq_len == 1.
   """Helper function to create sliding window mask for local attention."""
   upper_index = find_last_one_index(attn_mask)
 
@@ -495,6 +638,12 @@ def create_sliding_window_mask(
 
 
 class Attention(nnx.Module):
+  # [CLASS DOC]
+  # Gemma 3 attention: like Gemma 2 attention (MHA fused qkv / GQA / MQA
+  # einsums, left-aligned KV cache, remat option) but with QK RMSNorm
+  # (_query_norm, _key_norm over head_dim) before RoPE, per-layer RoPE base
+  # frequency and scale factor, configurable query scaling, no logit
+  # soft-capping, and a separate sliding mask for prefill vs decode.
   """Attention module."""
 
   def __init__(
@@ -514,6 +663,15 @@ class Attention(nnx.Module):
       remat_config: RematConfig,
       param_dtype: jnp.dtype = jnp.bfloat16,
   ):
+    # [FUNCTION DOC]
+    # Keyword-only inputs: num_heads, num_kv_heads, features (D), head_dim,
+    # attn_type, rngs, sliding_window_size, rope_base_frequency,
+    # rope_scale_factor, query_pre_attn_norm, shd_config, remat_config,
+    # param_dtype. Raises ValueError for LOCAL_SLIDING without a window size.
+    # Creates attn_vec_einsum ([N, H, D]); fused qkv_einsum ([3, N, D, H]) when
+    # num_heads == num_kv_heads, else q_einsum ([N, D, H]) and kv_einsum
+    # ([2, K, D, H], sharding (None, None, 'fsdp', None) for one kv head); and
+    # unsharded RMSNorms _query_norm and _key_norm of size head_dim.
     if attn_type == AttentionType.LOCAL_SLIDING and sliding_window_size is None:
       raise ValueError(
           '`sliding_window_size` must be set if `attn_type` is Local Sliding.'
@@ -569,6 +727,19 @@ class Attention(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Attention computation. Inputs: x [B, T, D], segment_pos [B, T], cache or
+    # None, attn_mask bool [B, T, S].
+    # Steps: project q/k/v; shard; RMSNorm q and k; RoPE on q and k with this
+    # layer's base frequency / scale factor; scale q by query_pre_attn_scalar;
+    # if cached, write k/v at slot end_index[0] modulo cache length and use the
+    # whole cache; compute logits (grouped for GQA). For LOCAL_SLIDING: when T is
+    # 1 multiply mask by create_sliding_window_mask; otherwise (prefill) by a band
+    # mask keeping |query_index - key_index| < window (assumes queries start at
+    # cache slot 0). Mask with K_MASK, softmax, weighted sum of values, output
+    # projection and act_btd sharding.
+    # Output: (new cache with end_index + T, or None; output [B, T, D]).
+    # KNOWN ISSUE: a single end_index (row 0) is used for the whole batch.
     seq_len = x.shape[1]
 
     if self.use_qkv_einsum:
@@ -679,6 +850,9 @@ class Attention(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Calls block via nnx.remat when remat_config is BLOCK (enum or its value),
+    # otherwise directly.
     if (
         self.remat_config == RematConfig.BLOCK
         or self.remat_config == RematConfig.BLOCK.value
@@ -693,14 +867,22 @@ class Attention(nnx.Module):
 
   @property
   def head_dim(self):
+    # [FUNCTION DOC]
+    # Property: head_dim from attn_vec_einsum.shape[1].
     return self.attn_vec_einsum.shape[1]
 
   @property
   def features(self):
+    # [FUNCTION DOC]
+    # Property: model width D from attn_vec_einsum.shape[2].
     return self.attn_vec_einsum.shape[2]
 
   @property
   def query_pre_attn_scalar(self):
+    # [FUNCTION DOC]
+    # Property: query scaling factor per query_pre_attn_norm: head_dim^-0.5 or
+    # (features // num_heads)^-0.5.
+    # KNOWN ISSUE: returns None implicitly for any other enum value.
     match self.query_pre_attn_norm:
       case QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_HEAD_DIM:
         return self.head_dim**-0.5
@@ -711,6 +893,8 @@ class Attention(nnx.Module):
 
   @property
   def num_heads(self):
+    # [FUNCTION DOC]
+    # Property: number of query heads (from qkv_einsum or q_einsum shape).
     return (
         self.qkv_einsum.shape[1]
         if self.use_qkv_einsum
@@ -719,6 +903,8 @@ class Attention(nnx.Module):
 
   @property
   def num_kv_heads(self):
+    # [FUNCTION DOC]
+    # Property: number of kv heads (from qkv_einsum or kv_einsum shape).
     return (
         self.qkv_einsum.shape[1]
         if self.use_qkv_einsum
@@ -727,14 +913,21 @@ class Attention(nnx.Module):
 
   @property
   def use_qkv_einsum(self):
+    # [FUNCTION DOC]
+    # Property: True when a fused qkv_einsum exists.
     return hasattr(self, 'qkv_einsum') and self.qkv_einsum is not None
 
   @property
   def use_gqa(self):
+    # [FUNCTION DOC]
+    # Property: True for GQA (kv heads != query heads and kv heads > 1).
     return self.num_kv_heads != self.num_heads and self.num_kv_heads > 1
 
 
 class FeedForward(nnx.Module):
+  # [CLASS DOC]
+  # Gated GELU MLP: down_proj(gelu(gate_proj(x)) * up_proj(x)) with bias-free
+  # zero-initialized nnx.Linear layers in config.param_dtype.
   """Feed forward module."""
 
   def __init__(
@@ -743,6 +936,9 @@ class FeedForward(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates gate_proj and up_proj (embed_dim -> hidden_dim, sharding
+    # ffw_weight_df) and down_proj (hidden_dim -> embed_dim, ffw_weight_fd).
     self.config = config
     kernel_init_fn = nnx.initializers.zeros_init()
     self.gate_proj = nnx.Linear(
@@ -780,6 +976,9 @@ class FeedForward(nnx.Module):
       self,
       x: jaxtyping.Array,
   ) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Computes the gated activation, applies act_btf sharding and projects down.
+    # [B, T, D] -> [B, T, D].
     ff_gate = self.gate_proj(x)
     gate_value = nnx.gelu(ff_gate)
     ff1 = self.up_proj(x)
@@ -792,6 +991,8 @@ class FeedForward(nnx.Module):
 
   @jax.named_scope('feed_forward')
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Uses nnx.remat around block when remat_config is BLOCK, else calls block.
     if self.config.remat_config == RematConfig.BLOCK:
       return nnx.remat(self.block.__func__)(self, x)
     else:
@@ -799,6 +1000,9 @@ class FeedForward(nnx.Module):
 
 
 class DecoderLayer(nnx.Module):
+  # [CLASS DOC]
+  # Gemma 3 decoder layer: pre-attn norm, attention, post-attn norm, residual,
+  # pre-FFW norm, MLP, post-FFW norm, residual. All four norms always present.
   """Transformer block."""
 
   def __init__(
@@ -808,6 +1012,10 @@ class DecoderLayer(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Builds the four RMSNorms (sharding rms_norm_weight, param_dtype), the
+    # Attention (local base frequency and scale for LOCAL_SLIDING layers, global
+    # ones otherwise) and the FeedForward from config.
     self.config = config
     self.pre_attention_norm = RMSNorm(
         config.embed_dim,
@@ -864,6 +1072,9 @@ class DecoderLayer(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # h = post_attention_norm(attn(pre_attention_norm(x))) + x;
+    # out = post_ffw_norm(mlp(pre_ffw_norm(h))) + h. Returns (cache, out).
     inputs_normalized = self.pre_attention_norm(x)
     cache, attn_output = self.attn(
         inputs_normalized,
@@ -889,6 +1100,8 @@ class DecoderLayer(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Uses nnx.remat around block when remat_config is DECODER, else calls block.
     if self.config.remat_config == RematConfig.DECODER:
       return nnx.remat(self.block.__func__)(
           self, x, segment_pos, cache, attn_mask
@@ -898,6 +1111,8 @@ class DecoderLayer(nnx.Module):
 
 
 class RMSNorm(nnx.Module):
+  # [CLASS DOC]
+  # RMSNorm with zero-initialized scale applied as (1 + scale), epsilon 1e-6.
   """RMSNorm layer."""
 
   def __init__(
@@ -908,6 +1123,9 @@ class RMSNorm(nnx.Module):
       sharding: tuple[str, ...] = (),
       param_dtype: jnp.dtype = jnp.bfloat16,
   ):
+    # [FUNCTION DOC]
+    # Creates scale [dim] of zeros in param_dtype with the given sharding
+    # (default unsharded).
     self.scale = nnx.Param(
         nnx.initializers.zeros_init()(rngs.params(), dim).astype(param_dtype),
         sharding=sharding,
@@ -915,6 +1133,8 @@ class RMSNorm(nnx.Module):
 
   @jax.named_scope('rms_norm')
   def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Returns x * rsqrt(mean(x^2, last axis) + 1e-6) * (1 + scale).
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
     normed_inputs = x * jax.lax.rsqrt(var + 1e-06)
 
@@ -927,11 +1147,19 @@ class RMSNorm(nnx.Module):
 
 
 class Gemma3(BackendMappingMixin, nnx.Module):
+  # [CLASS DOC]
+  # Gemma 3 model: optional SigLIP vision encoder (when config.vision_config
+  # is set), Embedder (with vision projection sized by the vision width),
+  # num_layers DecoderLayers following GEMMA3_ATTENTION_PATTERN cyclically, and
+  # a final RMSNorm with tied unembedding. Mixes in BackendMappingMixin.
   """Gemma3 transformer."""
 
   BACKEND_PACKAGE_PATH = __name__
 
   def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+    # [FUNCTION DOC]
+    # Builds the submodules described in the class doc from config; sets
+    # vision_encoder to None for text-only configs.
     self.config = config
 
     if config.vision_config is not None:
@@ -980,6 +1208,17 @@ class Gemma3(BackendMappingMixin, nnx.Module):
       *,
       images: jaxtyping.Array | None = None,  # [B, H, W, C] or [B, N, H, W, C]
   ) -> tuple[jaxtyping.Array, Cache | None]:
+    # [FUNCTION DOC]
+    # Forward pass. Inputs: last_tokens [B, L]; positions [B, L]; cache or None;
+    # attention_mask [B, L, S]; output_hidden_states; keyword images
+    # ([B, H, W, C] or [B, N, H, W, C], optional).
+    # Embeds tokens (merging image embeddings when images are given), runs every
+    # layer inside a named scope 'layer_<i>' collecting per-layer caches, applies
+    # final norm, optionally sows the hidden states as nnx.Intermediate
+    # 'all_hidden_states' (side effect), unembeds.
+    # Output: (logits [B, L, vocab], new cache or None).
+    # KNOWN ISSUE: positions and attention_mask default to None but are passed
+    # straight to the layers, so calling without them fails.
     """Transformer forward pass.
 
     You can run this forward pass two ways: with or without an attention kv
@@ -1031,6 +1270,11 @@ class Gemma3(BackendMappingMixin, nnx.Module):
       tokens: jaxtyping.Array,  # (B, L)
       images: jaxtyping.Array | None = None,  # (B, H, W, C) or (B, N, H, W, C)
   ) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # HELPER: embeds text tokens; if the model has a vision config and images are
+    # given, checks multimodal support and adds a num_images axis to 4D images;
+    # when images are given, merges vision embeddings via _merge_mm_embeddings.
+    # Returns [B, L, D].
     """Encode the text tokens, eventually including the vision embeddings."""
     if self.config.vision_config is not None and images is not None:
       self._assert_support_mm()
@@ -1046,6 +1290,9 @@ class Gemma3(BackendMappingMixin, nnx.Module):
     return x  # pytype: disable=bad-return-type  # jax-arraylike
 
   def _assert_support_mm(self) -> None:
+    # [FUNCTION DOC]
+    # HELPER: raises ValueError if the model has no vision encoder (mentioning
+    # text_only when such an attribute is truthy).
     if self.vision_encoder is None:
       msg = ''
       if getattr(self, 'text_only', False):
@@ -1063,6 +1310,11 @@ class Gemma3(BackendMappingMixin, nnx.Module):
       embeddings: jaxtyping.ArrayLike,  # B L D
       images: jaxtyping.ArrayLike,  # B N H W C
   ) -> jaxtyping.ArrayLike:  # B L D
+    # [FUNCTION DOC]
+    # HELPER: encodes images to soft embeddings [B, N, P, D] and scatters them
+    # into embeddings at positions where tokens equal
+    # vision_config.soft_token_placeholder (merge_embeddings). Raises ValueError
+    # if vision_config is None (only after encoding was attempted).
     """Update the embeddings to include the vision embeddings."""
     # Encode the images
     soft_embeddings = self._encode_vision(images)
@@ -1084,6 +1336,9 @@ class Gemma3(BackendMappingMixin, nnx.Module):
   def _encode_vision(
       self, images: jaxtyping.ArrayLike  # B N H W C
   ) -> jaxtyping.ArrayLike:  # B N P D
+    # [FUNCTION DOC]
+    # HELPER: runs the vision encoder on images [B, N, H, W, C] and projects the
+    # result with embedder.encode_vision. Raises ValueError if no vision encoder.
     """Encode the images into the same space as the text embeddings."""
     if self.vision_encoder is None:
       raise ValueError('`vision_encoder` is None, cannot encode images.')
@@ -1094,6 +1349,10 @@ class Gemma3(BackendMappingMixin, nnx.Module):
     return soft_embeddings
 
   def get_model_input(self):
+    # [FUNCTION DOC]
+    # Returns dummy inputs for tracing: last_tokens and positions int32 ones
+    # [2, 1], cache None, attention_mask bool ones [2, 1, 1], plus images float32
+    # ones [2, 1, 896, 896, 3] when a vision encoder exists.
     """Returns a dummy model input for the transformer.
 
     This dummy input has a batch size compatible with FSDP sharding on a
@@ -1123,10 +1382,14 @@ class Gemma3(BackendMappingMixin, nnx.Module):
 
   @property
   def embed_dim(self) -> int:
+    # [FUNCTION DOC]
+    # Property: embedding dimension.
     return self.embedder.embed_dim
 
   @property
   def num_embed(self) -> int:
+    # [FUNCTION DOC]
+    # Property: vocabulary size.
     return self.embedder.num_embed
 
   def get_attention_mask(
@@ -1135,6 +1398,12 @@ class Gemma3(BackendMappingMixin, nnx.Module):
       *,
       inputs_mask: jaxtyping.ArrayLike | None = None,  # (B, L)
   ):
+    # [FUNCTION DOC]
+    # Returns the [B, L, L] attention mask from utils.get_attention_mask, passing
+    # the vision soft-token placeholder id (bidirectional image blocks) when a
+    # vision config exists.
+    # KNOWN ISSUE: the docstring says it returns positions too, but only the mask
+    # is returned.
     """Returns the positions and attention mask for the transformer."""
     token_placeholder_id = (
         None if self.config.vision_config is None else
@@ -1148,4 +1417,6 @@ class Gemma3(BackendMappingMixin, nnx.Module):
 
   @property
   def num_layers(self) -> int:
+    # [FUNCTION DOC]
+    # Property: number of decoder layers.
     return len(self.layers)

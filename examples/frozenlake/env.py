@@ -8,6 +8,14 @@ https://github.com/RAGEN-AI/RAGEN/blob/main/ragen/env/frozen_lake/env.py
 
  Some components have been modified or extended for custom use in this project.
 """
+# [MODULE DOC]
+# FrozenLake grid-world environment for tunix agentic RL, adapted from Gymnasium FrozenLake and RAGEN.
+# Provides a valid-random-map generator and FrozenLakeEnv, which combines tunix BaseTaskEnv (step/reset
+# protocol with EnvStepResult, max_steps) with Gymnasium's FrozenLakeEnv (transition dynamics). Text
+# observations are grids of tokens P (player), _ (frozen), O (hole), G (goal), X (player in hole),
+# and a check mark (player on goal), tab-separated per cell, rows separated by newlines.
+# Module global MAX_STEPS (default 5) bounds both the DFS path length used to validate maps and the
+# env's step budget; it is overwritten by every FrozenLakeEnv construction (global side effect).
 
 import copy
 from typing import Any, Dict
@@ -23,6 +31,14 @@ MAX_STEPS: int = 5
 
 # DFS to check that it's a valid path.
 def is_valid(board: list[list[str]], max_size: int) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: depth-first search from the single "S" cell of board (list of rows of single-char strings)
+  # over 4-neighbours within a max_size x max_size grid, not entering "H" cells, abandoning paths longer
+  # than MAX_STEPS steps. Returns True as soon as a neighbour is "G", else False. Each cell is expanded
+  # at most once (first visit wins, so a shorter path found later may be missed).
+  # Raises IndexError if there is no "S".
+  # KNOWN ISSUE: because visited cells are marked regardless of step count, DFS order can reject maps
+  # that do have a path within MAX_STEPS.
   frontier, discovered = [], set()
   # find the start point
   start_r, start_c = np.where(np.array(board) == "S")
@@ -51,6 +67,12 @@ def is_valid(board: list[list[str]], max_size: int) -> bool:
 def generate_random_map(
     size: int = 8, p: float = 0.8, seed: int = 0
 ) -> tuple[list[str], tuple[int, int]]:
+  # [FUNCTION DOC]
+  # Generates a reproducible valid map. Uses a Gymnasium seeded numpy Generator from seed; loops:
+  # p is clamped to at most 1, a size x size board is sampled with "F" with probability p and "H"
+  # otherwise, start and goal positions are sampled uniformly until distinct, written as "S" and "G",
+  # and is_valid is checked; repeats until valid. Output: (list of row strings, (goal_row, goal_col)).
+  # May loop forever if no valid map is attainable (e.g. very low p). Docstring omits the goal tuple.
   """Generates a random valid map (one that has a path from start to goal)
 
   Args:
@@ -86,6 +108,8 @@ def generate_random_map(
 
 
 def get_goal_position(random_map):
+  # [FUNCTION DOC]
+  # HELPER: given a 2-D bytes array map, returns (row, col) of the first b"G" cell (numpy ints) or None.
   positions = np.argwhere(random_map == b"G")
   if positions.size == 0:
     return None  # G not found
@@ -93,6 +117,15 @@ def get_goal_position(random_map):
 
 
 class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
+  # [CLASS DOC]
+  # FrozenLake env usable by tunix agents. Actions are ints 1..4 (Left, Down, Right, Up) mapped to gym
+  # actions 0..3; 0 (or any falsy action) is a no-op "invalid" action with reward 0. Rewards come from
+  # Gym: 1 on reaching the goal, else 0. Episode is done on goal or hole (Gym termination) or by
+  # BaseTaskEnv max steps. Class constants: MAP_LOOKUP (byte tile to int: P0 F1 H2 G3), GRID_LOOKUP
+  # (int to rendered cell, 4 = in hole, 5 = on goal), ACTION_LOOKUP (names), INVALID_ACTION = 0,
+  # PENALTY_FOR_INVALID = -1.
+  # KNOWN ISSUE: docstring says invalid actions get -0.1 and the action range is {0,3}; code gives 0.0
+  # reward for invalid actions, PENALTY_FOR_INVALID is unused, and valid actions are 1..4.
   """Inherits from gymnasium.envs.toy_text.frozen_lake.FrozenLakeEnv
 
   ## Description
@@ -171,6 +204,17 @@ class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
       max_steps: int = 5,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Constructor. Inputs: entry (dict with optional numpy-scalar "seed" (default 42), "size" (8),
+    # "p" (0.8), each read via .item()), group_id and pair_index (stored in extra_kwargs), max_steps
+    # (default 5; also assigned to the module global MAX_STEPS), kwargs may contain "desc" (explicit map
+    # as list of strings) and "is_slippery" (default False); other kwargs are ignored. Without desc, a
+    # random valid map and goal are generated; with desc, the map is turned into a bytes char array and the
+    # goal located. Stores goal_postion (sic), initializes BaseTaskEnv(max_steps) and Gym FrozenLakeEnv
+    # (desc, is_slippery), sets ACTION_SPACE to Discrete(4, start=1), map_kwargs, env_kwargs, action_map
+    # (1..4 to 0..3), reward 0, empty _valid_actions, and extra_kwargs group/pair ids.
+    # Raises AttributeError if seed/size/p are plain Python numbers (no .item()).
+    # KNOWN ISSUE: mutates the module-global MAX_STEPS, affecting all other instances and map validation.
     global MAX_STEPS
     MAX_STEPS = max_steps
 
@@ -220,9 +264,14 @@ class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
     self.extra_kwargs["pair_index"] = pair_index
 
   def _get_player_position(self):
+    # [FUNCTION DOC]
+    # HELPER: returns (row, col) of the player from Gym's flat state index self.s and column count ncol.
     return (self.s // self.ncol, self.s % self.ncol)
 
   def _initial_observation(self) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: resets the Gym env with self.seed, zeroes reward and valid actions, returns the
+    # tiny_rgb_array text rendering as the initial observation.
     GymFrozenLakeEnv.reset(self, seed=self.seed)
     self.reward = 0
     self._valid_actions = []
@@ -230,18 +279,32 @@ class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
     return init_observation
 
   def finished(self):
+    # [FUNCTION DOC]
+    # Returns True if the player's current tile is G or H (episode terminal), else False.
     player_pos = self._get_player_position()
     return self.desc[player_pos] in b"GH"
 
   def success(self):
+    # [FUNCTION DOC]
+    # Returns True if the player's current tile is G.
+    # KNOWN ISSUE: docstring says goal or hole, but only the goal counts.
     """Check if the agent has reacched the goal (G) or hole (H)"""
     player_pos = self._get_player_position()
     return self.desc[player_pos] in b"G"
 
   def step(self, action: Any) -> tuple[Any, float, bool, Dict[str, Any]]:  # type: ignore[signature-mismatch]
+    # [FUNCTION DOC]
+    # Delegates to BaseTaskEnv.step (which handles step counting/max steps and calls _step_impl).
+    # Output: whatever BaseTaskEnv.step returns (observation, reward, done, info).
     return BaseTaskEnv.step(self, action)
 
   def _step_impl(self, action: Any) -> EnvStepResult:
+    # [FUNCTION DOC]
+    # Performs one step. If already on the goal, returns the current render with reward 1.0, done True,
+    # action_is_effective False. Falsy action becomes INVALID_ACTION; action is cast to int (ValueError for
+    # non-numeric strings). Invalid action returns render, reward 0.0, done False, not effective. Otherwise
+    # maps the action via action_map (KeyError for values outside 1..4), steps Gym, and returns render,
+    # float reward, Gym terminated flag as done, and action_is_effective = whether the state index changed.
     """- Map custom action to gymnasium FrozenLakeEnv action and take the step
 
     - Check if the action is effective (whether player moves in the env).
@@ -284,6 +347,13 @@ class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
     )
 
   def render(self, mode="tiny_rgb_array"):
+    # [FUNCTION DOC]
+    # Renders the env. mode must be tiny_rgb_array (default), list, state, rgb_array or ansi
+    # (AssertionError otherwise). rgb_array/ansi temporarily set Gym's render_mode and return Gym's render.
+    # Otherwise copies desc, replaces S by F and puts P at the player position. "state" returns an int
+    # array via MAP_LOOKUP, with 4 if the player is on a hole and 5 on the goal. "list" returns a list of
+    # row strings of stripped cell symbols joined by spaces. "tiny_rgb_array" returns the GRID_LOOKUP cells
+    # concatenated per row, rows joined by newlines.
     assert mode in ["tiny_rgb_array", "list", "state", "rgb_array", "ansi"]
     if mode in ["rgb_array", "ansi"]:
       prev_render_mode = self.render_mode
@@ -326,12 +396,19 @@ class FrozenLakeEnv(BaseTaskEnv, GymFrozenLakeEnv):
       return result
 
   def reset(self):  # type: ignore[signature-mismatch]
+    # [FUNCTION DOC]
+    # Resets BaseTaskEnv state and Gym state with self.seed (same map and start every time) and returns
+    # (tiny_rgb_array observation, empty info dict).
     BaseTaskEnv.reset(self)
     GymFrozenLakeEnv.reset(self, seed=self.seed)
     return self.render(mode="tiny_rgb_array"), {}
 
   @classmethod
   def from_dict(cls, env_info: dict) -> "FrozenLakeEnv":
+    # [FUNCTION DOC]
+    # Builds an env from a dict: entry=env_info, is_slippery from env_info (default False).
+    # KNOWN ISSUE: passes max_turns as a kwarg, which __init__ ignores, so max_steps always stays 5 and the
+    # "max_turns" value is lost.
     return cls(
         entry=env_info,
         max_turns=env_info.get("max_turns", MAX_STEPS),

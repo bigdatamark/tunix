@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Rollout (generation) worker interface shared by all backends (vanilla Tunix
+# sampler, vLLM, sglang-jax, mock). Defines the KV-cache config, the rollout
+# output container, the large RolloutConfig dataclass of sampling and
+# backend-specific knobs, and the abstract BaseRollout class. No import-time
+# side effects; aliases ABC and abstractmethod.
 """Base rollout worker interface."""
 
 import abc
@@ -30,6 +36,9 @@ abstractmethod = abc.abstractmethod
 
 @dataclasses.dataclass(frozen=True)
 class CacheConfig:
+  # [CLASS DOC]
+  # Frozen dataclass describing the KV cache for the vanilla sampler. Required
+  # fields: cache_size (max tokens held), num_layers, num_kv_heads, head_dim.
   """Configuration for the KV cache."""
 
   cache_size: int
@@ -40,6 +49,12 @@ class CacheConfig:
 
 @dataclasses.dataclass
 class RolloutOutput:
+  # [CLASS DOC]
+  # Mutable dataclass returned by generate. Fields: text (decoded completions),
+  # logits (per-sample unpadded per-step logits, may be None for some
+  # backends), tokens (per-sample unpadded completion token arrays as NumPy),
+  # left_padded_prompt_tokens (2-D NumPy array of prompt ids left padded),
+  # logprobs (per-sample log-probs of sampled tokens, or None).
   """Output of the rollout worker."""
 
   # Generated samples from the model.
@@ -66,6 +81,25 @@ class RolloutOutput:
 
 @dataclasses.dataclass
 class RolloutConfig:
+  # [CLASS DOC]
+  # Mutable dataclass of generation settings, all with defaults. Generic:
+  # max_tokens_to_generate 64, temperature 0.9 (0 means greedy), top_p 1.0,
+  # top_k None, seed None, max_prompt_length 64 (pad/truncate length),
+  # kv_cache_size 1024 (vanilla only), data_type None, eos_tokens None (use
+  # tokenizer EOS), rollout_mapping_config None, tensor_parallel_size -1,
+  # data_parallel_size -1, expert_parallel_size 1, return_logprobs False.
+  # vLLM-only fields prefixed rollout_vllm_ (server mode, model version, LoRA
+  # config, HBM utilization 0.2, random-weight init True, TPU backend type,
+  # async scheduling, logprobs mode "processed_logprobs", HF config path,
+  # additional config, DP attention, delete destination buffers True, max
+  # batched tokens, max sequences, reshard chunk size, engine kwargs, sampling
+  # kwargs). sglang-jax-only fields prefixed rollout_sglang_jax_ (model
+  # version, context length, static memory fraction 0.2, random-weight init,
+  # disable radix cache True, deterministic sampling, sort-based top-p/k/min-p
+  # True, static LoRA, single process True, LoRA targets/rank/scaling,
+  # precompile batch/token paddings, chunked prefill size -1, page size 128,
+  # load format "auto", max running requests, log level "info", extra kwargs).
+  # No validation.
   """Configuration for the rollout worker.
 
   Fields should be mapped to a subset of vLLM sampling knobs
@@ -242,10 +276,15 @@ class RolloutConfig:
 
 
 class BaseRollout(ABC):
+  # [CLASS DOC]
+  # Abstract rollout worker. Implementations must provide a constructor and
+  # generate, get_per_token_logps, update_params, pad_id, eos_id and model.
   """Base RolloutWorker."""
 
   @abstractmethod
   def __init__(self, **kwargs):
+    # [FUNCTION DOC]
+    # Abstract constructor taking backend-specific keyword arguments.
     """Initializes the rollout worker."""
 
   @abstractmethod
@@ -255,6 +294,9 @@ class BaseRollout(ABC):
       rollout_config: RolloutConfig,
       **kwargs,
   ) -> RolloutOutput:
+    # [FUNCTION DOC]
+    # Abstract. Generates completions for the prompt strings using the config
+    # (extra backend kwargs allowed). Returns a RolloutOutput.
     """Generates samples from the model."""
 
   @abstractmethod
@@ -263,6 +305,9 @@ class BaseRollout(ABC):
       prompt_tokens: jax.Array,
       completion_tokens: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Abstract. Returns per-token log-probs (batch by completion length) of the
+    # completion tokens conditioned on the prompt tokens under the rollout model.
     """Returns per-token log probabilities from the model."""
 
   @abstractmethod
@@ -271,16 +316,25 @@ class BaseRollout(ABC):
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Abstract. Loads new parameters (optionally only variables of filter_types)
+    # into the rollout model. Returns None.
     """Updates the rollout model parameters."""
 
   @abstractmethod
   def pad_id(self) -> int:
+    # [FUNCTION DOC]
+    # Abstract. Returns the tokenizer pad id.
     """Returns the pad id."""
 
   @abstractmethod
   def eos_id(self) -> int:
+    # [FUNCTION DOC]
+    # Abstract. Returns the tokenizer EOS id.
     """Returns the eos id."""
 
   @abstractmethod
   def model(self) -> Any:
+    # [FUNCTION DOC]
+    # Abstract. Returns the underlying rollout model object.
     """Returns the rollout model."""

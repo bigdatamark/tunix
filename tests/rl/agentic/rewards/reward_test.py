@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.agentic.rewards.reward: the global reward function
+# registry (register, get_reward_fn, unregister) and built-in reward functions
+# exact_match, is_two_reward, dummy_reward, calculate_reward, plus the
+# weighted combine_rewards factory. Reward functions take (task dict, action
+# string) and return a RewardOutput with reward float and metadata dict.
+# Side effects: tests mutate the module-level registry, which is backed up and
+# restored around each test.
+# KNOWN ISSUE: there is no main entry point, so the file only runs under an
+# external test runner.
+
 from absl.testing import parameterized
 
 from tunix.rl.agentic.rewards import reward
@@ -19,21 +30,34 @@ from tunix.rl.agentic.rewards import reward_types
 
 
 class RewardTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for the reward registry and built-in reward functions, with
+  # registry isolation through setUp/tearDown.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: stores a shallow copy of reward._REGISTRY for later restoration.
     super().setUp()
     # Back up the registry to ensure test isolation
     self._original_registry = reward._REGISTRY.copy()
 
   def tearDown(self):
+    # [FUNCTION DOC]
+    # HELPER: rebinds reward._REGISTRY to the copy saved in setUp.
     super().tearDown()
     # Restore the original registry
     reward._REGISTRY = self._original_registry
 
   def test_registry(self):
+    # [FUNCTION DOC]
+    # Verifies register adds a function retrievable by name, re-registering
+    # the same name raises ValueError, unregister returns True then False on
+    # a second call, and get_reward_fn raises KeyError after removal.
     """Tests the reward function registry mechanism."""
     # A simple reward function for testing registration
     def test_fn(task, action):
+      # [FUNCTION DOC]
+      # HELPER: dummy reward fn returning RewardOutput(0.5, empty metadata).
       return reward_types.RewardOutput(0.5, {})
 
     reward.register("test_fn")(test_fn)
@@ -55,6 +79,10 @@ class RewardTest(parameterized.TestCase):
       ("whitespace", "  hello world  ", "hello world", 1.0),
   )
   def test_exact_match(self, ground_truth, action, expected_score):
+    # [FUNCTION DOC]
+    # Verifies exact_match scores 1.0 when the action equals
+    # task["ground_truth"] after stripping surrounding whitespace, else 0.0,
+    # and mirrors the score in metadata["exact_match"].
     """Tests the exact_match reward function."""
     task = {"ground_truth": ground_truth}
     result = reward.exact_match(task, action)
@@ -69,12 +97,18 @@ class RewardTest(parameterized.TestCase):
       ("not_a_number", "two", 0.0),
   )
   def test_is_two_reward(self, action, expected_score):
+    # [FUNCTION DOC]
+    # Verifies is_two_reward gives 1.0 when the stripped action parses as a
+    # number equal to 2 (integer or float form), 0.0 for other numbers or
+    # non-numeric text, mirrored in metadata["is_two"].
     """Tests the is_two_reward function."""
     result = reward.is_two_reward({}, action)
     self.assertEqual(result.reward, expected_score)
     self.assertEqual(result.metadata["is_two"], expected_score)
 
   def test_dummy_reward(self):
+    # [FUNCTION DOC]
+    # Verifies dummy_reward always returns reward 0.0 with empty metadata.
     """Tests the dummy_reward function."""
     result = reward.dummy_reward({}, "any action")
     self.assertEqual(result.reward, 0.0)
@@ -87,6 +121,11 @@ class RewardTest(parameterized.TestCase):
       ("eval_error", "10 / 0 = ?", "1", 0.0),
   )
   def test_calculate_reward(self, question, action, expected_score):
+    # [FUNCTION DOC]
+    # Verifies calculate_reward evaluates the arithmetic in task["question"]
+    # and gives 1.0 when a number found in the action matches it, 0.0 on a
+    # wrong number, an unparseable action, or an evaluation error such as
+    # division by zero; score mirrored in metadata["calculate_correct"].
     """Tests the calculate_reward function."""
     task = {"question": question}
     result = reward.calculate_reward(task, action)
@@ -94,6 +133,10 @@ class RewardTest(parameterized.TestCase):
     self.assertEqual(result.metadata["calculate_correct"], expected_score)
 
   def test_combine_rewards(self):
+    # [FUNCTION DOC]
+    # Verifies combine_rewards with weights exact_match 0.7 and dummy 0.3
+    # returns the weighted sum of registered reward fns (0.7 on match, 0.0 on
+    # mismatch) and merges their metadata dicts (dummy contributes nothing).
     """Tests the reward combination logic."""
     weights = {"exact_match": 0.7, "dummy": 0.3}
     combined_fn = reward.combine_rewards(weights)

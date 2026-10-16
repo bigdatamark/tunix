@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loads Gemma 3 weights from Hugging Face safetensors checkpoints (text-only
+# or multimodal, with an optional 'language_model.' key prefix) into the NNX
+# model.Gemma3 via the generic safetensors_loader. Provides the regex key
+# mapping (with transpose/reshape rules), a stateful q/k/v fusing
+# preprocess function and the create_model_from_safe_tensors entry point.
 """Loads Gemma3 parameters from safetensors files."""
 
 import re
@@ -23,6 +29,26 @@ from tunix.models.gemma3 import model as model_lib
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: returns {HF key regex: (NNX dotted target, transform)} where the
+  # transform is None or (axis permutation, reshape shape or None).
+  # Text weights: embed_tokens -> embedder.input_embedding; q/k/v_proj ->
+  # temporary 'tmp.layers.N.attn.q|k|v' transposed and reshaped to
+  # [D, heads, head_dim]; o_proj -> attn_vec_einsum.w transposed and reshaped
+  # to [N, H, D]; gate/up/down_proj -> mlp kernels transposed; input_layernorm
+  # -> pre_attention_norm; post_attention_layernorm -> post_attention_norm;
+  # pre/post feedforward layernorm (several spellings) -> pre/post_ffw_norm;
+  # q_norm/k_norm -> attn._query_norm/_key_norm; model.norm -> final_norm.
+  # lm_head, attention/norm biases, rotary buffers and fused qkv_proj weights
+  # are routed to 'unused.*' targets (ignored).
+  # When cfg.vision_config is set, adds SigLIP mappings: patch embedding
+  # weight permuted [out, in, kh, kw] -> [kh, kw, in, out]; position
+  # embedding; per-layer q/k/v/out projection kernels (transposed) and biases;
+  # layer_norm1/2 -> ln1/ln2; mlp fc1/fc2 (kernels transposed); post_layernorm
+  # -> encoder_norm; multi-modal projector weight and soft-embedding norm ->
+  # embedder.mm_input_projection.w / mm_soft_embedding_norm.scale.
+  # KNOWN ISSUE: the HF position embedding is [num_patches, width] while the
+  # NNX parameter is [1, num_patches, width], and no reshape rule is given.
   """Mapping of torch_keys to (nnx_keys, (permute_rule, reshape_rule))."""
   mapping = {
       r"(?:language_model\.)?model\.embed_tokens\.weight": (
@@ -213,6 +239,12 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
 
 
 def _make_preprocess_fn(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: builds the stateful preprocess closure that fuses the temporary
+  # q/k/v tensors into qkv_einsum.w ([3, N, D, H], when num_heads ==
+  # num_kv_heads) or q_einsum.w ([N, D, H]) plus kv_einsum.w ([2, K, D, H]).
+  # Raises ValueError if cfg.head_dim is odd. The pending dict persists across
+  # calls so a layer's q/k/v may arrive in different calls.
   """Creates a tensor preprocessing function for Gemma3 safetensors, fusing q, k, and v projections."""
   q_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.q$")
   k_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.k$")
@@ -227,6 +259,9 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     )
 
   def _to_ndh(q: jnp.ndarray) -> jnp.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: returns q in [N, D, H] layout, accepting [N, D, H], [D, N, H] or
+    # [N, H, D]; raises ValueError otherwise.
     # Expected shape: (N, D, H)
     if q.shape == (cfg.num_heads, cfg.embed_dim, cfg.head_dim):
       return q
@@ -237,6 +272,9 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     raise ValueError(f"[gemma3 preprocess] unexpected q shape: {q.shape}")
 
   def _to_kdh(x: jnp.ndarray) -> jnp.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: returns a k or v weight in [K, D, H] layout, accepting [K, D, H],
+    # [D, K, H] or [K, H, D]; raises ValueError otherwise.
     if x.shape == (cfg.num_kv_heads, cfg.embed_dim, cfg.head_dim):
       return x
     if x.shape == (cfg.embed_dim, cfg.num_kv_heads, cfg.head_dim):  # D,K,H
@@ -246,6 +284,13 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     raise ValueError(f"[gemma3 preprocess] unexpected kv shape: {x.shape}")
 
   def preprocess(tensors: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+    # [FUNCTION DOC]
+    # Copies the input dict, moves temporary q/k/v entries into pending, then
+    # for each pending layer writes the fused weights as soon as the needed
+    # slots are present (fused: all three, validated to [N, D, H] each, else
+    # ValueError; non-fused: q alone, and k with v together) and removes
+    # completed layers from pending. Returns the new dict. Side effect: mutates
+    # the closure pending dict.
     out = dict(tensors)
 
     for key in list(out):
@@ -312,6 +357,11 @@ def create_model_from_safe_tensors(
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ):
+  # [FUNCTION DOC]
+  # Public entry point: loads safetensors from file_dir into a model.Gemma3
+  # built from config, optionally sharded on mesh and cast to dtype, using the
+  # key mapping above and a fresh preprocess function; mode is forwarded to
+  # safetensors_loader.load_and_create_model. Returns the populated model.
   return safetensors_loader.load_and_create_model(
       file_dir=file_dir,
       model_class=model_lib.Gemma3,

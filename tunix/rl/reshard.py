@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utilities for moving pytrees of JAX arrays (model weights) between shardings
+# and meshes, e.g. from trainer devices to rollout devices. Tries the
+# Pathways experimental reshard API first (requires pathwaysutils and the
+# "proxy" JAX platform) and falls back to jax.device_put. Completion is
+# logged asynchronously from a background thread. Also reshards a whole nnx
+# model onto a given mesh using its partition specs.
 """Resharding functions."""
 
 from concurrent import futures
@@ -35,10 +42,20 @@ def callback_on_ready(
     success: Callable[[], None],
     failure: Callable[[Exception], None],
 ):
+  # [FUNCTION DOC]
+  # HELPER: Inputs: pytree x, zero-arg success callback, one-arg failure
+  # callback. Creates a Future, attaches a done-callback that calls success if
+  # the future has no exception else failure with the exception, and starts a
+  # new (non-daemon) thread that blocks until x is ready and then resolves the
+  # future with x or with the raised exception. Returns None immediately; the
+  # callbacks run on the background thread.
   """Callback to invoke when the Jax array is ready."""
   fut = futures.Future()
 
   def callback(f):
+    # [FUNCTION DOC]
+    # HELPER: Done-callback: reads the future's exception and dispatches to
+    # success or failure.
     e = f.exception()
     if e is None:
       success()
@@ -48,6 +65,9 @@ def callback_on_ready(
   fut.add_done_callback(callback)
 
   def wait():
+    # [FUNCTION DOC]
+    # HELPER: Thread body: waits for x to be ready; sets the future's exception
+    # on any error, else sets its result to x.
     try:
       jax.block_until_ready(x)
     except Exception as e:  # pylint: disable=broad-exception-caught
@@ -67,6 +87,14 @@ def _get_reshard_fn_pathwaysutils(
     donate: bool,
     use_experimental_pre_reshard: bool,
 ):
+  # [FUNCTION DOC]
+  # HELPER: Keyword-only inputs: cache_resharding_plans, donate,
+  # use_experimental_pre_reshard. Imports the pathwaysutils experimental reshard
+  # module; on ImportError logs and re-raises. Raises EnvironmentError if the
+  # JAX_PLATFORMS environment variable does not contain "proxy". Otherwise
+  # returns a closure reshard_fn(x, sharding).
+  # KNOWN ISSUE: the docstring says use_experimental_pre_reshard is ignored, but
+  # the returned function does use it to choose the API.
   """Returns a reshard function using pathwaysutils.
 
   Args:
@@ -97,6 +125,12 @@ def _get_reshard_fn_pathwaysutils(
         x: Any,
         sharding: jax.sharding.Sharding | Any,
     ):
+      # [FUNCTION DOC]
+      # HELPER: Reshards pytree x to the target sharding pytree. If
+      # use_experimental_pre_reshard, collects each leaf's current sharding and
+      # calls the side-channel reshard with an intermediate sharding (passing
+      # donate and plan caching); otherwise calls the experimental reshard with
+      # donate, no aliasing hint and plan caching. Returns the resharded pytree.
 
       # TODO(b/476149699): Migrate to new API once it's verified.
       if use_experimental_pre_reshard:
@@ -131,6 +165,10 @@ def _get_reshard_fn_jax_device_put(
     cache_resharding_plans: bool = False,  # pylint: disable=unused-argument
     use_experimental_pre_reshard: bool = False,  # pylint: disable=unused-argument
 ):
+  # [FUNCTION DOC]
+  # HELPER: Returns jax.device_put partially applied with donate; the plan
+  # caching and pre-reshard options are accepted for interface compatibility
+  # and ignored. Never raises.
   return functools.partial(
       jax.device_put,
       donate=donate,
@@ -143,6 +181,13 @@ def _get_reshard_fn(
     use_experimental_pre_reshard: bool,
     get_reshard_fns: list[Callable[..., Any]],
 ):
+  # [FUNCTION DOC]
+  # HELPER: Tries each factory in get_reshard_fns in order with the given
+  # options; factories raising ImportError or EnvironmentError are skipped
+  # (debug-logged). Returns the first reshard function obtained. Raises
+  # ValueError if none succeeded.
+  # KNOWN ISSUE: the debug and error messages contain literal "{...=}" text
+  # because they are not f-strings.
   """Returns a reshard function.
 
   Args:
@@ -176,6 +221,17 @@ def reshard_pytree(
     donate_input: bool = False,
     use_experimental_pre_reshard: bool = True,
 ) -> jaxtyping.PyTree:
+  # [FUNCTION DOC]
+  # Inputs: source pytree of arrays, target pytree of arrays or shardings,
+  # cache_plan (default True), donate_input (default False),
+  # use_experimental_pre_reshard (default True). Converts every target leaf to a
+  # destination sharding: NamedSharding or SingleDeviceSharding leaves are used
+  # as is, arrays become a NamedSharding with their mesh, spec and memory kind.
+  # Selects a reshard function (Pathways first, then device_put), records the
+  # start time, reshards source, registers an asynchronous readiness callback
+  # that logs the elapsed time on success or an error on failure, and returns
+  # the resharded pytree (possibly not yet ready). Raises ValueError if no
+  # reshard backend is available; may invalidate source when donating.
   """Reshard input pytree from source sharding and mesh to target sharding and mesh.
 
   From source to target, both the sharding and mesh can be different.
@@ -196,6 +252,10 @@ def reshard_pytree(
   """
 
   def _get_dst_sharding(x):
+    # [FUNCTION DOC]
+    # HELPER: Maps one target leaf to a sharding as described above; raises
+    # AttributeError if the leaf is neither a supported sharding nor has a
+    # NamedSharding-like sharding attribute.
     if isinstance(
         x, jax.sharding.NamedSharding | jax.sharding.SingleDeviceSharding
     ):
@@ -238,6 +298,15 @@ def reshard_pytree(
 
 
 def reshard_model_to_mesh(model: nnx.Module, mesh: jax.sharding.Mesh):
+  # [FUNCTION DOC]
+  # Inputs: nnx model, mesh (may be None). Determines the mesh of the model's
+  # state via utils.get_pytree_mesh_info. If mesh is given and differs, then
+  # within the mesh context splits the model, builds NamedShardings on that
+  # mesh from each variable's partition spec using the first device's default
+  # memory kind, reshards the state with reshard_pytree and merges a new model.
+  # Returns the new model, or the original model unchanged otherwise.
+  # KNOWN ISSUE: docstring mentions only LoRA models but the logic applies to
+  # any model.
   """Reshard the lora model if the mesh is specified and the lora model mesh is not the same as the input mesh."""
   model_mesh = utils.get_pytree_mesh_info(nnx.state(model))
   if mesh is not None and model_mesh != mesh:

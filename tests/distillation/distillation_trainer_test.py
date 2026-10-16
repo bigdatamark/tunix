@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.distillation_trainer.DistillationTrainer,
+# a PeftTrainer-style trainer that trains a student model against a frozen
+# teacher using a distillation strategy (LogitStrategy or
+# AttentionTransferStrategy): custom loss functions are rejected, student
+# params are updated, and sharded training matches unsharded training.
+# Module state: _VOCAB_SIZE (256). Sets XLA_FLAGS to force 4 host CPU devices.
+# KNOWN ISSUE: XLA_FLAGS is set after importing jax; effective only if the
+# backend is not yet initialized. Docstring typo 'Disttillation'.
 """Disttillation trainer unittest."""
 
 import os
@@ -32,8 +41,14 @@ _VOCAB_SIZE = 256
 
 
 def create_sharded_model(model_ctor, rngs, mesh):
+  # [FUNCTION DOC]
+  # HELPER: builds a model (ToyTransformer config with _VOCAB_SIZE) inside a
+  # jitted function with sharding constraints from its partition specs, under
+  # the given mesh. Outputs: (model, NamedSharding tree of the state).
   @nnx.jit(static_argnums=(0,))
   def _create_sharded_model(model_ctor, rngs):
+    # [FUNCTION DOC]
+    # HELPER: jitted inner builder returning (constrained model, state).
     model = model_ctor(config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=rngs)
     state = nnx.state(model)
     pspecs = nnx.get_partition_spec(state)
@@ -48,6 +63,9 @@ def create_sharded_model(model_ctor, rngs, mesh):
 
 
 def dummy_gen_model_input_fn(x: distillation_trainer.TrainingInput):
+  # [FUNCTION DOC]
+  # HELPER: maps a TrainingInput to model kwargs: input_tokens, input_mask,
+  # positions 0..seq_len-1 and an all-ones attention_mask.
   return {
       'input_tokens': x.input_tokens,
       'input_mask': x.input_mask,
@@ -61,6 +79,10 @@ def get_labels_fn(
     input_mask: jax.Array,
     **kwargs,
 ):
+  # [FUNCTION DOC]
+  # HELPER: labels function. Takes tokens shifted left by one as targets,
+  # one-hot encodes them over _VOCAB_SIZE and zeroes rows where the shifted
+  # input_mask is 0; extra kwargs are ignored. Output: (B, L-1, V) array.
   del kwargs
   target_tokens = input_tokens[:, 1:]
   target_mask = input_mask[:, 1:]
@@ -77,6 +99,10 @@ def get_model_outputs_fn(
     positions: jax.Array,
     attention_mask: jax.Array,
 ):
+  # [FUNCTION DOC]
+  # HELPER: forward function. Calls model(input_tokens, positions, None,
+  # attention_mask), drops the cache output and returns logits without the last
+  # position (B, L-1, V); input_mask is ignored.
   del input_mask
   logits, _ = model(
       input_tokens,
@@ -89,6 +115,9 @@ def get_model_outputs_fn(
 
 
 def get_toy_logit_strategy():
+  # [FUNCTION DOC]
+  # HELPER: returns a LogitStrategy using the toy forward and labels functions
+  # with default temperature/alpha.
   return strategies.LogitStrategy(
       student_forward_fn=get_model_outputs_fn,
       teacher_forward_fn=get_model_outputs_fn,
@@ -97,6 +126,9 @@ def get_toy_logit_strategy():
 
 
 def get_toy_attention_transfer_strategy():
+  # [FUNCTION DOC]
+  # HELPER: returns an AttentionTransferStrategy capturing
+  # nnx.MultiHeadAttention outputs, using the toy forward/labels functions.
   return strategies.AttentionTransferStrategy(
       student_forward_fn=get_model_outputs_fn,
       teacher_forward_fn=get_model_outputs_fn,
@@ -106,6 +138,9 @@ def get_toy_attention_transfer_strategy():
 
 
 def dummy_datasets(batch_size: int, repeat: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: list of TrainingInput batches from integers 0..127 reshaped to
+  # (num_batches, batch_size, 16) with all-ones masks, repeated repeat times.
   # (num_batch, batch_size, seq_len)
   dummy_input = np.arange(128).reshape((-1, batch_size, 16))
   return [
@@ -117,12 +152,19 @@ def dummy_datasets(batch_size: int, repeat: int = 1):
 
 
 class DistillationTrainerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for DistillationTrainer.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture; train and eval datasets are the same 2-batch list.
     super().setUp()
     self.eval_ds = self.train_ds = dummy_datasets(batch_size=4)
 
   def test_with_loss_fn_raises_exception(self):
+    # [FUNCTION DOC]
+    # Verifies with_loss_fn raises NotImplementedError (the strategy defines the
+    # loss).
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
     student_model = tc.ToyTransformer(
@@ -142,6 +184,8 @@ class DistillationTrainerTest(absltest.TestCase):
       ).with_loss_fn(lambda a, b: 0.0)
 
   def test_basic_training(self):
+    # [FUNCTION DOC]
+    # Verifies logit distillation training updates every student param.
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
     student_model = tc.ToyTransformer(
@@ -167,6 +211,9 @@ class DistillationTrainerTest(absltest.TestCase):
     jax.tree.map_with_path(tc.assert_not_equal, original_variables, variables)
 
   def test_complex_strategy_training(self):
+    # [FUNCTION DOC]
+    # Verifies attention-transfer distillation with a deeper (6-layer) teacher
+    # updates every student param.
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
     student_model = tc.ToyTransformer(
@@ -193,6 +240,12 @@ class DistillationTrainerTest(absltest.TestCase):
     jax.tree.map_with_path(tc.assert_not_equal, original_variables, variables)
 
   def test_distributed_training(self):
+    # [FUNCTION DOC]
+    # Verifies sharded attention-transfer training on a (2, n/2) mesh keeps the
+    # ('fsdp','tp') and ('tp','fsdp') specs for layer 0 kernels, updates params,
+    # and matches an unsharded run from identical inits (assert_close).
+    # KNOWN ISSUE: the same strategy instance (already preprocessed with the
+    # sharded models) is reused for the unsharded run.
     total_devices = jax.device_count()
     mesh = shd.Mesh(
         devices=np.array(jax.devices()).reshape(2, total_devices // 2),

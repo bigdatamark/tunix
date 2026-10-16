@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# R2E-Gym based software-engineering environment for tunix agentic RL. If r2egym is importable,
+# its Action, EnvArgs and RepoEnv are used, else they are None placeholders (the env then fails at
+# use time). Defines tool command file lists inside the r2egym package: R2EGYM_COMMAND_FILES
+# (file_editor, search, execute_bash, finish) and SWEAGENT_COMMAND_FILES (str_replace_editor,
+# execute_bash, submit), the helper _unpack_entry, and SWEEnv, which wraps an r2egym RepoEnv (a
+# Docker/Kubernetes sandbox for one repository task) behind the BaseTaskEnv interface.
 import json
 import os
 from typing import Any, Optional, cast
@@ -36,6 +43,10 @@ SWEAGENT_COMMAND_FILES = [
 
 
 def _unpack_entry(entry: dict) -> dict:
+  # [FUNCTION DOC]
+  # HELPER: returns a new dict where numpy array values are replaced by .item() (so must be
+  # size-1), list values must have length 1 and are replaced by their single element (ValueError
+  # otherwise), and other values are copied as is. Used to undo batch collation of a single entry.
   """Utility to clean up and unpack the dataset entry."""
   unpacked_entry = {}
   for k, v in entry.items():
@@ -53,6 +64,11 @@ def _unpack_entry(entry: dict) -> dict:
 
 
 class SWEEnv(BaseTaskEnv):
+  # [CLASS DOC]
+  # BaseTaskEnv for one R2E-Gym task. Attributes: entry (unpacked task dict), step/reward timeouts,
+  # total_steps, delete_image, backend, env (RepoEnv or None until first reset), verbose, scaffold
+  # ("r2egym" or "sweagent", selects tool set), final_reward_fn (env.compute_reward, set on reset),
+  # extra_kwargs with group_id and pair_index.
   """Software Engineering Environment for code-related tasks."""
 
   def __init__(
@@ -68,6 +84,14 @@ class SWEEnv(BaseTaskEnv):
       scaffold: str = "r2egym",
       max_steps: int = 1,
   ):
+    # [FUNCTION DOC]
+    # Stores configuration (entry unpacked via _unpack_entry; step_timeout 90 s, reward_timeout 300 s,
+    # backend "kubernetes", delete_image False, verbose False, scaffold "r2egym", max_steps 1), asserts
+    # scaffold is r2egym or sweagent (AssertionError), calls BaseTaskEnv.__init__(max_steps), and records
+    # group_id / pair_index in extra_kwargs. Does not start any container. Raises ValueError from
+    # _unpack_entry for multi-element lists.
+    # KNOWN ISSUE: docstring says entry may be None and pair_index random, but neither is supported; verbose,
+    # scaffold and max_steps are undocumented.
     """Initialize the SWE environment.
 
     Args:
@@ -101,6 +125,12 @@ class SWEEnv(BaseTaskEnv):
     self.extra_kwargs["pair_index"] = pair_index
 
   def _initial_observation(self) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: on first call creates RepoEnv(EnvArgs(ds=entry)) with backend, timeouts and verbosity;
+    # on later calls resets the existing RepoEnv. Sets final_reward_fn to env.compute_reward, registers the
+    # scaffold's command files, resets total_steps to 0, and returns env.get_task_instruction() (the task
+    # prompt polled from the runtime). Side effects: starts/resets a container. Raises TypeError if
+    # r2egym is not installed (EnvArgs is None).
     if not self.env:
       # Initialize environment if not created yet.
       env_args = EnvArgs(ds=self.entry)
@@ -124,6 +154,12 @@ class SWEEnv(BaseTaskEnv):
     return self.env.get_task_instruction()
 
   def _step_impl(self, action: Any) -> EnvStepResult:
+    # [FUNCTION DOC]
+    # Converts a string action via Action.from_string (otherwise uses the object as is). If it has no
+    # function_name, returns empty observation, reward 0, done False, empty info without touching the env.
+    # Raises ValueError if env is not initialized. Otherwise calls env.step, increments total_steps and
+    # returns EnvStepResult(str(obs), reward, done, info); RepoEnv reward is always 0, the real reward
+    # comes from final_reward_fn.
     if isinstance(action, str):
       action_obj = Action.from_string(action)
     else:
@@ -144,6 +180,11 @@ class SWEEnv(BaseTaskEnv):
     )
 
   def close(self) -> None:
+    # [FUNCTION DOC]
+    # Closes the RepoEnv if present; then, if delete_image and env exist, runs "docker rmi <image>" via
+    # os.system. No output. Side effects: container teardown, shell command execution.
+    # KNOWN ISSUE: reads env.runtime.docker_image after env.close(); env is not reset to None, and the
+    # image name is interpolated into a shell command unquoted.
     """Close the environment and clean up resources."""
     if self.env is not None:
       self.env.close()
@@ -154,6 +195,10 @@ class SWEEnv(BaseTaskEnv):
 
   @staticmethod
   def from_dict(extra_info: dict | str) -> "SWEEnv":
+    # [FUNCTION DOC]
+    # Static factory: JSON-decodes extra_info if it is a string, copies any keys that match SWEEnv.__init__
+    # parameter names into kwargs, sets entry to the whole extra_info dict, and constructs SWEEnv.
+    # Output: SWEEnv. Raises json errors for invalid JSON and errors from __init__.
     """Create an environment instance from JSON configuration.
 
     Args:

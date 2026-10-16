@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Pure-functional beam search helpers used by the native JAX sampler's decode
+# loop. All functions operate on JAX arrays and are jit-friendly (no Python
+# side effects). Layout convention: the "flattened" batch dimension B equals
+# original_batch_size times beam_size, where beams of the same example are
+# contiguous (row index = batch_index * beam_size + beam_index).
+# Flow: init_batched_beam_state expands the prefill outputs by beam_size; each
+# decode step calls beam_search_step which re-ranks and reorders beams; at the
+# end finalize_beam_search_state picks beam 0 (the best, since beams are kept
+# sorted by score) of each example.
 
 """Beam search for LLM generation related utils."""
 
@@ -25,6 +35,13 @@ import jaxtyping
 
 @flax.struct.dataclass
 class _BeamSearchSamplingState:
+  # [CLASS DOC]
+  # HELPER: immutable flax struct dataclass (a JAX pytree) carrying beam search
+  # state inside the main sampling state.
+  # Fields: scores, a float32 array of shape [batch_size, beam_size] holding the
+  # accumulated log-probability of each beam (pytree leaf); initialized, a static
+  # (non-pytree) boolean telling whether at least one beam step has run. Since
+  # initialized is static, changing it alters the pytree structure/treedef.
   """The state used by beam search.
 
   This is intented to be included by the main sampling state.
@@ -45,6 +62,21 @@ def init_batched_beam_state(
     logits_buffer: jax.Array | None,
     beam_size: int,
 ) -> tuple[_BeamSearchSamplingState, dict[str, Any]]:
+  # [FUNCTION DOC]
+  # Builds the initial beam state and beam-expanded copies of sampler buffers.
+  # Inputs: logits [B, V] for the current (last prefill) step; input_token_buffer
+  # [B, L]; initial_cache, a nested dict pytree of KV cache arrays with batch on
+  # axis 0; done [B, ...] boolean; positions [B, L]; optional logits_buffer
+  # [B, L, V]; beam_size integer.
+  # Behavior: batch_size is taken from input_token_buffer axis 0. Every array
+  # (logits, token buffer, every cache leaf, done, positions, logits_buffer when
+  # not None) is repeated beam_size times along axis 0 with element repetition
+  # (each row duplicated consecutively, so beams of an example are adjacent).
+  # Output: a tuple of (a _BeamSearchSamplingState with zero float32 scores of
+  # shape [batch_size, beam_size] and initialized False, and a dict with keys
+  # logits, token_buffer, cache, done, positions, logits_buffer where
+  # logits_buffer is None if the input was None).
+  # No exceptions raised explicitly; no side effects.
   """Intializes the beam search sampling state.
 
   In order to support beam search, we need to expand the input other states to
@@ -97,6 +129,44 @@ def beam_search_step(
     decoding_step: int,
     logprobs_buffer: jax.Array | None = None,
 ) -> tuple[_BeamSearchSamplingState, dict[str, Any]]:
+  # [FUNCTION DOC]
+  # Performs one beam search decoding step over flattened beams.
+  # Inputs: logits [batch_size*beam_size, V]; done flags for each flattened beam;
+  # token_buffer [batch*beam, L]; cache pytree with flattened batch on axis 0;
+  # optional logits_buffer; the previous beam state; pad_token_id; decoding_step
+  # (index of the last written token; the new token is written at index
+  # decoding_step + 1); optional logprobs_buffer [batch*beam, L].
+  # Algorithm:
+  # 1. Reshape logits to [batch, beam, V] and compute log_softmax over V.
+  # 2. If state is not initialized, all beams are identical copies, so candidates
+  #    are only beam 0's log-probs, shape [batch, V]. Otherwise candidate scores
+  #    are previous beam scores plus log-probs, with candidates from already
+  #    finished beams set to negative infinity, flattened to [batch, beam*V].
+  # 3. Append, per example, the scores of finished beams (negative infinity for
+  #    unfinished) so finished beams can survive unchanged; take top beam_size of
+  #    the concatenation (jax top_k; result is sorted descending).
+  # 4. For each pick, if its flat index is below the candidate width it is an
+  #    extension: source beam = index divided by V, token = index modulo V.
+  #    Otherwise it is a kept finished beam: source beam = index minus candidate
+  #    width, token = pad_token_id.
+  # 5. Reorder token_buffer, logits_buffer, logprobs_buffer, done and every cache
+  #    leaf by gathering rows at batch_index*beam_size + source_beam (nested
+  #    helper). Write the chosen token at column decoding_step+1 of the token
+  #    buffer; write the chosen token's log-prob (looked up in log_probs by source
+  #    beam and token) at the same column of the logprobs buffer if present.
+  # Output: tuple of (new state with the top-k scores and initialized True, dict
+  # with token_buffer, cache, done, logits_buffer, logprobs_buffer). done is only
+  # reordered, not updated with end-of-sequence detection (caller must do that).
+  # No side effects.
+  # KNOWN ISSUE: in the uninitialized branch, done flags are ignored and
+  # candidate width is V (not beam*V), so a kept finished beam index offset is
+  # computed relative to V; any finished beam at init would map to a beam index
+  # relative to that width, which is consistent but means finished-at-prefill
+  # beams still receive extension candidates.
+  # KNOWN ISSUE: the log-prob lookup for kept finished beams uses pad_token_id as
+  # the token index, recording the pad token's log-prob instead of zero.
+  # KNOWN ISSUE: the logits_buffer is reordered but no logits for the new step
+  # are written into it here.
   """Beam search step.
 
   In beam search, at each step, we generate possible next tokens for each of
@@ -202,6 +272,12 @@ def beam_search_step(
 
   # Gather function for arrays with shape (batch_size, beam_size_prev, ...)
   def gather_beams_by_indices(arr, indices):
+    # [FUNCTION DOC]
+    # HELPER: gathers rows of a flattened [batch*beam, ...] array. Input indices
+    # has shape [batch, beam, 2] with (batch index, source beam index) pairs.
+    # Computes flat row index batch_index * beam_size + beam_index (beam_size from
+    # the enclosing scope), flattens it in row-major order and returns the array
+    # indexed by those rows, shape [batch*beam, ...].
     # expected arr shape (batch_size * beam_size, ...)
     # indices shape (batch_size, beam_size, 2)
     # output shape (batch_size *beam_size, ...) with selected beam index
@@ -267,6 +343,18 @@ def finalize_beam_search_state(
     logits_buffer: jax.Array | None,
     logprobs_buffer: jax.Array | None = None,
 ) -> dict[str, Any]:
+  # [FUNCTION DOC]
+  # Selects the final output after beam search finishes.
+  # Inputs: the beam state (only its scores shape [batch, beam] is used);
+  # token_buffer [batch*beam, L]; optional logits_buffer; optional
+  # logprobs_buffer [batch*beam, L].
+  # Behavior: reshapes each buffer to [batch, beam, -1] and keeps beam 0 of each
+  # example (beams are sorted best-first by beam_search_step).
+  # Output: dict with token_buffer [batch, L], logits_buffer (or None),
+  # logprobs_buffer (or None). No side effects.
+  # KNOWN ISSUE: logits_buffer of shape [batch*beam, L, V] is reshaped to
+  # [batch, beam, L*V], so the returned logits are flattened to [batch, L*V]
+  # rather than [batch, L, V].
   """Finalize the beam search sampling state.
 
   This function is called when decoding is done. Beams are sorted. So the

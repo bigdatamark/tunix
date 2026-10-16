@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Foundational tool types: ToolCall (name plus arguments of a requested tool
+# invocation), ToolOutput (result container with output, error and metadata and a
+# display-oriented repr), and BaseTool (abstract, immutable-after-construction
+# tool interface with schema generation and sync/async execution hooks).
+# Immutability relies on tunix.utils.immutable.ImmutableMeta, which sets a private
+# "_locked" flag on instances once construction completes. Module aliases
+# abstractmethod and dataclass are defined. No import-time side effects.
 """Base classes and utilities for defining and using tools in agentic systems.
 
 This module provides the foundational structures:
@@ -34,6 +42,10 @@ dataclass = dataclasses.dataclass
 
 @dataclass
 class ToolCall:
+  # [CLASS DOC]
+  # Dataclass with required fields name (str, tool name) and arguments (intended to
+  # be a dict of parameter names to values; not validated, parsers may pass any
+  # type, e.g. a JSON string).
   """Represents a single tool invocation request.
 
   Contains the function name and arguments needed to execute a specific
@@ -52,6 +64,10 @@ class ToolCall:
 
 @dataclass
 class ToolOutput:
+  # [CLASS DOC]
+  # Dataclass for tool results. Fields: name (str, required), output (string, list,
+  # dict or None; default None), error (string or None; None means success),
+  # metadata (dict or None). Overrides repr for display.
   """Standardized container for tool execution results.
 
   Provides a unified interface for tool outputs that can handle successful
@@ -74,6 +90,11 @@ class ToolOutput:
   metadata: Optional[dict[str, Any]] = None
 
   def __repr__(self) -> str:
+    # [FUNCTION DOC]
+    # Render the output for display/logging. Returns "Error: <error>" if error is
+    # truthy; else the empty string if output is None; else JSON encoding of output
+    # when it is a dict or list; else str(output).
+    # Exceptions: TypeError if a dict/list output is not JSON-serializable.
     """Generate human-readable string representation of the tool output.
 
     Prioritizes error messages, then formats structured data as JSON,
@@ -92,6 +113,12 @@ class ToolOutput:
 
 
 class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
+  # [CLASS DOC]
+  # Abstract tool base (abc.ABC with ImmutableMeta metaclass). Instances get name
+  # and description in the constructor; after the full constructor chain finishes
+  # the metaclass sets _locked, after which any attribute assignment raises
+  # AttributeError. Subclasses must implement get_json_schema and either apply or
+  # apply_async. An optional inputSchema attribute is used by to_mcp_json.
   """Abstract stateless base class defining the interface for all agent tools.
 
   Tools are reusable components that extend agent capabilities by providing
@@ -107,6 +134,9 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
   """
 
   def __init__(self, name: str, description: str):
+    # [FUNCTION DOC]
+    # Store name and description as attributes (allowed because the instance is not
+    # yet locked). Inputs: name, description strings. Side effects: sets attributes.
     """Initialize the base tool with identification and documentation.
 
     Args:
@@ -119,6 +149,10 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
     self.description = description
 
   def __setattr__(self, name: str, value: Any):
+    # [FUNCTION DOC]
+    # Attribute assignment guard. If the instance's "_locked" attribute is truthy,
+    # raises AttributeError naming the class and the attribute; otherwise performs a
+    # normal assignment.
     """Prevents post-init modification. See `ImmutableMeta` for details."""
     if getattr(self, "_locked", False):
       raise AttributeError(
@@ -129,6 +163,10 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
 
   @abstractmethod
   def get_json_schema(self) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Abstract. Return the OpenAI function-calling schema: a dict with "type"
+    # "function" and "function" holding name, description and a JSON-schema
+    # "parameters" object. Base returns None.
     """Generate OpenAI-compatible function metadata for tool registration.
 
     Provides the schema definition needed for LLM function calling systems
@@ -152,6 +190,10 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
     pass
 
   def to_mcp_json(self) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Return an MCP-style registration dict: "type" "function" and "function" with
+    # the tool's name, description and "parameters" set to the instance's inputSchema
+    # attribute, or an empty dict if absent. No side effects.
     """Generate MCP (Model Context Protocol) compliant tool registration.
 
     Converts the tool definition to the standardized MCP format for
@@ -179,6 +221,10 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
     }
 
   def apply(self, **kwargs) -> ToolOutput:
+    # [FUNCTION DOC]
+    # Synchronous execution hook taking tool-specific keyword arguments and returning
+    # a ToolOutput. Base raises NotImplementedError; subclasses override this or
+    # apply_async.
     """Execute the tool synchronously with the provided arguments.
 
     Default implementation raises NotImplementedError. Subclasses should
@@ -199,6 +245,12 @@ class BaseTool(abc.ABC, metaclass=immutable.ImmutableMeta):
     )
 
   async def apply_async(self, **kwargs) -> ToolOutput:
+    # [FUNCTION DOC]
+    # Asynchronous execution hook (coroutine) taking keyword arguments and returning a
+    # ToolOutput. Base raises NotImplementedError.
+    # KNOWN ISSUE: the docstring says the default delegates to the synchronous apply,
+    # but it actually raises NotImplementedError, so a tool implementing only apply
+    # fails when invoked through apply_async.
     """Execute the tool asynchronously with the provided arguments.
 
     Default implementation delegates to the synchronous apply() method.

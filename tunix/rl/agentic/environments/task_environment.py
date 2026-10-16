@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines TaskEnvironment, a single-turn BaseTaskEnv: reset returns the task (one
+# dataset example) and the first action always ends the episode with a reward
+# computed by the optional reward_fn. Imports reward (unused) and absl logging.
 """RL Environment for single-turn task-based agent interactions."""
 
 from typing import Any, Dict
@@ -23,6 +27,9 @@ from tunix.rl.agentic.rewards import reward
 
 
 class TaskEnvironment(base_environment.BaseTaskEnv):
+  # [CLASS DOC]
+  # Single-step environment with max_steps fixed at 1. Attributes inherited from
+  # BaseTaskEnv; task holds the example dict.
   """Reinforcement learning environment for single-turn agent interactions.
 
   This environment is designed for tasks where the agent receives an
@@ -41,6 +48,13 @@ class TaskEnvironment(base_environment.BaseTaskEnv):
       reward_fn=None,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Initialize. Inputs: single_example (dict used as the task); keyword-only
+    # reward_fn (callable with task= and action= keywords, or None); extra kwargs
+    # (e.g. group_id) forwarded to BaseTaskEnv and stored in extra_kwargs.
+    # Behavior: logs a warning once per process when reward_fn is None; calls the
+    # base constructor with max_steps=1.
+    # Exceptions: TypeError if kwargs contains max_steps (duplicate keyword).
     """Initialize the task environment.
 
     Args:
@@ -61,10 +75,19 @@ class TaskEnvironment(base_environment.BaseTaskEnv):
     )
 
   def _initial_observation(self) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Return the task dict itself as the initial observation.
     """Reset the environment and return the task as the initial observation."""
     return self.task
 
   def _step_impl(self, action: Any) -> base_environment.EnvStepResult:
+    # [FUNCTION DOC]
+    # HELPER: Unwrap an Action to its payload, compute reward_fn(task=task,
+    # action=payload) if a reward_fn is set (else 0.0), and return
+    # EnvStepResult(observation {}, reward value, done True, info {"response":
+    # payload}). The reward is whatever reward_fn returns (may be a RewardOutput).
+    # KNOWN ISSUE: the docstring says info includes reward metadata, but only the
+    # response is included.
     """Process the agent's action, calculate reward, and terminate.
 
     In a single-turn environment, any action terminates the episode. We assume
@@ -92,6 +115,11 @@ class TaskEnvironment(base_environment.BaseTaskEnv):
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "TaskEnvironment":
+    # [FUNCTION DOC]
+    # Classmethod factory. Pops "reward_fn" and "group_id" (both default None) from
+    # env_args; the remaining dict becomes the task. Returns cls(single_example=...,
+    # reward_fn=..., group_id=...), so group_id ends up in extra_kwargs.
+    # Side effects: mutates the caller's env_args dict.
     """Create TaskEnvironment instance from configuration dictionary.
 
     This preserves the original behavior:

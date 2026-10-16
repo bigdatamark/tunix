@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: small utility module for resizing feature arrays by average
+#   pooling so teacher features can be compared with smaller student ones.
+# Defines PaddingMode enum and avg_pool_array_to_target_shape.
+# No side effects at import.
 """Utilities for mutating feature shapes via pooling for distillation."""
 
 import enum
@@ -21,6 +26,9 @@ import jax.numpy as jnp
 
 
 class PaddingMode(enum.Enum):
+  # [CLASS DOC]
+  # Enum of pooling padding modes whose values are the strings passed to
+  # nnx.avg_pool: VALID ("VALID") and SAME ("SAME").
   """Feature shape padding modes."""
 
   VALID = "VALID"
@@ -33,6 +41,25 @@ def avg_pool_array_to_target_shape(
     padding_mode: PaddingMode = PaddingMode.VALID,
     count_include_pad_for_same_padding: bool = False,
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # Average-pools an N-d array to an exact target shape, treating every
+  # dimension as spatial.
+  # Inputs: input_array; target_shape (tuple, same rank); padding_mode
+  #   (default VALID); count_include_pad_for_same_padding (bool, default
+  #   False, passed as count_include_pad).
+  # Steps: return input unchanged if shapes already equal; ValueError if
+  #   ranks differ; ValueError if any target dim is < 1 or > input dim;
+  #   reshape to (1, *shape, 1) (batch=1, channel=1); per dimension with
+  #   input D and output O: if O == D window=stride=1; else if VALID,
+  #   stride = D // O and window = D - (O - 1) * stride (yields exactly O
+  #   windows covering the whole dim); else (SAME) stride = window =
+  #   ceil(D / O). Call nnx.avg_pool with these windows/strides, padding
+  #   string and count_include_pad; any exception is re-raised as
+  #   RuntimeError (chained) naming the parameters. Squeeze the leading
+  #   and trailing singleton axes; ValueError if result shape != target.
+  # Output: pooled array with target_shape. Side effects: none.
+  # Note: SAME mode may yield fewer than O outputs for some (D, O) pairs,
+  #   which then fails the final shape check with ValueError.
   """Reduces a JAX numpy array to a target shape using average pooling.
 
   This function reshapes the input to treat all its dimensions as spatial

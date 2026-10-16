@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Placeholder tool parser for Gemini models. Gemini emits native structured
+# functionCall objects rather than text-encoded tool calls, so this parser does
+# no text parsing. Re-exports BaseTool, ToolCall and ToolParser aliases.
 """Tool parser for Gemini models."""
 
 from typing import Any, List
@@ -25,8 +29,18 @@ ToolParser = tool_parser_base.ToolParser
 
 
 class GeminiToolParser(ToolParser):
+  # [CLASS DOC]
+  # ToolParser implementation for Gemini. Stateless stub: parse always returns an
+  # empty list and get_tool_prompt returns a fixed short instruction string.
 
   def parse(self, model_response: Any) -> list[ToolCall]:
+    # [FUNCTION DOC]
+    # Stub parse for Gemini output.
+    # Inputs: model_response of any type (ignored).
+    # Outputs: always an empty list; no tool calls are ever extracted.
+    # Side effects/exceptions: none.
+    # KNOWN ISSUE: never extracts any tool calls, so Gemini tool use through this
+    # parser is effectively unsupported.
     return []
 
   def get_tool_prompt(
@@ -35,4 +49,9 @@ class GeminiToolParser(ToolParser):
       *,
       schema_style: str = "gemini",
   ) -> str:
+    # [FUNCTION DOC]
+    # Return a fixed tool instruction prompt for Gemini.
+    # Inputs: tools (ignored); keyword-only schema_style (default "gemini", ignored).
+    # Outputs: the constant string "Return a functionCall with name and args."
+    # Side effects/exceptions: none. Tool schemas are not included in the text.
     return "Return a functionCall with name and args."

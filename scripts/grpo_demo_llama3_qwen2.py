@@ -11,6 +11,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# End-to-end GRPO training demo script (top-level code, runs on import) for Llama3 / Qwen2.5 / Qwen3
+# models on GSM8K-style math data. Flow:
+# 1. If JAX_PLATFORMS is "proxy", initializes pathwaysutils. Prints a WIP warning, sets
+# SKIP_JAX_PRECOMPILE=1, parses CLI flags (root dir, profiler, model version, num generations,
+# num batches/test batches, global/micro/mini batch sizes, rollout engine vanilla|vllm|sglang_jax,
+# rollout server mode/async scheduling, rollout dp/tp, log level, cluster setup, max TPUs,
+# trainer fsdp/tp, data source/dataset, LoRA flags, perf v1/v2, trace dir) and sets absl verbosity.
+# 2. Derives constants: GCS/local data paths, model dir root_dir/rl/grpo/models/<model version>,
+# LoRA config (raises ValueError if LoRA enabled without target modules), MAX_TP_SIZE by model
+# (2 for Qwen2.5-0.5B, 4 for Qwen2.5-7B, else 8).
+# 3. Device partitioning: total devices (capped by max-tpu-to-use if positive) split by cluster setup:
+# colocated (all roles share all devices), disaggregated-2-way (rollout gets the first half-ish,
+# trainer and reference share the second half), disaggregated-3-way (rollout, then reference with a
+# quarter, then trainer with a half). Rollout always starts at device 0. Unknown setup raises
+# ValueError; LoRA with 3-way asserts. Trainer fsdp/tp and rollout dp/tp are resolved from flags
+# (-1 means derive from the other or use defaults: trainer all-fsdp tp=1, rollout tp=min(MAX_TP,
+# devices)), with assertions that products equal device counts and tp does not exceed MAX_TP_SIZE.
+# Meshes are (shape, ("fsdp","tp")) pairs; reference mesh equals trainer mesh except in 3-way.
+# 4. GRPO hyperparameters (prompt length 256, 768 generation steps, temperature 0.9, top_k 50,
+# beta 0.08, epsilon 0.2, 1 iteration), training steps = min(num_batches, 7473 // global batch),
+# AdamW with warmup-cosine schedule (peak 3e-6, 10% warmup) chained after global-norm clipping 0.1,
+# checkpoint dir under root_dir, inference configs greedy/standard/liberal.
+# 5. Deletes the checkpoint dir, clears JAX arrays, downloads the HF model, loads the tokenizer, builds
+# train/val/test datasets via math_dataset.create_dataset and data_lib.post_init_dataset.
+# 6. Loads reference model and policy model (LoRA on top of reference when enabled, else a separate
+# copy on trainer devices), builds the rollout mesh, defines reward functions, builds the
+# ClusterConfig / GRPOConfig / optional perf config, RLCluster and GRPOLearner with four reward fns.
+# 7. Evaluates with greedy decoding, trains, restores the final actor checkpoint (LoRA params or full
+# params) into the training model, and evaluates again, printing accuracy metrics.
+# Inputs: CLI flags, network/GCS/HF access. Outputs: printed metrics, checkpoints, TensorBoard logs at
+# /tmp/tensorboard/grpo, optional profiles and perf traces. Raises: ValueError/AssertionError on bad
+# configuration; NotImplementedError for unsupported model families.
+# KNOWN ISSUE: --enable-profiler, --rollout-server-mode and --async-scheduling use type=bool, so any
+# non-empty string (including "False") parses as True.
+# KNOWN ISSUE: the test dataset is built from LOCAL_TRAIN_DATA_DIR rather than LOCAL_TEST_DATA_DIR when
+# the data source is not tfds (both dirs are equal here, but the intent seems wrong).
+# KNOWN ISSUE: validata_args (misspelled) is defined but never called.
+# KNOWN ISSUE: MODEL_CONFIG lookup only covers six model versions; any other --model-version raises
+# KeyError when loading the model.
 
 r"""Demo script for GRPO with Llama3 model.
 
@@ -298,6 +338,9 @@ args = parser.parse_args()
 
 
 def validata_args():
+  # [FUNCTION DOC]
+  # HELPER: asserts that when data_source is "tfds" the dataset is "gsm8k". Reads the global args.
+  # Raises AssertionError otherwise. No output. KNOWN ISSUE: never called anywhere in the script.
   if args.data_source == "tfds":
     assert args.dataset == "gsm8k"
 
@@ -596,6 +639,9 @@ tc.download_from_huggingface(
 
 
 def load_json_from_local(path):
+  # [FUNCTION DOC]
+  # HELPER: opens the file at path in binary mode and returns the JSON-decoded contents.
+  # Raises OSError / json.JSONDecodeError. Unused in this script.
   # with gfile.Open(path, "rb") as f:
   with open(path, "rb") as f:
     return json.loads(f.read())
@@ -618,6 +664,10 @@ value) between {solution_start} and {solution_end}."""
 
 
 def extract_hash_answer(text: str) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: returns the stripped text after the first "####" marker (GSM8K answer format), or None if the
+  # text has no "####". Note it returns the second split segment only, so text after a second "####" is
+  # dropped. Unused in this script.
   if "####" not in text:
     return None
   return text.split("####")[1].strip()
@@ -670,6 +720,10 @@ MODEL_CONFIG = {
 
 
 def get_trainer_model(ckpt_path, model_mesh, ref_model_config):
+  # [FUNCTION DOC]
+  # Chooses a safetensors loader based on substrings of the global HF_MODEL_VERSION: "Llama" uses the
+  # llama3 params loader, "Qwen2.5" the qwen2 loader, "Qwen3" the qwen3 loader; each is called with
+  # (ckpt_path, ref_model_config, model_mesh) and its model returned. Raises NotImplementedError otherwise.
   if "Llama" in HF_MODEL_VERSION:
     return llama_params.create_model_from_safe_tensors(
         ckpt_path, ref_model_config, model_mesh
@@ -690,6 +744,11 @@ def get_trainer_model(ckpt_path, model_mesh, ref_model_config):
 def get_model(
     device_start_idx: int, device_end_idx: int, mesh: list[tuple[int]]
 ):
+  # [FUNCTION DOC]
+  # Builds a JAX mesh with shape mesh[0] and axis names mesh[1] over devices
+  # [device_start_idx, device_end_idx) (Auto axis types), instantiates the ModelConfig for
+  # HF_MODEL_VERSION from MODEL_CONFIG, and loads the model from NNX_CKPT_DIR via get_trainer_model.
+  # Output: tuple (model, mesh, model_config). Raises KeyError for an unknown model version.
   ckpt_path = os.path.join(NNX_CKPT_DIR)
   model_mesh = jax.make_mesh(
       *mesh,
@@ -702,6 +761,14 @@ def get_model(
 
 
 def get_lora_model(base_model, model_mesh=None):
+  # [FUNCTION DOC]
+  # Wraps base_model with qwix LoRA (rank RANK, alpha ALPHA). Module regex: for Llama3 instances, the
+  # q/k/v/o and gate/down/up projections; otherwise Gemma-style names (q_einsum, kv_einsum,
+  # gate/down/up_proj, attn_vec_einsum). Uses base_model.get_model_input() as sample inputs for
+  # qwix.apply_lora_to_model. Output: the LoRA model.
+  # KNOWN ISSUE: model_mesh is accepted but ignored. The non-Llama regex uses Gemma naming, which may not
+  # match Qwen2/Qwen3 projection names, so LoRA could silently apply only to the MLP projections.
+  # KNOWN ISSUE: --lora-target-modules is used only for sglang rollout, not for this regex.
   """Creates a LoRA model from a base model.
 
   Args:
@@ -782,6 +849,10 @@ match_format.search(
 
 
 def match_format_exactly(prompts, completions, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # Reward fn: for each completion, 3.0 if the global match_format regex (optional whitespace, reasoning
+  # block, anything, answer block, optional whitespace, multiline+dotall) finds a match, else 0.
+  # Prompts and extra kwargs ignored. Output: list of floats/ints, one per completion.
   scores = []
   for completion in completions:
     score = 0
@@ -794,6 +865,9 @@ def match_format_exactly(prompts, completions, **kargs):  # pylint: disable=unus
 
 
 def match_format_approximately(prompts, completions, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # Reward fn: for each completion, adds +0.5 for each of the four tags (reasoning start/end, answer
+  # start/end) that occurs exactly once, else -0.5 per tag. Range -2.0 to 2.0. Output: list of scores.
   """Computes a score based on the approximate match of the format, penalizing if too many keywords are seen.
 
   Args:
@@ -820,6 +894,12 @@ def match_format_approximately(prompts, completions, **kargs):  # pylint: disabl
 
 
 def check_answer(prompts, completions, answer, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # Reward fn: extracts the last match of match_numbers (first number after an answer start tag) per
+  # completion; None gives 0. Exact string equality with the answer gives 3.0; equality after stripping
+  # gives 1.5; else ratio guess/answer as floats: within [0.9,1.1] gives 0.5, within [0.8,1.2] gives 0.25,
+  # otherwise -1.0; any conversion/division exception gives -0.5. Output: list of scores.
+  # Relies on the global match_numbers defined after this function (resolved at call time).
   """Computes a score based on the correctness of the answer.
 
   Args:
@@ -874,6 +954,11 @@ match_numbers.findall(f"{solution_start}  0.34  {solution_end}")
 
 
 def check_numbers(prompts, completions, answer, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # Reward fn: requires kwarg "question" (KeyError otherwise). Extracts the last match_numbers match per
+  # completion, prints a debug block for the first example (question, answer, response, extracted),
+  # then scores 1.5 if guess and answer (commas removed, stripped, parsed as float) are equal, else 0.0;
+  # 0 if nothing extracted or parsing fails. Output: list of scores. Side effect: stdout.
   """Computes a score based on the correctness of the extracted number.
 
   Args:
@@ -917,6 +1002,11 @@ def check_numbers(prompts, completions, answer, **kargs):  # pylint: disable=unu
 def generate(
     question, sampler, temperature=0.7, top_k=50, top_p=0.95, seed=None
 ):
+  # [FUNCTION DOC]
+  # Builds chat-templated prompt strings (system prompt SYSTEM_PROMPT plus user question, with generation
+  # prompt, untokenized) for a single string or list of questions using the global model_tokenizer, calls
+  # sampler with TOTAL_GENERATION_STEPS, the given temperature/top_k/top_p/seed and echo off, and returns
+  # the single text for a str input or the list of texts otherwise.
   """Given prompt, generates text."""
 
   if isinstance(question, str):
@@ -969,6 +1059,17 @@ def evaluate(
     corr_lst=False,
     make_lst=False,
 ):
+  # [FUNCTION DOC]
+  # Evaluates a sampler on batches (dicts with "question" and "answer" lists). For each question, runs
+  # num_passes generations; for each response takes the last match_numbers number (default "-1000000"),
+  # counts exact float equality as correct and ratio within [0.9,1.1] as partially correct (ValueError /
+  # ZeroDivisionError printed and skipped), and match_format as format-correct; stops early per question
+  # once all three are hit. A question counts in each tally if any response met that criterion. If
+  # make_lst, collects (question, answer, responses) for correct questions when corr_lst else for
+  # incorrect ones. Prints running stats every 10 questions.
+  # Output: tuple (corr, total, accuracy %, partial %, format %), plus the list if make_lst.
+  # Raises ZeroDivisionError if the dataset is empty.
+  # KNOWN ISSUE: the partial-correct ratio check also counts exactly correct answers.
   """Computes accuracy and percentage of outputs matching the format."""
 
   response_lst = []
@@ -1098,6 +1199,14 @@ if args.enable_profiler:
 
 
 def get_rollout_config(engine: str) -> base_rollout.RolloutConfig:
+  # [FUNCTION DOC]
+  # Builds the RolloutConfig. Common: max tokens TOTAL_GENERATION_STEPS, max prompt MAX_PROMPT_LENGTH,
+  # kv cache = prompt + generation + 256, TEMPERATURE/TOP_P/TOP_K. For "sglang_jax": adds a mapping config
+  # built from the reference model, the model path, mem fraction 0.2, random-weight init, radix cache
+  # disabled, non-deterministic sampling, precompile paddings (bs 8, tokens 2048), chunked prefill 2048,
+  # page size 64, and when LoRA is on sets static LoRA with target modules, max rank RANK, scaling
+  # ALPHA/RANK. Otherwise (vanilla or vllm) sets dp/tp from ROLLOUT_MESH, the vLLM model path, HBM
+  # utilization 0.2, jax TPU backend, and server mode / async scheduling flags. Output: RolloutConfig.
   if engine == "sglang_jax":
     config = base_rollout.RolloutConfig(
         max_tokens_to_generate=TOTAL_GENERATION_STEPS,

@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# External-environment test for loading Llama-3.2-1B weights from HuggingFace safetensors via
+# tunix.models.llama3.params.create_model_from_safe_tensors.
+# Side effects at import time: prints progress and downloads "meta-llama/Llama-3.2-1B" (ignoring
+# .pth files) with huggingface_hub.snapshot_download into the HF cache; on any download failure it
+# prints the error and sets the module-level local path to None so the test is skipped.
+# When run directly it uses unittest's text runner inside IPython (detected by get_ipython existing)
+# or absltest.main otherwise. Outputs: test results and printed messages.
 
 # BEGIN-GOOGLE-INTERNAL
 # Tests for Llama3 model parameter loading from safetensors files.
@@ -64,8 +72,16 @@ except Exception as e:
 
 
 class Llama3ParamsTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests Llama3 parameter loading, device placement and display.
 
   def _test_model_loading(self, model_name, model_path, config_fn, mesh_config):
+    # [FUNCTION DOC]
+    # HELPER: shared test body. Inputs: model_name (label), model_path (local directory or None),
+    # config_fn (config factory), mesh_config (pair of mesh shape and axis names). Skips if model_path is
+    # None. Builds config and an Auto-typed mesh, then inside the mesh loads the model from safetensors
+    # (failing the test with a message on any exception), asserts it is non-None, calls nnx.display
+    # (failing on exception), asserts display succeeded and prints a success message.
     """Common test logic for loading different Llama3 models.
 
     Args:
@@ -111,6 +127,9 @@ class Llama3ParamsTest(absltest.TestCase):
       print(f"Llama3-{model_name} model loaded and displayed successfully")
 
   def test_create_model_from_safe_tensors_1b(self):
+    # [FUNCTION DOC]
+    # Runs the shared loading check for the downloaded 1B model with config llama3p2_1b on a (1, N) mesh
+    # with axes ("fsdp", "tp").
     # Use the globally downloaded path for the 1B model
     self._test_model_loading(
         model_name="1B",

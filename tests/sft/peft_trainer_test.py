@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.sft.peft_trainer.PeftTrainer (generic/PEFT supervised
+# trainer): single compilation of the train step, parameter updates, metric
+# logging (loss, perplexity, learning_rate), checkpoint save/resume (full or
+# LoRA-only, sharded or not), training hooks, profiler integration,
+# distributed vs single-device equivalence, custom loss functions with and
+# without aux outputs, gradient accumulation equivalence and injected
+# optimizer hyperparameters. Uses toy models from tunix.tests.test_common.
+# Module state: TEST_LEARNING_RATE (1e-3); global_counter counts how often
+# the train step is traced. Sets XLA_FLAGS to force 4 host CPU devices.
+# KNOWN ISSUE: XLA_FLAGS is set after jax is imported; it only matters if the
+# backend is not yet initialized.
 """Peft trainer unittest."""
 
 import contextlib
@@ -44,8 +56,16 @@ os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
 
 
 def create_sharded_model(model_ctor, rngs, mesh):
+  # [FUNCTION DOC]
+  # HELPER: builds a model whose state is sharded per its partition metadata.
+  # Inside a jitted inner function (constructor static) builds model_ctor with
+  # a default tc.ModelConfig and rngs, applies with_sharding_constraint using
+  # the state's partition specs and updates the model; runs under
+  # compat.set_mesh(mesh). Outputs: (model, NamedSharding tree of the state).
   @nnx.jit(static_argnums=(0,))
   def _create_sharded_model(model_ctor, rngs):
+    # [FUNCTION DOC]
+    # HELPER: jitted inner builder returning (constrained model, state).
     model = model_ctor(config=tc.ModelConfig(), rngs=rngs)
     state = nnx.state(model)
     pspecs = nnx.get_partition_spec(state)
@@ -60,6 +80,10 @@ def create_sharded_model(model_ctor, rngs, mesh):
 
 
 def dummy_gen_model_input_fn(x: peft_trainer.TrainingInput):
+  # [FUNCTION DOC]
+  # HELPER: maps a TrainingInput to model kwargs: input_tokens, input_mask,
+  # positions as a 0..seq_len-1 range, and an all-ones attention_mask shaped
+  # like input_tokens.
   return {
       'input_tokens': x.input_tokens,
       'input_mask': x.input_mask,
@@ -69,6 +93,11 @@ def dummy_gen_model_input_fn(x: peft_trainer.TrainingInput):
 
 
 def dummy_datasets(batch_size: int, repeat: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: builds a list of TrainingInput batches from the integers 0..127
+  # reshaped to (num_batches, batch_size, 16) with all-ones int32 masks
+  # (batch_size 4 gives 2 batches), repeated repeat times (list repetition, so
+  # the same objects reappear).
   # (num_batch, batch_size, seq_len)
   dummy_input = np.arange(128).reshape((-1, batch_size, 16))
   return [
@@ -83,8 +112,16 @@ global_counter = 0
 
 
 class PeftTrainerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test case for PeftTrainer. Fixture provides temp path, simulated 4 CPU
+  # devices, a (2, n/2) ('fsdp','tp') mesh and 2-batch train/eval datasets.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture setting self.temp_path, self.num_cpus (4, via
+    # chex.set_n_cpu_devices), self.mesh, self.train_ds and self.eval_ds (the
+    # same list object).
+    # KNOWN ISSUE: train/eval datasets are assigned twice (redundant).
     super().setUp()
     try:
       self.temp_path = self.create_tempdir().full_path
@@ -106,9 +143,18 @@ class PeftTrainerTest(parameterized.TestCase):
     self.eval_ds = self.train_ds = dummy_datasets(batch_size=4)
 
   def test_compile_once(self):
+    # [FUNCTION DOC]
+    # Verifies the train step is traced exactly once over a full run (counted by
+    # a subclass overriding _train_step that increments global_counter) with a
+    # mesh-sharded LoRA model.
     class CountCompiledTimesTrainer(peft_trainer.PeftTrainer):
+      # [CLASS DOC]
+      # HELPER: PeftTrainer subclass counting how many times _train_step is traced.
 
       def _train_step(self, model, optimizer, inputs):
+        # [FUNCTION DOC]
+        # HELPER: overridden train step incrementing global_counter (runs only at
+        # trace time) then delegating to the parent implementation.
         global global_counter
         global_counter += 1
         return super()._train_step(model, optimizer, inputs)
@@ -131,6 +177,11 @@ class PeftTrainerTest(parameterized.TestCase):
       ('no_cache_nnx_graph', False),
   )
   def test_basic_training(self, cache_nnx_graph: bool):
+    # [FUNCTION DOC]
+    # Verifies training changes all params, logs positive train/eval perplexity,
+    # logs the constant learning rate, records one perplexity entry per train
+    # step, and that train() can be called again without an eval dataset.
+    # Input: cache_nnx_graph flag passed to train().
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
@@ -174,7 +225,17 @@ class PeftTrainerTest(parameterized.TestCase):
   def test_checkpoint_save_and_restore(
       self, enable_lora: bool, distributed: bool
   ):
+    # [FUNCTION DOC]
+    # Verifies checkpoint resume: after training with a checkpoint directory, a
+    # new trainer built from fresh model/optimizer restores model params (LoRA or
+    # full) and optimizer state equal to the trained ones, continues training,
+    # and keeps optimizer-state shardings equivalent. Inputs: enable_lora and
+    # distributed (mesh-sharded model under the mesh context).
     def create_model_and_optimizer():
+      # [FUNCTION DOC]
+      # HELPER: builds a ToyTransformer from Rngs(0) (sharded if distributed,
+      # LoRA-wrapped if enable_lora) and an adamw optimizer with injected constant
+      # learning rate. Outputs: (model, optimizer).
       rngs = nnx.Rngs(0)
       if distributed:
         model, _ = create_sharded_model(tc.ToyTransformer, rngs, self.mesh)
@@ -253,6 +314,10 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
   def test_basic_training_with_hooks(self):
+    # [FUNCTION DOC]
+    # Verifies an autospec'd TrainingHooks receives on_train_start,
+    # on_train_step_start/end, on_eval_step_start/end and on_train_end calls
+    # (presence checked in any order) over 4 train batches.
     train_ds = dummy_datasets(batch_size=4, repeat=2)
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
@@ -285,6 +350,9 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
   def test_reusing_trainer(self):
+    # [FUNCTION DOC]
+    # Verifies calling train() twice re-creates the jitted train step function
+    # (a new object after re-setting gen_model_input_fn).
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
@@ -304,6 +372,13 @@ class PeftTrainerTest(parameterized.TestCase):
 
   @mock.patch.object(profiler, 'Profiler')
   def test_basic_training_with_profiler(self, mock_profiler_init):
+    # [FUNCTION DOC]
+    # Verifies the trainer constructs Profiler(initial_step 0, max_step, options)
+    # once and calls maybe_activate for steps 0..7 and maybe_deactivate for
+    # steps 1..8 over 8 training steps. Input: patched Profiler class.
+    # KNOWN ISSUE: should_activate/should_deactivate side effects are configured
+    # but not part of the asserted API, and the comment saying steps 0 through 8
+    # does not match range(8) (0..7).
     mock_profiler_instance = mock.MagicMock()
     mock_profiler_init.return_value = mock_profiler_instance
     mock_profiler_instance.should_activate.side_effect = (
@@ -348,6 +423,10 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
   def test_dist_training(self):
+    # [FUNCTION DOC]
+    # Verifies mesh-sharded training keeps partition specs ('fsdp','tp') and
+    # ('tp','fsdp') for layer 0 kernels, updates params, and yields params close
+    # to an unsharded run from the same init.
     rngs = nnx.Rngs(0)
     model, _ = create_sharded_model(tc.ToyTransformer, rngs, self.mesh)
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
@@ -385,6 +464,9 @@ class PeftTrainerTest(parameterized.TestCase):
     jax.tree.map_with_path(tc.assert_close, variables, unsharded_variables)
 
   def test_custom_loss_fn(self):
+    # [FUNCTION DOC]
+    # Verifies with_loss_fn installs a custom loss (next-token masked softmax
+    # cross entropy) and training still updates all params.
     def custom_loss_fn(
         model: nnx.Module,
         input_tokens: jax.Array,
@@ -392,6 +474,9 @@ class PeftTrainerTest(parameterized.TestCase):
         positions: jax.Array,
         attention_mask: jax.Array,
     ) -> jax.Array:
+      # [FUNCTION DOC]
+      # HELPER: custom loss; runs the model, shifts logits/targets by one, masks
+      # one-hot targets by input_mask and returns mean softmax cross entropy.
       logits, _ = model(input_tokens, positions, None, attention_mask)
       logits = logits[:, :-1, :]
       target_tokens = input_tokens[:, 1:]
@@ -419,6 +504,9 @@ class PeftTrainerTest(parameterized.TestCase):
       ('constant_schedule', optax.constant_schedule(TEST_LEARNING_RATE)),
   )
   def test_lora_training(self, learning_rate_scheduler):
+    # [FUNCTION DOC]
+    # Verifies LoRA training updates only LoRA params (base params unchanged)
+    # and logs the learning rate, for scalar and schedule learning rates.
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
     model = tc.get_lora_model(
@@ -455,11 +543,19 @@ class PeftTrainerTest(parameterized.TestCase):
       ('constant_schedule', optax.constant_schedule(TEST_LEARNING_RATE)),
   )
   def test_gradient_accumulation(self, learning_rate_schedule):
+    # [FUNCTION DOC]
+    # Verifies gradient accumulation equivalence: training with batch 4 and no
+    # accumulation vs batch 2 with 2 accumulation steps gives params close within
+    # 1e-7, equal train_steps, double iter_steps, and close train loss.
     def train(
         train_ds,
         gradient_accumulation_steps: int | None,
         learning_rate_schedule: int | optax.Schedule,
     ):
+      # [FUNCTION DOC]
+      # HELPER: trains a fresh Rngs(0) ToyTransformer with the given dataset,
+      # accumulation steps and learning rate, asserts the logged learning rate, and
+      # returns (Param state, trainer).
       config = peft_trainer.TrainingConfig(
           eval_every_n_steps=2,
           max_steps=100,
@@ -540,6 +636,13 @@ class PeftTrainerTest(parameterized.TestCase):
       resume_step,
       expected_save_steps,
   ):
+    # [FUNCTION DOC]
+    # Verifies checkpoint interaction with a mocked CheckpointManager: created
+    # with root dir and options; maybe_restore called with LoRA-only restore;
+    # save called for each expected step with LoRA-only and empty metadata,
+    # then latest_step and a forced final save, then close, in order. Covers
+    # gradient accumulation and resuming from a step. Inputs: patched class,
+    # grad_accu, resume_step, expected_save_steps.
     mock_checkpoint_manager = mock.MagicMock()
     mock_checkpoint_manager_init.return_value = mock_checkpoint_manager
     mock_checkpoint_manager.maybe_restore.return_value = (resume_step, {})
@@ -599,6 +702,10 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
   def test_loss_fn_with_aux(self):
+    # [FUNCTION DOC]
+    # Verifies has_aux loss functions: aux dicts are passed to
+    # _post_process_train_step (accumulated by addition over 2 train steps) and
+    # _post_process_eval_step (multiplied over 4 eval steps).
     def custom_loss_fn(
         model: nnx.Module,
         input_tokens: jax.Array,
@@ -606,6 +713,8 @@ class PeftTrainerTest(parameterized.TestCase):
         positions: jax.Array,
         attention_mask: jax.Array,
     ) -> Tuple[jax.Array, Any]:
+      # [FUNCTION DOC]
+      # HELPER: loss returning constant 1.0 and aux {'foo': 1, 'bar': 2}.
       del model, input_tokens, input_mask, positions, attention_mask
       return jnp.array(1.0), {'foo': 1, 'bar': 2}
 
@@ -613,12 +722,18 @@ class PeftTrainerTest(parameterized.TestCase):
     eval_invoke = {'foo': 1, 'bar': 1}
 
     class CustomTrainer(peft_trainer.PeftTrainer):
+      # [CLASS DOC]
+      # HELPER: PeftTrainer subclass recording aux values in enclosing dicts.
 
       def _post_process_train_step(self, aux):
+        # [FUNCTION DOC]
+        # HELPER: adds aux values into train_invoke (closure side effect).
         train_invoke['foo'] += aux['foo']
         train_invoke['bar'] += aux['bar']
 
       def _post_process_eval_step(self, aux):
+        # [FUNCTION DOC]
+        # HELPER: multiplies aux values into eval_invoke (closure side effect).
         eval_invoke['foo'] *= aux['foo']
         eval_invoke['bar'] *= aux['bar']
 
@@ -635,6 +750,9 @@ class PeftTrainerTest(parameterized.TestCase):
     self.assertEqual(eval_invoke, {'foo': 1, 'bar': 16})
 
   def test_injected_params(self):
+    # [FUNCTION DOC]
+    # Verifies an inject_hyperparams optimizer with extra hyperparams (momentum)
+    # still logs the scheduled learning rate.
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
 

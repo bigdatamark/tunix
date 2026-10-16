@@ -1,3 +1,36 @@
+# [MODULE DOC]
+# Notebook-style script (top-level code, "# %%" cells) that trains a Gemma4-31B-it policy on the
+# agentic FrozenLake task with tunix's agentic GRPOLearner. Steps:
+# 1. Configures Python and absl logging to INFO on stdout. Tries etils ecolab adhoc imports (Colab
+# reload); on any failure uses a null context; imports tunix modules and the FrozenLake agent/env
+# inside it. Tries to initialize pathwaysutils (errors swallowed).
+# 2. Parses known CLI args: batch_size 64, mini_batch_size 64, learning_rate 1e-6, b1 0.9, b2 0.99,
+# weight_decay 0.01, num_batches 150, num_generations 8, beta 0.0, epsilon 0.2, epsilon_high 0.28,
+# max_prompt_length 2048, max_response_length 2048, temperature 0.7, top_p 0.95, top_k None,
+# max_concurrency 64, shuffle_data False, seed 42, loss_agg_mode "sequence-mean-token-mean",
+# kl_loss_mode "low_var_kl". Derives constants (3 epochs, MAX_STEPS = num_batches * 3, remat,
+# flash attention block 256, bf16, grad clip 0.3, save every 5 steps keep 500, vLLM limits).
+# 3. Builds three disjoint meshes ("fsdp","tp"): rollout (1x4) on the first devices, reference (1x4)
+# on the next, trainer (4x4) on the last 16 devices; raises ValueError if more than available.
+# 4. Chooses storage paths: internal gfile paths if the internal package imports, else GCS
+# (gs://tunix/...) via fsspec. Checkpoint dir is timestamped. Loads the HF tokenizer, a default chat
+# template parser, and train/val/test datasets (data_lib.post_init_dataset; 50 test batches).
+# 5. Loads the reference model from safetensors on the reference mesh; the actor is a LoRA wrapper
+# (if TRAIN_WITH_LORA, False by default) or a copy of the reference resharded onto the trainer mesh.
+# 6. Builds checkpointing options, metrics logger options (TensorBoard dir on a GCS bucket and wandb
+# config from args), AdamW with constant LR chained after global-norm clipping, rollout config
+# (vllm with server mode, dp attention, async scheduling, random-init weights, or vanilla; ROLLOUT_ENGINE
+# env var, default "vllm"; anything else raises ValueError), ClusterConfig, agentic GRPOConfig
+# (empty system prompt, off-policy steps 0), PerfMetricsConfig exporting traces to /tmp/agentic_perf,
+# RLCluster, and GRPOLearner with FrozenLakeAgent / FrozenLakeEnv and metric_fn, then trains.
+# Side effects: heavy device use, network/GCS IO, checkpoint and log writes.
+# KNOWN ISSUE: env_kwargs passes max_steps as the string "5" rather than an int.
+# KNOWN ISSUE: WARMUP_STEPS and GENERATION_CONFIGS are computed but the optimizer uses a constant LR
+# and no evaluation uses the configs; the comment describing warmup-cosine scheduling is stale.
+# KNOWN ISSUE: --shuffle_data uses type=bool so any non-empty string enables it.
+# KNOWN ISSUE: vars(args) is mutated in place when building the wandb config, adding keys to args.
+# KNOWN ISSUE: bare except clauses around ecolab and pathwaysutils swallow every exception.
+# KNOWN ISSUE: the train file is opened in default (text) mode while the test file is opened "rb".
 """Script to train FrozenLake with GRPO on Gemma4."""
 
 import contextlib
@@ -312,6 +345,13 @@ def create_datasets(
     train_ds_path: str = TRAIN_DATA_PATH,
     test_ds_path: str = TEST_DATA_PATH,
 ):
+  # [FUNCTION DOC]
+  # Opens the train and test Parquet files through the module's file-open function, reads them into
+  # pandas DataFrames, wraps each in a Hugging Face datasets.Dataset, optionally shuffles both with SEED
+  # when args.shuffle_data is truthy, and wraps each in a grain MapDataset that maps process_item over
+  # rows. Inputs: train_ds_path, test_ds_path (default to module constants). Output: tuple
+  # (train MapDataset, test MapDataset); each row is a FrozenLake config dict (env_name, seed, size, p)
+  # plus an empty "prompts" field. Raises: IO/parquet errors. Side effects: remote/local file reads.
   with file_open(train_ds_path) as train_f, file_open(
       test_ds_path, "rb"
   ) as test_f:
@@ -325,6 +365,9 @@ def create_datasets(
     test_ds = test_ds.shuffle(SEED)
 
   def process_item(item):
+    # [FUNCTION DOC]
+    # HELPER: sets item["prompts"] to the empty string (the agent builds prompts from the env) and returns
+    # the mutated item.
     item["prompts"] = ""
     return item
 
@@ -382,6 +425,12 @@ show_hbm_usage("after loading gemma4_ref")
 
 # %%
 def get_lora_model(base_model, model_mesh):
+  # [FUNCTION DOC]
+  # Applies qwix LoRA (rank RANK, alpha ALPHA) to base_model on Gemma-style modules (q_einsum,
+  # kv_einsum, gate/down/up_proj, attn_vec_einsum) using base_model.get_model_input() as sample inputs,
+  # then under model_mesh applies sharding constraints from the state's partition specs and writes the
+  # sharded state back. Inputs: base_model (nnx model), model_mesh (jax Mesh). Output: the LoRA model.
+  # Unused unless TRAIN_WITH_LORA is True.
   lora_provider = qwix.LoraProvider(
       module_path=(
           ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj|"
@@ -565,6 +614,15 @@ show_hbm_usage("after RLCluster creation")
 
 # %%
 def metric_fn(prompts, completions, rewards, advantages, **kwargs):
+  # [FUNCTION DOC]
+  # Custom metric function passed to GRPOLearner (metric_fns). Input: rewards (numpy array of the
+  # group's trajectory rewards); prompts, completions, advantages and kwargs are ignored. Computes
+  # solve_all (all rewards above 0.1), solve_none (all rewards exactly 0), solve_partial (neither) and
+  # solve_ratio (fraction of rewards above 0.1). Output: dict mapping "rewards/solve_all",
+  # "rewards/solve_none", "rewards/solve_partial" (each 1 or 0) and "rewards/solve_ratio" to
+  # (value, np.mean) pairs, the second element being the aggregation function.
+  # KNOWN ISSUE: solve_all uses a 0.1 threshold but solve_none uses exact zero, so rewards in (0, 0.1]
+  # count as neither solved nor unsolved (they land in solve_partial).
   del prompts, completions, advantages, kwargs
   solve_all = (rewards > 0.1).all()
   solve_none = (rewards == 0).all()

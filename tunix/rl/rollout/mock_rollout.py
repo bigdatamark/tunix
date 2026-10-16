@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Mock rollout backend for testing and benchmarking RL pipelines without a
+# real model or accelerator. Generates random completions made of words from
+# a fixed dummy vocabulary (_DUMMY_WORDS), with configurable length
+# distributions and simulated latency; returns zero-filled logits/logprobs
+# on the host; parameter updates are no-ops.
 """Mock rollout worker."""
 
 from collections.abc import Sequence
@@ -38,6 +44,13 @@ _DUMMY_WORDS = (
 
 
 class MockRollout(base_rollout.BaseRollout):
+  # [CLASS DOC]
+  # BaseRollout implementation. State: optional model object, optional
+  # tokenizer, vocab size (default 32000), fallback pad id (0) and EOS id (1),
+  # min/max simulated generation time in seconds (defaults 1.0 and 10.0),
+  # length distribution name (uniform, normal, skewed, fixed; default
+  # uniform), optional length mean and std, and two RNGs (Python random and
+  # NumPy Generator) seeded from the rollout config seed when provided.
   """Mock rollout worker for testing RL pipelines.
 
   This engine simulates the behavior of a real LLM rollout worker (like vLLM
@@ -95,6 +108,13 @@ class MockRollout(base_rollout.BaseRollout):
       rollout_config: base_rollout.RolloutConfig | None = None,
       **kwargs,
   ):
+    # [FUNCTION DOC]
+    # Inputs: optional rollout_actor (returned by model), tokenizer, vocab_size,
+    # pad_id, eos_id, rollout_config, and kwargs min_generation_time,
+    # max_generation_time, length_distribution, length_mean, length_std (other
+    # kwargs ignored). Applies defaults listed in the class doc. If the config
+    # has a seed, converts it to int (using item() for JAX arrays) and seeds both
+    # RNGs with it; otherwise both RNGs are unseeded.
     self._model = rollout_actor
     self._tokenizer = tokenizer
     self._vocab_size = vocab_size if vocab_size is not None else 32_000
@@ -122,6 +142,11 @@ class MockRollout(base_rollout.BaseRollout):
       self._np_rng = np.random.default_rng()
 
   def _encode_text(self, text: str) -> np.ndarray | None:
+    # [FUNCTION DOC]
+    # HELPER: If a tokenizer with an encode method exists, returns the encoding of
+    # text as an int32 NumPy array; if encoding raises, logs a warning at most
+    # every 100 occurrences and returns None. Returns None when no usable
+    # tokenizer.
     """Attempts to encode text using the tokenizer, returning None on failure."""
     if self._tokenizer is not None and hasattr(self._tokenizer, "encode"):
       try:
@@ -133,6 +158,18 @@ class MockRollout(base_rollout.BaseRollout):
     return None
 
   def _get_target_length(self, max_tokens: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Samples a completion length in [1, max_tokens] (returns max_tokens
+    # unchanged if it is at most 1). uniform: without mean/std, a uniform integer
+    # in [1, max_tokens] from the Python RNG; with either given, defaults mean to
+    # the midpoint and std to (max_tokens - 1) divided by sqrt(12), samples a
+    # float uniformly in [mean - sqrt(3) std, mean + sqrt(3) std + 1), truncates
+    # and clamps. normal / skewed: default mean max_tokens/2 or /4, default std
+    # max_tokens/6 or /8; maps to a Beta distribution on [0, 1] by method of
+    # moments (normalized mean clamped to [0.01, 0.99], variance clamped to
+    # [1e-5, m(1-m) - 1e-5], alpha and beta at least 0.1), samples, scales to
+    # [1, max_tokens], truncates and clamps. fixed: int of mean (default half of
+    # max_tokens) clamped. Unknown names log a warning and fall back to uniform.
     """Calculates the target length for generation based on distribution config."""
     if max_tokens <= 1:
       return max_tokens
@@ -205,6 +242,20 @@ class MockRollout(base_rollout.BaseRollout):
       rollout_config: base_rollout.RolloutConfig,
       **kwargs,
   ) -> base_rollout.RolloutOutput:
+    # [FUNCTION DOC]
+    # Inputs: a prompt string or sequence of strings, RolloutConfig, ignored
+    # kwargs. Sleeps a uniformly random time between min and max generation time
+    # (side effect: blocks). max tokens is max_tokens_to_generate, at least 1.
+    # Allocates a prompt-token matrix (batch by max_prompt_length) filled with
+    # pad id. For each prompt: picks a target length, samples that many dummy
+    # words joined by spaces; if the tokenizer can encode the prompt, keeps its
+    # last max_prompt_length tokens and right-aligns them in the matrix; if it
+    # can encode the completion text, truncates to max tokens (or replaces an
+    # empty encoding with one random id) and, if the tokenizer can decode,
+    # replaces the text with the decoded tokens; otherwise samples target-length
+    # random ids in [0, vocab). Creates a zero float16 logits array of length by
+    # vocab. If return_logprobs, creates zero float32 logprobs per sample, else
+    # None. Returns RolloutOutput with these values.
     """Generates random samples and simulates time delay.
 
     Args:
@@ -301,6 +352,9 @@ class MockRollout(base_rollout.BaseRollout):
       completion_tokens: jax.Array,
       completion_mask: jax.Array | None = None,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Returns a zero float32 NumPy array shaped like completion_tokens (batch by
+    # length); prompt tokens and mask are ignored.
     """Returns mock per-token log probabilities.
 
     Args:
@@ -321,6 +375,8 @@ class MockRollout(base_rollout.BaseRollout):
       params: jaxtyping.PyTree,
       filter_types: tuple[Any, ...] | None = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # No-op; parameters are ignored. Returns None.
     """Mock update params.
 
     Args:
@@ -330,16 +386,24 @@ class MockRollout(base_rollout.BaseRollout):
     pass
 
   def pad_id(self) -> int:
+    # [FUNCTION DOC]
+    # Returns the tokenizer's pad_id (calling it if callable) when a tokenizer
+    # with that attribute exists, else the configured fallback pad id.
     if self._tokenizer is not None and hasattr(self._tokenizer, "pad_id"):
       pad_id_attr = self._tokenizer.pad_id
       return pad_id_attr() if callable(pad_id_attr) else pad_id_attr
     return self._pad_id
 
   def eos_id(self) -> int:
+    # [FUNCTION DOC]
+    # Returns the tokenizer's eos_id (calling it if callable) when available,
+    # else the configured fallback EOS id.
     if self._tokenizer is not None and hasattr(self._tokenizer, "eos_id"):
       eos_id_attr = self._tokenizer.eos_id
       return eos_id_attr() if callable(eos_id_attr) else eos_id_attr
     return self._eos_id
 
   def model(self) -> Any:
+    # [FUNCTION DOC]
+    # Returns the rollout_actor object passed at construction (may be None).
     return self._model

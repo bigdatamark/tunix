@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Async unit tests for GroupQueueManager, which buffers TrajectoryItems by
+# group_id until a group reaches group_size, then releases whole groups into
+# batches via get_batch, keeping leftovers in an internal batch buffer.
+# Also checks exception propagation via put_exception. Each test runs its
+# coroutine with asyncio.run. No external side effects.
+
 """Tests for group_queue_manager."""
 
 import asyncio
@@ -24,6 +31,9 @@ from tunix.rl.agentic.queue_manager import group_queue_manager
 def _create_item(
     group_id: str, pair_index: int = 0
 ) -> agent_types.TrajectoryItem:
+  # [FUNCTION DOC]
+  # HELPER: builds a TrajectoryItem with the given group_id and pair_index,
+  # start_step 0 and traj None.
   """Helper to create a TrajectoryItem for testing."""
   return agent_types.TrajectoryItem(
       pair_index=pair_index,
@@ -34,11 +44,18 @@ def _create_item(
 
 
 class GroupQueueManagerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests for GroupQueueManager grouping, waiting, leftover and error paths.
 
   def test_put_and_get_simple_batch(self):
+    # [FUNCTION DOC]
+    # Verifies that with group_size 2 a group is not ready after one put,
+    # becomes ready after the second, and get_batch(2) returns both items.
     """Tests basic put and get functionality."""
 
     async def _run_test():
+      # [FUNCTION DOC]
+      # HELPER: async body of the test.
       manager = group_queue_manager.GroupQueueManager(group_size=2)
       item1 = _create_item("g1", 0)
       item2 = _create_item("g1", 1)
@@ -56,14 +73,21 @@ class GroupQueueManagerTest(absltest.TestCase):
     asyncio.run(_run_test())
 
   def test_get_batch_waits_for_items(self):
+    # [FUNCTION DOC]
+    # Verifies get_batch(2) blocks until a concurrent producer task has put
+    # both items of the group (with small sleeps between puts), then returns 2.
     """Tests that get_batch waits until a group is ready."""
 
     async def _run_test():
+      # [FUNCTION DOC]
+      # HELPER: async body of the test.
       manager = group_queue_manager.GroupQueueManager(group_size=2)
       item1 = _create_item("g1", 0)
       item2 = _create_item("g1", 1)
 
       async def producer():
+        # [FUNCTION DOC]
+        # HELPER: puts item1 then item2, sleeping 0.01s before each.
         await asyncio.sleep(0.01)
         await manager.put(item1)
         await asyncio.sleep(0.01)
@@ -78,9 +102,15 @@ class GroupQueueManagerTest(absltest.TestCase):
     asyncio.run(_run_test())
 
   def test_batching_with_leftovers(self):
+    # [FUNCTION DOC]
+    # Verifies a ready group of 3 split by get_batch(2) yields the first two
+    # items and leaves the third in _batch_buf, which get_batch(1) then
+    # returns, leaving the buffer empty.
     """Tests batching where a group is split across two get_batch calls."""
 
     async def _run_test():
+      # [FUNCTION DOC]
+      # HELPER: async body of the test.
       manager = group_queue_manager.GroupQueueManager(group_size=3)
       items = [_create_item("g1", i) for i in range(3)]
       for item in items:
@@ -101,9 +131,14 @@ class GroupQueueManagerTest(absltest.TestCase):
     asyncio.run(_run_test())
 
   def test_put_exception(self):
+    # [FUNCTION DOC]
+    # Verifies that after put_exception(ValueError), subsequent put and
+    # get_batch calls both raise that ValueError.
     """Tests that an exception is propagated to put and get calls."""
 
     async def _run_test():
+      # [FUNCTION DOC]
+      # HELPER: async body of the test.
       manager = group_queue_manager.GroupQueueManager(group_size=2)
       exc = ValueError("Test Exception")
       await manager.put_exception(exc)

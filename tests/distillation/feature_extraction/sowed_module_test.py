@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.feature_extraction.sowed_module:
+# wrap_model_with_sowed_modules replaces (in place, recursively, including
+# inside list attributes) every submodule of the target types with a
+# SowedModule wrapper that records its output under SowedModule._SOW_TAG,
+# never double-wraps an existing SowedModule, and also recurses into wrapped
+# targets; pop_sowed_intermediate_outputs collects and removes the recorded
+# outputs as a state tree; unwrap_sowed_modules restores the originals.
 """Unit tests for sowed module wrapping."""
 
 from absl.testing import absltest
@@ -23,21 +31,32 @@ from tunix.tests import test_common as tc
 
 
 class SimpleLayer(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: leaf nnx layer with a string tag and a 1-element Param of 1.0.
   """A basic NNX layer for testing."""
 
   def __init__(self, tag: str):
+    # [FUNCTION DOC]
+    # HELPER: stores tag and creates the [1.0] parameter.
     self.tag = tag  # Just to differentiate instances
     self.param = nnx.Param(jnp.array([1.0]))  # Dummy parameter
 
   def __call__(self, x: jax.Array) -> jax.Array:
+    # [FUNCTION DOC]
+    # HELPER: returns x plus the parameter value.
     # Simple operation: add param and return
     return x + self.param.value
 
 
 class Block(nnx.Module, pytree=False):
+  # [CLASS DOC]
+  # HELPER: non-pytree nnx module holding layer1, layer2 and a Python list
+  # other_layers of two SimpleLayers, applied sequentially.
   """A block containing nested layers."""
 
   def __init__(self, tag: str):
+    # [FUNCTION DOC]
+    # HELPER: creates the four SimpleLayers tagged from tag.
     self.tag = tag
     self.layer1 = SimpleLayer(f'{tag}_layer1')
     self.layer2 = SimpleLayer(f'{tag}_layer2')  # Another instance
@@ -47,6 +66,8 @@ class Block(nnx.Module, pytree=False):
     ]
 
   def __call__(self, x: jax.Array) -> jax.Array:
+    # [FUNCTION DOC]
+    # HELPER: applies layer1, layer2, then each of other_layers in order.
     x = self.layer1(x)
     x = self.layer2(x)
     for layer in self.other_layers:
@@ -55,14 +76,20 @@ class Block(nnx.Module, pytree=False):
 
 
 class OuterModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: top-level model: block1 -> block2 -> final_layer.
   """A top-level model with nested blocks."""
 
   def __init__(self):
+    # [FUNCTION DOC]
+    # HELPER: creates two Blocks and a final SimpleLayer.
     self.block1 = Block('block1')
     self.block2 = Block('block2')
     self.final_layer = SimpleLayer('final')
 
   def __call__(self, x: jax.Array) -> jax.Array:
+    # [FUNCTION DOC]
+    # HELPER: runs block1, block2 and final_layer sequentially.
     x = self.block1(x)
     x = self.block2(x)
     x = self.final_layer(x)
@@ -70,8 +97,14 @@ class OuterModel(nnx.Module):
 
 
 class SowedModuleTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for wrapping, sow capture, and unwrapping.
 
   def test_wrap_model_with_sowed_modules_recursive(self):
+    # [FUNCTION DOC]
+    # Verifies all nine SimpleLayers (including list items) are replaced by
+    # SowedModules wrapping the original objects, while Blocks are untouched.
+    # KNOWN ISSUE: dummy_input is created but unused.
     dummy_input = jnp.array([10.0])
     model = OuterModel()
     # Store references to all original SimpleLayer instances
@@ -149,6 +182,11 @@ class SowedModuleTest(absltest.TestCase):
     self.assertIs(model.final_layer.wrapped_model, original_final)
 
   def test_wrap_model_with_multiple_target_types(self):
+    # [FUNCTION DOC]
+    # Verifies wrapping with [SimpleLayer, Block]: Blocks become SowedModules
+    # whose wrapped Block's SimpleLayers are themselves wrapped, and all
+    # wrapped_model references are the originals.
+    # KNOWN ISSUE: dummy_input is created but unused.
     dummy_input = jnp.array([10.0])
     model = OuterModel()
     # Store references to all original SimpleLayer instances
@@ -241,6 +279,10 @@ class SowedModuleTest(absltest.TestCase):
     self.assertIs(model.block2.wrapped_model, original_b2)
 
   def test_wrap_model_with_sowed_modules_forward_pass(self):
+    # [FUNCTION DOC]
+    # Verifies a forward pass through the wrapped model gives the same output as
+    # chaining the original layers, and the popped sowed state (pure dict) holds
+    # a 1-tuple of each layer's output under the sow tag at the matching path.
     dummy_input = jnp.array([10.0])
     model = OuterModel()
     # Store references to all original SimpleLayer instances
@@ -311,6 +353,9 @@ class SowedModuleTest(absltest.TestCase):
     )
 
   def test_capture_avoids_double_wrapping(self):
+    # [FUNCTION DOC]
+    # Verifies a manually wrapped layer is not re-wrapped while other target
+    # layers are wrapped.
     model = Block('block')
     original_l1 = model.layer1
     original_l2 = model.layer2
@@ -333,6 +378,9 @@ class SowedModuleTest(absltest.TestCase):
     self.assertIs(model.layer2.wrapped_model, original_l2)
 
   def test_unwrap_sowed_modules_recursive(self):
+    # [FUNCTION DOC]
+    # Verifies unwrap_sowed_modules restores every original SimpleLayer object,
+    # including list entries.
     model = OuterModel()
     # Store references to ALL original SimpleLayer instances
     original_b1_l1 = model.block1.layer1

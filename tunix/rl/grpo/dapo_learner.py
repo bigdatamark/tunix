@@ -11,6 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# DAPO (Decoupled clip and Dynamic sAmpling Policy Optimization,
+# arXiv 2503.14476) configuration, overlong reward shaping and learner.
+# DAPOConfig extends GRPOConfig (asymmetric clipping via epsilon_high, no KL,
+# token-mean loss, overlong-buffer settings). reward_shaping is an extra
+# reward function penalizing completions that run into the overlong buffer.
+# DAPOLearner is a GRPO learner that appends reward_shaping to the reward
+# functions when the overlong buffer is enabled. Re-exports TrainingInputT,
+# RewardFn and MetricFn.
+# KNOWN ISSUE: the module docstring says "Helper functions for GRPO Trainer".
 """Helper functions for GRPO Trainer."""
 
 import dataclasses
@@ -26,6 +36,16 @@ MetricFn = rl_learner.MetricFn
 
 @dataclasses.dataclass(kw_only=True)
 class DAPOConfig(grpo_learner_lib.GRPOConfig):
+  # [CLASS DOC]
+  # Keyword-only dataclass. Defaults: algo_variant "dapo", advantage_estimator
+  # "grpo", policy_loss_fn "grpo", loss_agg_mode "token-mean", reward_manager
+  # "sequence-level", num_generations 2, num_iterations 1, beta None (no KL),
+  # epsilon 0.2 (lower clip), epsilon_high 0.28 (upper clip), dynamic_sampling
+  # True (not implemented), overlong_buffer dict with enable True,
+  # overlong_buffer_length 4096, overlong_buffer_penalty 1.0,
+  # max_response_length 20480. The overlong_buffer dict is forwarded by the
+  # reward manager as a keyword argument to reward functions whose signature
+  # names it.
   """Configuration for DAPO.
 
   Attributes:
@@ -73,6 +93,17 @@ class DAPOConfig(grpo_learner_lib.GRPOConfig):
   )
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Validates: beta must be None, epsilon_high must be at least epsilon; if the
+    # overlong buffer is present and enabled, all of overlong_buffer_length,
+    # overlong_buffer_penalty and max_response_length must be present and not
+    # None, penalty must be non-negative, buffer length and max response length
+    # positive. Raises ValueError on the first violation. Returns None.
+    # KNOWN ISSUE: does not call GRPOConfig/AlgorithmConfig __post_init__, so
+    # num_generations and loss_algo checks and config logging are skipped. Also
+    # GRPOLearner tests beta against 0.0, and None differs from 0.0, so the
+    # reference model log-probs are still computed for DAPO (and a KL term may
+    # be attempted) despite "no KL".
     if self.beta is not None:
       raise ValueError(
           "DAPO does not support KL penalty, so beta must be None."
@@ -109,6 +140,17 @@ def reward_shaping(
     overlong_buffer: Dict[str, Any] | None = None,
     **kwargs,
 ) -> List[float]:
+  # [FUNCTION DOC]
+  # Reward function for overlong shaping. Inputs: prompts, completions (strings),
+  # mode, overlong_buffer dict, ignored kwargs. Raises ValueError if
+  # overlong_buffer is None (KeyError if keys missing). expected length =
+  # max_response_length minus overlong_buffer_length. For each completion,
+  # exceed = its length minus expected length; reward is the minimum of zero and
+  # negative exceed divided by buffer length times penalty. Returns the list of
+  # floats (0 for short completions, increasingly negative inside the buffer).
+  # KNOWN ISSUE: length is measured in characters of the completion string, not
+  # tokens, while the thresholds describe generation (token) lengths; the
+  # penalty is not capped beyond the buffer.
   """Reward shaping function for DAPO."""
   del prompts, mode, kwargs
   if overlong_buffer is None:
@@ -132,6 +174,8 @@ def reward_shaping(
 
 class DAPOLearner(grpo_learner_lib.GrpoLearner[DAPOConfig]):
   """DAPO learner."""
+  # [CLASS DOC]
+  # GRPO learner specialized with DAPOConfig; only constructor behavior differs.
 
   def __init__(
       self,
@@ -141,6 +185,14 @@ class DAPOLearner(grpo_learner_lib.GrpoLearner[DAPOConfig]):
       metric_fns: Sequence[MetricFn] | None = None,
       data_shuffle_seed: int | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs as GRPOLearner. Wraps a single reward function into a list
+    # (non-sequence inputs). If overlong_buffer is set and its "enable" entry is
+    # truthy, appends reward_shaping to the reward list. Then calls GRPOLearner
+    # init with the (possibly extended) list.
+    # KNOWN ISSUE: when the caller passes a list, it is mutated in place by the
+    # append; passing a tuple raises AttributeError on append; a missing
+    # "enable" key raises KeyError.
     """Initializes the `DAPOLearner`."""
     reward_fns = (
         [reward_fns] if not isinstance(reward_fns, Sequence) else reward_fns

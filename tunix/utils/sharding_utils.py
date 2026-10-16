@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Small sharding utility module providing a single function that applies
+# a named sharding to a JAX array using the currently active physical mesh
+# (taken from the thread-local mesh resource environment).
 """Sharding utilities."""
 
 from typing import Tuple
@@ -25,6 +29,20 @@ import jax.sharding as shd
 # TODO(abheesht17): Use this function for all models and unify with the fn in
 # sft/sharding_utils.py.
 def shard(x: jnp.ndarray, s: Tuple[str, ...], eager: bool = False):
+  # [FUNCTION DOC]
+  # Applies a sharding to an array.
+  # Inputs: x - array-like; s - tuple of mesh axis names (or None entries) used
+  #   as the partition spec, one per array dimension; eager - choose eager
+  #   placement vs. a traced sharding constraint.
+  # Behavior: read the current physical mesh from the thread-local resource
+  #   environment. If that mesh is empty or the first JAX device is a CPU,
+  #   simply convert x to a JAX array and return it (no sharding). Otherwise build
+  #   a named sharding of the mesh and a partition spec from s; if eager, place
+  #   the array with device_put; else return a sharding constraint (for use
+  #   inside jit tracing).
+  # Output: the (possibly) sharded JAX array.
+  # Exceptions: propagates JAX errors for invalid specs/axis names.
+  # Side effects: eager mode transfers data to devices.
   """Shards a JAX array.
 
   Args:

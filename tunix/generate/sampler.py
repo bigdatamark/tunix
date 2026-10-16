@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Native JAX/flax-nnx autoregressive sampler ("vanilla" sampler) for tunix
+# transformer models. Supports greedy decoding, top-p/top-k sampling with
+# temperature, and beam search (via beam_search module), optional per-step
+# logits and log-probability capture, forbidden tokens, custom EOS sets,
+# multimodal image inputs, echo of the prompt and fixed-length padded output.
+# Design: prompts are tokenized, left-padded to a fixed prompt length, and
+# placed in a fixed-size token buffer of length prompt_length plus
+# max_generation_steps. A jitted prefill runs the full prompt through the model
+# filling a KV cache and samples the first token; a jitted decode function then
+# runs a lax while loop producing one token per step until every row hit an
+# EOS or the buffer is full. Both jitted functions donate the sampling state so
+# the KV cache is updated in place. Model params are passed as an argument
+# (graphdef kept separately) so they are not static in the compiled program.
+# Defines type aliases LayerCache (dict of name to array) and Cache (dict of
+# layer name to LayerCache).
 """Vanilla sampler for LLM generation."""
 
 from __future__ import annotations
@@ -44,6 +60,19 @@ Cache = dict[str, LayerCache]
 
 @flax.struct.dataclass
 class _SamplingState:
+  # [CLASS DOC]
+  # HELPER: immutable flax struct dataclass (JAX pytree) carrying the full
+  # decoding state through jit and the while loop.
+  # Pytree fields: decoding_step (index of the last written token), token_buffer
+  # [B, L] int32, positions [B, L] (positions ignoring pad), cache (KV cache
+  # pytree), done [B] bool, total_sampling_steps (L), logits_buffer [B, L, V] or
+  # None, logprobs_buffer [B, L] or None, forbidden_token_ids tuple or None,
+  # seed (PRNG key), beam_search_sampling_state (beam state or None).
+  # Static (non-pytree) fields: sampling_mode (greedy, top_p or beam_search),
+  # num_input_tokens (padded prompt length), temperature, sampling_parameters
+  # (dict with top_p and top_k, or beam_size).
+  # Note total_sampling_steps and forbidden_token_ids are declared as pytree
+  # fields though they hold Python values.
   """Internal sampling state."""
 
   # Decoding step.
@@ -100,6 +129,11 @@ class _SamplingState:
 
 @dataclasses.dataclass(frozen=True)
 class CacheConfig:
+  # [CLASS DOC]
+  # Frozen dataclass configuring the KV cache: cache_size (max sequence length
+  # the cache holds; total prompt plus generation length must not exceed it),
+  # num_layers, num_kv_heads, head_dim (the last three only used by the
+  # deprecated fallback cache initializer).
   """Configuration for the KV cache."""
 
   cache_size: int
@@ -116,6 +150,23 @@ def sample_top_p(
     top_k: int | None,
     return_logprobs: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+  # [FUNCTION DOC]
+  # Samples one token per row with temperature, nucleus (top-p) and top-k
+  # filtering.
+  # Inputs: logits [B, T, V] (only the last position is used), a PRNG key,
+  # temperature (divides logits; must be nonzero), top_p threshold, top_k
+  # (None or non-positive means no top-k), and return_logprobs flag.
+  # Behavior: casts last-position logits to float32 and divides by temperature.
+  # Fast path when top_p is at least 1 and no top-k: categorical sample over the
+  # full vocabulary. Otherwise takes the top k logits (k = vocab size when no
+  # top-k) sorted descending, computes softmax and its cumulative sum, masks to
+  # negative infinity every entry whose cumulative probability before itself
+  # already exceeds top_p (so the token crossing the threshold is kept), samples
+  # categorically among the remaining and maps back to vocabulary ids.
+  # Returns (token ids [B], log-probs [B] or None). Log-probs are computed from
+  # the temperature-scaled but unfiltered distribution (log_softmax over the
+  # full vocabulary), not from the truncated distribution.
+  # No side effects.
   """Sample a token using top-p sampling."""
   # Upcast to float32 for numerical stability of softmax and subsequent cumsum.
   next_token_logits = logits[:, -1].astype(jnp.float32) / temperature
@@ -157,6 +208,10 @@ def sample_top_p(
 def sample_best(
     logits, return_logprobs: bool = False
 ) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+  # [FUNCTION DOC]
+  # Greedy selection: returns (argmax token id of the last position for each
+  # row, shape [B]; and if return_logprobs, its float32 log-softmax
+  # log-probability [B], else None). Input logits are [B, T, V].
   next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True)
   next_token = next_token[:, 0]
   if not return_logprobs:
@@ -175,6 +230,13 @@ def _init_cache(
     head_dim: int,
     dtype: jnp.dtype,
 ) -> Cache:
+  # [FUNCTION DOC]
+  # HELPER: deprecated fallback KV cache constructor. Returns a dict with keys
+  # layer_0 to layer_{n_layers-1}, each holding k and v zero arrays of shape
+  # [batch_size, cache_size, num_kv_heads, head_dim] in the given dtype and an
+  # int32 end_index zero vector of shape [batch_size].
+  # KNOWN ISSUE: the docstring says it returns the cache for one attention
+  # block, but it returns caches for all layers.
   """Create KV cache for the transformer.
 
   Args:
@@ -202,6 +264,13 @@ def _init_cache(
 
 
 class Sampler(base_sampler.BaseSampler):
+  # [CLASS DOC]
+  # BaseSampler implementation running the model directly with JAX. Keeps the
+  # model split into a graphdef and its variables (nested State plus a flat list
+  # of Variable leaves used as the jitted function argument), a TokenizerAdapter,
+  # the CacheConfig, an optional image processor, the jitted prefill and decode
+  # functions, and a flag telling whether the model call accepts
+  # decode_only_last_token. The EOS id array (eos_ids) is set on each call.
   """Sampler for transformer model."""
 
   def __init__(
@@ -211,6 +280,14 @@ class Sampler(base_sampler.BaseSampler):
       cache_config: CacheConfig,
       image_processor: image_processor_lib.ImageProcessor | None = None,
   ):
+    # [FUNCTION DOC]
+    # Wraps the tokenizer in a TokenizerAdapter if needed; stores cache config and
+    # image processor; extracts the graphdef and variables (nnx.variables) from the
+    # model and flattens the variables into a list of Variable leaves. Creates
+    # jitted versions of the decode function (donating the sampling-state
+    # argument) and of the prefill function (donating the state, echo static).
+    # Inspects the model's call signature to set the decode_only_last_token
+    # support flag. No device computation happens here.
     """Initializes the sampler.
 
     Args:
@@ -254,23 +331,42 @@ class Sampler(base_sampler.BaseSampler):
     )
 
   def model_def_and_state(self) -> tuple[graph.NodeDef, statelib.State]:
+    # [FUNCTION DOC]
+    # Returns a tuple of the model graphdef and the flat list of Variable leaves
+    # (despite the annotation, not a State).
     """Returns the transformer graphdef and state."""
     return self._transformer_graphdef, self._flattened_transformer_state
 
   @property
   def transformer(self) -> nnx.Module:
+    # [FUNCTION DOC]
+    # Property: reconstructs and returns a model module by merging the graphdef
+    # with the flat variable leaves (new module object on every access).
     return nnx.merge(
         self._transformer_graphdef, self._flattened_transformer_state
     )
 
   @property
   def transformer_state(self) -> statelib.State:
+    # [FUNCTION DOC]
+    # Property getter returning the stored nested variable State.
     return self._transformer_state
 
   @transformer_state.setter
   def transformer_state(self, state: statelib.State) -> None:
+    # [FUNCTION DOC]
+    # Property setter replacing model weights (used for weight sync from trainer).
+    # Collects the Variable types in the new state. If it contains nnx.Param: full
+    # replacement; the new state must have the same tree structure as the current
+    # one (ValueError otherwise) and replaces it. Else the state must contain only
+    # nnx.LoRAParam (ValueError otherwise): the current LoRA subset must match the
+    # new state's structure, and the new state is merged into the current non-LoRA
+    # subset. Finally recomputes the flat leaf list.
 
     def get_all_param_types(tree):
+      # [FUNCTION DOC]
+      # HELPER: returns the set of Python types of all leaves of tree, treating
+      # nnx.Variable instances as leaves.
       param_types = set()
       jax.tree_util.tree_map(
           lambda x: param_types.add(type(x)),
@@ -280,6 +376,12 @@ class Sampler(base_sampler.BaseSampler):
       return param_types
 
     def check_tree_structure(tree1, tree2):
+      # [FUNCTION DOC]
+      # HELPER: raises ValueError (showing both treedefs) if the two trees have
+      # different pytree structures. Then compares leaves pairwise with the
+      # shape/dtype/sharding helper and raises ValueError (showing both trees) if
+      # any pair differs. Mixed sharding classes (e.g. single-device vs named) are
+      # always considered different.
       if jax.tree_util.tree_structure(tree1) != jax.tree_util.tree_structure(
           tree2
       ):
@@ -290,8 +392,21 @@ class Sampler(base_sampler.BaseSampler):
         )
 
       def check_shape_dtype_sharding(x, y):
+        # [FUNCTION DOC]
+        # HELPER: returns True when two leaves have identical shape and dtype and
+        # equivalent sharding.
 
         def equivalent_sharding(x, y):
+          # [FUNCTION DOC]
+          # HELPER: sharding equivalence. Two single-device shardings are equivalent if
+          # their device sets match. Otherwise both must be NamedSharding on the same
+          # mesh, and every partition-spec entry present in the first spec but not in
+          # the second must be None/empty or name a mesh axis of size 1 (memory kind is
+          # ignored on purpose).
+          # KNOWN ISSUE: the comparison is a one-directional set difference that ignores
+          # positions, so specs differing in axis order or with extra entries only in
+          # the second spec are considered equivalent; a tuple spec entry would be used
+          # directly as a mesh axis key and fail.
           # Lift the condition on memory_kind due to offloading.
           # Besides it seems jax.jit might change some shardings of the params
           # to equivalent representation so here we check if the specs are
@@ -359,6 +474,10 @@ class Sampler(base_sampler.BaseSampler):
 
   @property
   def dtype(self) -> jnp.dtype:
+    # [FUNCTION DOC]
+    # Property: returns the model config's dtype if the model has a config with a
+    # dtype attribute, otherwise the dtype of the first flat variable leaf. Merges
+    # a fresh model on each access (cost only, no side effects).
     if hasattr(self.transformer, 'config') and (
         hasattr(self.transformer.config, 'dtype')
     ):
@@ -378,6 +497,23 @@ class Sampler(base_sampler.BaseSampler):
       beam_size: Optional[int],
       include_logprobs: bool = False,
   ) -> _SamplingState:
+    # [FUNCTION DOC]
+    # Builds the initial _SamplingState.
+    # Inputs: all_input_ids [B, P] left-padded prompts; total_sampling_steps L;
+    # include_logits; forbidden_token_ids; temperature; top_p; top_k; seed key;
+    # beam_size; include_logprobs.
+    # Behavior: token buffer [B, L] filled with pad id, prompt copied into the first
+    # P columns; mask true for non-pad prompt positions and all generation slots;
+    # positions computed with utils.build_positions_from_mask. done all False.
+    # Cache from the model's init_cache(batch, cache_size, dtype) if available,
+    # otherwise the deprecated helper (emits DeprecationWarning). Optional float32
+    # zero logits buffer [B, L, num_embed of the model] and logprobs buffer [B, L].
+    # Sampling mode: beam_search if beam_size given (stores beam_size), top_p if
+    # top_p given (stores top_p and top_k), greedy otherwise; utils
+    # check_sampling_mode_conflict raises when both beam and top_p are given.
+    # decoding_step starts at P - 1.
+    # KNOWN ISSUE: top_k without top_p is silently ignored (greedy is used), and
+    # the stored num_input_tokens is a JAX array in a static field.
     """Initializes the sampling state given input prompts."""
     batch_size = all_input_ids.shape[0]
     num_input_tokens = all_input_ids.shape[1]
@@ -469,6 +605,9 @@ class Sampler(base_sampler.BaseSampler):
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
+    # [FUNCTION DOC]
+    # Encodes a string, prepends BOS if its id is truthy, removes duplicate
+    # leading BOS ids and returns an int32 numpy array.
     """Tokenizes the input string."""
     input_ids = self.tokenizer.encode(input_string)
     bos_tok = [self.tokenizer.bos_id()] if self.tokenizer.bos_id() else []
@@ -484,6 +623,17 @@ class Sampler(base_sampler.BaseSampler):
       cache: dict[str, dict[str, jaxtyping.Array]],
       sampler_state: _SamplingState,
   ) -> _SamplingState:
+    # [FUNCTION DOC]
+    # HELPER: picks the next token from model logits and advances the state.
+    # Uses only the last position's logits ([B, 1, V]); sets forbidden token
+    # logits to negative infinity. Beam search mode delegates to
+    # beam_search_step (passing the first EOS id as pad id) and takes its
+    # reordered cache, token buffer, done, logits and logprobs buffers. Greedy
+    # uses sample_best; top_p uses sample_top_p with a key derived by folding the
+    # decoding step into the seed; any other mode raises ValueError. For non-beam
+    # modes the token (and log-prob when buffered) is written at column
+    # decoding_step + 1. Then done is OR-ed with whether that new token is in eos.
+    # Returns a new state with decoding_step incremented and the given cache.
     """Samples a token from the logits."""
 
     logits = logits[:, -1][:, None, :]  # B, 1, V
@@ -564,6 +714,23 @@ class Sampler(base_sampler.BaseSampler):
       images: jnp.ndarray | None = None,
       echo: bool = True,
   ) -> _SamplingState:
+    # [FUNCTION DOC]
+    # HELPER (jitted with state donated and echo static): runs the prompt through
+    # the model and samples the first generated token.
+    # Slices the first num_input_tokens columns of the token buffer and positions.
+    # Builds the attention mask: the model's get_attention_mask on the non-pad
+    # mask, right-padded with zeros to cache_size, if the model provides it,
+    # otherwise utils.make_causal_attn_mask with cache_size. Merges the model
+    # from params. Passes images when given, and decode_only_last_token True when
+    # supported and echo is False. Calls the model with tokens, positions, cache,
+    # mask to get logits and the filled cache.
+    # If logits are buffered, writes them into the logits buffer starting at
+    # column num_input_tokens (last-token logits only) or column 1 (full prompt
+    # logits, shifted so the logit at i predicts token i+1).
+    # For beam search, expands all state arrays by beam size via
+    # init_batched_beam_state. Then calls the sampling helper with the model logits
+    # and self.eos_ids and returns the resulting state. Column 0 of the logits
+    # buffer never receives logits.
     """Performs prefill."""
     batch_size = sampler_state.token_buffer.shape[0]
 
@@ -681,12 +848,25 @@ class Sampler(base_sampler.BaseSampler):
       params: statelib.State,
       sampling_state: _SamplingState,
   ) -> _SamplingState:
+    # [FUNCTION DOC]
+    # HELPER (jitted with state donated): runs a lax while loop applying one
+    # sampling step per iteration while decoding_step is below
+    # total_sampling_steps and at least one row is not done. Returns the final
+    # state.
+    # KNOWN ISSUE: the last iteration runs with decoding_step equal to
+    # total_sampling_steps minus 1 and writes the token at index
+    # total_sampling_steps, which is out of bounds and silently dropped by JAX.
     """Internal generating function (to be jitted)."""
 
     def sample_with_params(sampler_state: _SamplingState):
+      # [FUNCTION DOC]
+      # HELPER: while-loop body; applies one sampling step with the captured params.
       return self._sample_step(params, sampler_state)
 
     def cond_fn(sampler_state: _SamplingState):
+      # [FUNCTION DOC]
+      # HELPER: while-loop condition; true while decoding_step is below
+      # total_sampling_steps and any row is not done.
       return (
           sampler_state.decoding_step < sampler_state.total_sampling_steps
       ) & jnp.any(jnp.logical_not(sampler_state.done))
@@ -696,6 +876,17 @@ class Sampler(base_sampler.BaseSampler):
   def _sample_step(
       self, params: statelib.State, sampler_state: _SamplingState
   ) -> _SamplingState:
+    # [FUNCTION DOC]
+    # HELPER: one decode step. Takes the token at decoding_step for each row and
+    # its position, builds the attention mask with utils.compute_attention_masks
+    # from the step, cache size and a mask of pad positions over the whole token
+    # buffer, merges the model and runs it on the single token with the cache.
+    # Calls the sampling helper, then if logits are buffered writes this step's
+    # logits at column decoding_step + 1. Returns the updated state.
+    # KNOWN ISSUE: in beam search mode the logits buffer is reordered by beam
+    # selection inside the sampling helper and afterwards this step's logits are
+    # written in the old (pre-reorder) beam order, misaligning them. Generated
+    # tokens equal to the pad id are also treated as padding in the mask.
     """Performs a single sampling step."""
     batch_size = sampler_state.token_buffer.shape[0]
     decoding_step = sampler_state.decoding_step
@@ -763,6 +954,36 @@ class Sampler(base_sampler.BaseSampler):
           | None
       ) = None,
   ) -> base_sampler.SamplerOutput:
+    # [FUNCTION DOC]
+    # Main entry point; samples completions for one or more prompts.
+    # Side effect: sets self.eos_ids to a JAX array of eos_tokens or the
+    # tokenizer EOS id.
+    # Steps: normalize input to a list; forbidden tokens to a tuple (or None);
+    # tokenize prompts; if images and an image processor are given, process images
+    # into a JAX array (otherwise raw images are passed through); compute
+    # max_prompt_length (next power of two of the longest prompt when missing or
+    # too small); left-pad prompts with the pad id; total_sampling_steps =
+    # max_prompt_length + max_generation_steps, raising ValueError if it exceeds
+    # cache_size. Seed: PRNGKey(0) if None, PRNGKey(seed) for an int, else used
+    # as given. Initialize state, run jitted prefill then jitted decode. For beam
+    # search, finalize to the top beam per prompt.
+    # Output extraction:
+    # - pad_output True: utils.padded_fill_tokens_and_logits produces fixed-length
+    #   (total steps if echo else max_generation_steps) tokens/logits and lengths;
+    #   texts decode the first length tokens; logprobs, if requested, are sliced
+    #   from start (first non-pad index if echo, else prompt length) to the first
+    #   EOS after the prompt and right-padded with zeros to that fixed length.
+    # - pad_output False: per row slices tokens (and logits/logprobs when
+    #   requested) from the same start to the first EOS index after the prompt
+    #   (EOS excluded), moved to host; texts are decoded slices.
+    # Returns SamplerOutput(text, logits list or empty list, tokens, padded prompt
+    # array, logprobs or None).
+    # Raises ValueError on cache overflow or conflicting sampling modes.
+    # KNOWN ISSUE: eos_ids is read inside the jitted functions at trace time and
+    # baked in as a constant; jit caching does not key on it, so changing
+    # eos_tokens between calls with identical shapes reuses the old EOS set.
+    # KNOWN ISSUE: the cache-size error message says must be less than but equality
+    # is allowed. top_p sampling with temperature 0 divides by zero.
     """Samples a completion of the input string.
 
     If top_p is provided, the sampling mode will be top_p.

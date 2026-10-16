@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Rollout backend that delegates generation to vLLM (JAX/TPU backend) through
+# tunix.generate.vllm_sampler. Builds the Tunix-to-vLLM weight mapping,
+# configures the vLLM engine from RolloutConfig, loads the initial weights,
+# and implements the BaseRollout interface. Per-token log-probs are taken
+# from the last generation's output rather than recomputed.
+# KNOWN ISSUE: the module docstring says "with Tunix sampler" but generation
+# uses vLLM.
 """vLLM rollout worker with Tunix sampler."""
 
 from typing import Any, Dict, Optional, Tuple
@@ -25,6 +33,9 @@ from tunix.rl.rollout import base_rollout
 
 
 class VllmRollout(base_rollout.BaseRollout):
+  # [CLASS DOC]
+  # BaseRollout implementation holding one VllmSampler. generate stores the last
+  # sampler output on attribute output, which get_per_token_logps returns.
   """vLLM rollout worker."""
 
   def __init__(
@@ -35,6 +46,22 @@ class VllmRollout(base_rollout.BaseRollout):
       mesh: jax.sharding.Mesh,
       rollout_config: base_rollout.RolloutConfig,
   ):
+    # [FUNCTION DOC]
+    # Inputs: model (Tunix model for mapping and initial weights), tokenizer,
+    # cache_config_or_size (used directly as vLLM max_model_len, so effectively an
+    # int), JAX mesh, RolloutConfig. Builds a MappingConfig for backend
+    # "vllm_jax"; creates VllmSampler with VllmConfig from rollout config fields
+    # (server mode, mapping, return_logprobs, random-weight init, TPU backend
+    # type, additional config, DP attention, HBM utilization, LoRA config, mesh,
+    # tensor/data/expert parallel sizes, delete-dst-buffers, reshard chunk size,
+    # sampling kwargs) and engine kwargs: model version, max_model_len, async
+    # scheduling, max batched tokens, max sequences, HF config path, max_logprobs
+    # fixed to 1 (only sampled-token logprobs), logprobs mode, then any
+    # rollout_vllm_kwargs (which may override earlier keys). Then loads the
+    # model's nnx state into the engine. Side effects: engine startup, weight
+    # transfer.
+    # KNOWN ISSUE: if a CacheConfig object is passed instead of an int it is
+    # forwarded as max_model_len unchanged.
     mapping_config = mappings.MappingConfig.build(
         mapping_obj=rollout_config.rollout_mapping_config,
         model=model,
@@ -83,6 +110,8 @@ class VllmRollout(base_rollout.BaseRollout):
 
   @property
   def mesh(self) -> jax.sharding.Mesh:
+    # [FUNCTION DOC]
+    # Property returning the sampler's device mesh.
     return self._sampler.mesh
 
   def generate(
@@ -91,6 +120,13 @@ class VllmRollout(base_rollout.BaseRollout):
       rollout_config: base_rollout.RolloutConfig,
       **kwargs,
   ) -> base_rollout.RolloutOutput:
+    # [FUNCTION DOC]
+    # Inputs: prompts, RolloutConfig, extra kwargs forwarded to the sampler.
+    # Calls the sampler with generation length, max prompt length, temperature,
+    # top_p, top_k, seed, echo off and padded outputs; stores the result on
+    # self.output. Returns RolloutOutput with text, no logits, tokens, left-padded
+    # prompt tokens and logprobs.
+    # KNOWN ISSUE: rollout_config.eos_tokens is not forwarded.
     """Generates samples from the model."""
     self.output = self._sampler(
         input_strings=prompts,
@@ -118,6 +154,12 @@ class VllmRollout(base_rollout.BaseRollout):
       prompt_tokens: jax.Array,
       completion_tokens: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Ignores its token inputs and returns the logprobs from the most recent
+    # generate call (stored on self.output).
+    # KNOWN ISSUE: raises AttributeError if generate has not been called, and
+    # returns stale/mismatched values if the given tokens are not the last
+    # generated batch; despite the comment, it does return self.output.logprobs.
     """Returns per-token log probabilities from the rollout policy."""
     # b/428730696, we cannot return self.output.logprobs yet
     # May need to validate if there will be any difference from recalculation
@@ -128,13 +170,22 @@ class VllmRollout(base_rollout.BaseRollout):
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Forwards params and optional filter_types to the sampler's update_params
+    # to sync new weights into vLLM. Returns None.
     self._sampler.update_params(params, filter_types)
 
   def pad_id(self) -> int:
+    # [FUNCTION DOC]
+    # Returns the sampler tokenizer's pad id.
     return self._sampler.tokenizer.pad_id()
 
   def eos_id(self) -> int:
+    # [FUNCTION DOC]
+    # Returns the sampler tokenizer's EOS id.
     return self._sampler.tokenizer.eos_id()
 
   def model(self) -> nnx.Module:
+    # [FUNCTION DOC]
+    # Returns the sampler's transformer object.
     return self._sampler.transformer

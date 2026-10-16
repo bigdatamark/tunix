@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Sphinx configuration for the Tunix documentation site. Executed by sphinx-build; defines module-level
+# settings only: project metadata (name Tunix, copyright, author), extensions (myst_nb, sphinx_gallery,
+# sphinx_collections, autodoc, autosummary, intersphinx, napoleon), templates path, exclude patterns,
+# source suffixes (rst, md, ipynb), HTML theme options, sphinx-gallery and collections config,
+# suppressed warnings, autodoc defaults (members, imported-members, undoc-members), intersphinx
+# mappings for optax/flax/jax, and a setup hook that installs a log filter.
+# Inputs: none (read by Sphinx). Outputs: module globals consumed by Sphinx. Side effects: setup() mutates
+# the "sphinx" logger's warning handler.
+# KNOWN ISSUE: in exclude_patterns two string literals (the from_safetensor_load glob and the rl README
+# path) are adjacent without a comma, so they concatenate into one bogus pattern and neither is excluded.
 """Configuration file for the Sphinx documentation builder.
 
 For the full list of built-in configuration values, see the documentation:
@@ -125,6 +136,9 @@ intersphinx_mapping = {
 
 
 class FilterSphinxWarnings(logging.Filter):
+  # [CLASS DOC]
+  # logging.Filter that drops Sphinx log records whose message (stripped) starts with
+  # "duplicate object description" (autosummary noise). Holds the Sphinx app object.
   """Filter autosummary 'duplicate object description' warnings.
 
   These warnings are unnecessary as they do not cause missing documentation
@@ -132,16 +146,28 @@ class FilterSphinxWarnings(logging.Filter):
   """
 
   def __init__(self, app):
+    # [FUNCTION DOC]
+    # HELPER: stores the given Sphinx app on self.app, then calls the base Filter constructor (no name).
+    # Inputs: app (Sphinx application). Outputs: none. Raises: nothing.
     self.app = app
     super().__init__()
 
   def filter(self, record: logging.LogRecord) -> bool:
+    # [FUNCTION DOC]
+    # Returns False (drop record) if the record's formatted message, stripped of whitespace, starts with
+    # "duplicate object description"; otherwise True (keep). Inputs: record (LogRecord). Output: bool.
+    # Raises: whatever record.getMessage raises on bad format args. No side effects.
     msg = record.getMessage()
     filter_out = ("duplicate object description",)
     return not msg.strip().startswith(filter_out)
 
 
 def setup(app):
+# [FUNCTION DOC]
+# Sphinx extension hook. Gets the "sphinx" logger, finds handlers that are Sphinx WarningStreamHandler
+# instances, takes the first, and inserts a FilterSphinxWarnings(app) at position 0 of its filters.
+# Inputs: app (Sphinx application). Output: none. Raises ValueError (unpacking) if no
+# WarningStreamHandler is attached. Side effect: mutates global logging handler filters.
   """Set up custom logging filters."""
   logger = logging.getLogger("sphinx")
   warning_handler, *_ = [

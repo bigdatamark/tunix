@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Flax NNX SigLIP vision encoder used by Gemma 3 multimodal models.
+# Images [B, N, H, W, C] are flattened to B*N images, patchified by a strided
+# convolution (ViT patch embedding), given learned absolute position
+# embeddings, passed through a stack of pre-LayerNorm transformer encoder
+# blocks (bidirectional multi-head self-attention + GELU MLP) and a final
+# LayerNorm, optionally average-pooled down to a fixed number of soft tokens
+# per image (VisionExit), reshaped back to [B, N, tokens, width], and
+# (by default) wrapped in stop_gradient so the vision tower is frozen.
+# Contents: SigLIPShardingConfig, SigLIPConfig, VisionAttention, MlpBlock,
+# Encoder1DBlock, Encoder, ViTModel, VisionExit, SigLiP. Sharding constraints
+# are applied only when a SigLIPShardingConfig is provided.
 """Gemma 3 vision encoder implementation."""
 
 from __future__ import annotations
@@ -32,6 +44,12 @@ from tunix.utils import sharding_utils
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class SigLIPShardingConfig:
+  # [CLASS DOC]
+  # Frozen dataclass of partition-spec tuples for SigLIP weights (patch conv
+  # kernel/bias, position embedding, q/k/v and output kernels/biases, MLP fc1/fc2
+  # kernels/biases, layer norms) and activations (act_btd for [B, T, D],
+  # act_bnts for attention logits [B, N, T, S], act_bhwd for patch grid
+  # [B, H, W, D]).
   """Sharding configuration for SigLIP vision encoder."""
 
   emb_patch_kernel: Tuple[str | None, ...]
@@ -55,6 +73,11 @@ class SigLIPShardingConfig:
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False):
+    # [FUNCTION DOC]
+    # Static factory returning the default SigLIP sharding: weights shard their
+    # model dimension on 'tp' and the other on 'fsdp' (None when is_sampling);
+    # activations shard batch on 'fsdp' (None when sampling) and features or
+    # heads on 'tp'.
     fsdp = "fsdp" if not is_sampling else None
     return SigLIPShardingConfig(
         emb_patch_kernel=(None, None, None, "tp"),
@@ -78,6 +101,13 @@ class SigLIPShardingConfig:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class SigLIPConfig:
+  # [CLASS DOC]
+  # Keyword-only dataclass of SigLIP hyperparameters: tokens per image before
+  # (4096) and after (256) pooling, expected image height/width/channels
+  # (896, 896, 3), image_mean/std (127.5; not used in this module),
+  # soft_token_placeholder id (219) marking image positions in the text,
+  # patch_size (14, 14), width 1152, depth 27, mlp_dim 4304, num_heads 16,
+  # dropout 0.0.
   """SigLIP vision encoder config."""
 
   num_mm_tokens_per_image_prepool: int = 4096
@@ -100,6 +130,10 @@ class SigLIPConfig:
 
 
 class VisionAttention(nnx.Module):
+  # [CLASS DOC]
+  # Standard bidirectional multi-head self-attention with separate q/k/v/out
+  # linear projections (with biases), scaled dot-product attention, dropout on
+  # attention probabilities, and optional activation sharding constraints.
   """Attention layer."""
 
   def __init__(
@@ -112,6 +146,12 @@ class VisionAttention(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: hidden_dim, num_heads, dropout rate, rngs, dtype_mm (param dtype,
+    # default float32), optional shd_config. head_dim = hidden_dim // num_heads.
+    # Creates query/key/value/out nnx.Linear (hidden -> hidden) with
+    # xavier-uniform kernels and normal(1e-6) biases, partitioned by shd_config
+    # when given, and an nnx.Dropout. Stores configuration.
     self.hidden_dim = hidden_dim
     self.num_heads = num_heads
     self.head_dim = hidden_dim // num_heads
@@ -178,6 +218,12 @@ class VisionAttention(nnx.Module):
     self.shd_config = shd_config
 
   def __call__(self, x: jax.Array, deterministic: bool = True) -> jax.Array:
+    # [FUNCTION DOC]
+    # Input x [B, T, D]; deterministic disables dropout (default True).
+    # Projects q, k, v, reshapes to [B, T, N, H], logits = q.k / sqrt(H) as
+    # [B, N, T, S], softmax over keys (no mask), dropout, weighted sum of values
+    # reshaped to [B, T, D], output projection. Applies sharding constraints
+    # when configured. Returns [B, T, D].
     batch_size, seq_length, _ = x.shape
     desired_shape = (batch_size, seq_length, self.num_heads, self.head_dim)
 
@@ -216,6 +262,9 @@ class VisionAttention(nnx.Module):
 
 
 class MlpBlock(nnx.Module):
+  # [CLASS DOC]
+  # Two-layer MLP: fc1 (width -> mlp_dim, default 4*width), tanh-approximate
+  # GELU, dropout, fc2 (mlp_dim -> width).
   """Transformer MLP / feed-forward block."""
 
   def __init__(
@@ -229,6 +278,10 @@ class MlpBlock(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Stores block_id, mlp_dim, dropout rate, dtype_mm and width, creates fc1
+    # and fc2 nnx.Linear (xavier-uniform kernels, normal(1e-6) biases, optional
+    # sharding) and an nnx.Dropout.
     self.block_id = block_id
     self.mlp_dim = mlp_dim
     self.dropout_rate = dropout
@@ -270,6 +323,9 @@ class MlpBlock(nnx.Module):
   def __call__(
       self, x: jaxtyping.ArrayLike, deterministic: bool = True
   ) -> jaxtyping.ArrayLike:
+    # [FUNCTION DOC]
+    # Applies fc1, approximate GELU, dropout (unless deterministic) and fc2,
+    # with act_btd sharding constraints when configured. Returns same shape as x.
     """Applies Transformer MlpBlock module.
 
     Args:
@@ -297,6 +353,9 @@ class MlpBlock(nnx.Module):
 
 
 class Encoder1DBlock(nnx.Module):
+  # [CLASS DOC]
+  # Pre-norm transformer encoder block: x + dropout(attn(ln1(x))) followed by
+  # x + dropout(mlp(ln2(x))). LayerNorm epsilon 1e-6.
   """Single transformer encoder block (MHSA + MLP)."""
 
   def __init__(
@@ -311,6 +370,10 @@ class Encoder1DBlock(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Keyword-only inputs width, block_id, mlp_dim, num_heads (default 12),
+    # dropout, rngs, dtype_mm, shd_config. Creates ln1, VisionAttention,
+    # dropout, ln2 and MlpBlock and stores the configuration.
     self.ln1 = nnx.LayerNorm(
         num_features=width,
         epsilon=1e-6,
@@ -366,6 +429,9 @@ class Encoder1DBlock(nnx.Module):
   def __call__(
       self, x: jaxtyping.ArrayLike, deterministic: bool = True
   ) -> jaxtyping.ArrayLike:
+    # [FUNCTION DOC]
+    # Runs the two residual sub-blocks described in the class doc; dropout is
+    # disabled when deterministic. Returns [B, T, D].
     """Applies Encoder1DBlock module.
 
     Args:
@@ -389,6 +455,9 @@ class Encoder1DBlock(nnx.Module):
 
 
 class Encoder(nnx.Module):
+  # [CLASS DOC]
+  # Stack of `depth` Encoder1DBlocks followed by a final LayerNorm
+  # (encoder_norm, epsilon 1e-6).
   """Transformer Model Encoder for sequence to sequence translation."""
 
   def __init__(
@@ -403,6 +472,8 @@ class Encoder(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Creates the block list (block_id = index) and encoder_norm; stores config.
     self.blocks = compat.ModuleList([
         Encoder1DBlock(
             width=width,
@@ -440,6 +511,8 @@ class Encoder(nnx.Module):
   def __call__(
       self, x: jaxtyping.ArrayLike, deterministic: bool = True
   ) -> jaxtyping.ArrayLike:
+    # [FUNCTION DOC]
+    # Applies every block in order then the final LayerNorm. Returns [B, T, D].
     """Applies Encoder module.
 
     Args:
@@ -457,6 +530,10 @@ class Encoder(nnx.Module):
 
 
 class ViTModel(nnx.Module):
+  # [CLASS DOC]
+  # Vision Transformer backbone: non-overlapping patch embedding via nnx.Conv
+  # (kernel = stride = patch_size, VALID padding), learned position embedding
+  # [1, num_patches, width], dropout and the Encoder.
   """ViT model.
 
   Attributes:
@@ -485,6 +562,13 @@ class ViTModel(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Creates the patch conv (lecun-normal kernel, zero bias, param dtype
+    # dtype_mm), pos_embedding with num_patches = (H // ph) * (W // pw) drawn from
+    # normal(1/sqrt(width)), dropout and Encoder; stores configuration.
+    # KNOWN ISSUE: the inline comment says 896x896 images with 14x14 patches give
+    # 16x16=256 patches, but they give 64x64=4096 patches (256 is the pooled
+    # count produced later by VisionExit).
     self.embedding = nnx.Conv(
         in_features=image_channels,
         out_features=width,
@@ -544,6 +628,11 @@ class ViTModel(nnx.Module):
       *,
       train: bool = False,
   ) -> jaxtyping.ArrayLike:
+    # [FUNCTION DOC]
+    # Input image [B, H, W, C]; train enables dropout. Casts to dtype_mm, applies
+    # the patch conv ([B, h, w, width]), flattens patches to [B, h*w, width], adds
+    # position embeddings, applies dropout and the encoder. Returns
+    # [B, num_patches, width]. Image size must match the configured size.
     """Applies ViTModel module.
 
     Args:
@@ -575,6 +664,9 @@ class ViTModel(nnx.Module):
 
 
 class VisionExit(nnx.Module):
+  # [CLASS DOC]
+  # Downsamples soft tokens by spatial average pooling to output_length tokens
+  # (both lengths assumed to be perfect squares).
   """The vision exit layer.
 
   Possibly downsample the soft tokens to a required output length.
@@ -584,11 +676,18 @@ class VisionExit(nnx.Module):
   """
 
   def __init__(self, *, output_length: int = 256, rngs: nnx.Rngs):  # pylint: disable=unused-argument
+    # [FUNCTION DOC]
+    # Stores output_length (default 256); rngs is accepted but unused.
     self.output_length = output_length
 
   def __call__(
       self, x: jaxtyping.ArrayLike  # B INPUT_LENGTH D
   ) -> jaxtyping.ArrayLike:  # B OUTPUT_LENGTH D
+    # [FUNCTION DOC]
+    # Input x [B, L, D]. Returns x unchanged if L == output_length; otherwise
+    # reshapes to a sqrt(L) x sqrt(L) grid, average-pools with a square window
+    # and stride of sqrt(L) // sqrt(output_length), and flattens back to
+    # [B, output_length, D].
     """Applies VisionExit module.
 
     Args:
@@ -612,6 +711,10 @@ class VisionExit(nnx.Module):
 
 
 class SigLiP(nnx.Module):
+  # [CLASS DOC]
+  # Complete SigLIP image tower for Gemma 3: ViTModel encoder (siglip_encoder)
+  # plus VisionExit pooling (siglip_exit), mapping batches of multiple images to
+  # per-image soft-token embeddings, optionally with gradients stopped.
   """SigLIP vision encoder."""
 
   def __init__(
@@ -623,6 +726,11 @@ class SigLiP(nnx.Module):
       dtype_mm: jnp.dtype = jnp.float32,
       shd_config: SigLIPShardingConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: config (SigLIPConfig), apply_stop_gradient (default True), rngs
+    # (defaults to nnx.Rngs(0) if None), dtype_mm, shd_config. Builds the
+    # ViTModel (siglip_encoder) from config and the VisionExit (siglip_exit) with
+    # output length num_mm_tokens_per_image; stores config and the flag.
     if rngs is None:
       rngs = nnx.Rngs(0)
 
@@ -652,6 +760,14 @@ class SigLiP(nnx.Module):
       self,
       images: jaxtyping.ArrayLike,  # B N H W C
   ) -> jaxtyping.ArrayLike:  # B N siglip_embed_dim
+    # [FUNCTION DOC]
+    # Input images [B, N, H, W, C]. Flattens to [B*N, H, W, C], encodes with
+    # the ViT, pools via siglip_exit when the configured pre-pool and post-pool
+    # token counts differ (asserting the resulting length), reshapes to
+    # [B, N, tokens, width], and applies stop_gradient when configured.
+    # Raises AssertionError if pooling yields an unexpected length.
+    # KNOWN ISSUE: the trailing comment says the output is
+    # [B, N, siglip_embed_dim] but it is 4D [B, N, tokens, width].
     """Applies SigLiP module.
 
     Args:

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.feature_extraction.pooling
+# .avg_pool_array_to_target_shape, which average-pools an array (any rank)
+# down to a target shape of equal rank, deriving per-dimension window and
+# stride, with VALID or SAME padding (optionally counting padded zeros in the
+# average for SAME), and raising ValueError for rank mismatch or target
+# dimensions outside [1, input_dim].
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax.numpy as jnp
@@ -20,6 +27,8 @@ from tunix.distillation.feature_extraction import pooling
 
 
 class AvgPoolArrayToTargetShapeTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for avg_pool_array_to_target_shape.
 
   @parameterized.named_parameters(
       # VALID padding tests
@@ -109,6 +118,10 @@ class AvgPoolArrayToTargetShapeTest(parameterized.TestCase):
       padding_mode: pooling.PaddingMode,
       count_include_pad_for_same_padding: bool,
   ):
+    # [FUNCTION DOC]
+    # Verifies the output shape equals target_shape for VALID and SAME padding
+    # across 1D-3D inputs (arange values). Inputs: input_shape, target_shape,
+    # padding_mode, count_include_pad_for_same_padding.
     """Tests if the function produces the correct output shape for valid inputs."""
     result = pooling.avg_pool_array_to_target_shape(
         input_array=jnp.arange(np.prod(input_shape), dtype=jnp.float32).reshape(
@@ -122,6 +135,9 @@ class AvgPoolArrayToTargetShapeTest(parameterized.TestCase):
     result.block_until_ready()
 
   def test_same_padding_count_include_pad_effect_on_values(self):
+    # [FUNCTION DOC]
+    # Verifies SAME padding values for [1..5] -> 2 elements: including pad in the
+    # count gives [2.0, 3.0]; excluding it gives [2.0, 4.5].
     input_arr = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=jnp.float32)
     target_shape = (2,)
 
@@ -179,6 +195,9 @@ class AvgPoolArrayToTargetShapeTest(parameterized.TestCase):
       target_shape: tuple[int, ...],
       error_msg_regex: str,
   ):
+    # [FUNCTION DOC]
+    # Verifies ValueError with exact messages for rank mismatch, a target
+    # dimension larger than the input dimension, and a zero target dimension.
     with self.assertRaisesRegex(ValueError, error_msg_regex):
       pooling.avg_pool_array_to_target_shape(
           jnp.arange(np.prod(input_shape), dtype=jnp.float32).reshape(

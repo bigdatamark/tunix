@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Package for the llama3 model family. Re-exports the submodules model (network
+# definition and config) and params (checkpoint loading), and defines
+# BACKEND_MAPPINGS: a dict mapping rollout backend name strings ('vllm_jax',
+# 'sglang_jax') to the weight-name mapping objects defined in mapping_vllm_jax
+# (VLLM_JAX_MAPPING) and mapping_sglang_jax (SGLANG_JAX_MAPPING). These mappings
+# are used to translate tunix parameter names/layouts into the naming used by the
+# corresponding inference engine when syncing weights.
+# Inputs/outputs: none at import time beyond the exported names in __all__
+# (BACKEND_MAPPINGS, model, params). Side effects: imports the four submodules.
+# Raises: only import errors from submodules.
 """Llama3 API."""
 
 from tunix.models.llama3 import mapping_sglang_jax

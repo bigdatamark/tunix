@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Orbax (v0 API) checkpoint manager wrapper used by PEFT/SFT trainers.
+# Saves/restores a composite checkpoint with items "model_params"
+#   (nnx.state of the model, optionally only LoRA params),
+#   "optimizer_state" (nnx OptState of the optimizer, optional) and
+#   "custom_metadata" (JSON). Module constant _DEFAULT_CHECKPOINTING_OPTIONS:
+#   continuous saving at most every 180 s, keep 3 checkpoints.
+# No side effects at import beyond constructing the default options.
 """Checkpoint manager for PEFT."""
 
 import os
@@ -32,6 +40,9 @@ _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
 
 
 class CheckpointManager:
+  # [CLASS DOC]
+  # Wraps ocp.CheckpointManager (attribute _checkpoint_manager, None when
+  # disabled). All methods are no-ops / neutral returns when disabled.
   """Checkpoint manager for PEFT."""
 
   def __init__(
@@ -39,6 +50,18 @@ class CheckpointManager:
       root_directory: str | None = None,
       options: ocp.CheckpointManagerOptions | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: root_directory (None disables checkpointing), options (Orbax
+    #   v0 CheckpointManagerOptions; None uses the module default).
+    # Behavior: if root_directory is given, choose item handlers: when the
+    #   JAX_PLATFORMS env var contains "proxy" (Pathways), use
+    #   PyTreeCheckpointHandler with use_ocdbt=False and use_zarr3=False for
+    #   model_params and optimizer_state and log info if
+    #   ENABLE_PATHWAYS_PERSISTENCE is set, else warn about OOM risk;
+    #   otherwise default PyTreeCheckpointHandlers. Add a
+    #   JsonCheckpointHandler for custom_metadata and create the Orbax
+    #   CheckpointManager at root_directory.
+    # Exceptions: from Orbax. Side effects: may create directories; logging.
     """Initializes the checkpoint manager.
 
     Args:
@@ -83,6 +106,9 @@ class CheckpointManager:
       )
 
   def latest_step(self) -> int | None:
+    # [FUNCTION DOC]
+    # Returns the latest saved step from Orbax, or None if disabled or no
+    # checkpoints exist.
     """Returns the latest step."""
     if self._checkpoint_manager is None:
       return None
@@ -97,6 +123,17 @@ class CheckpointManager:
       force: bool = False,
       custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
+    # [FUNCTION DOC]
+    # Inputs: step, model, optimizer (optional), save_only_lora_params,
+    #   force, custom_metadata (optional dict).
+    # Steps: return False if disabled, or if not force and Orbax
+    #   should_save(step) is False. params = nnx.state(model, LoRAParam) if
+    #   save_only_lora_params else full nnx.state(model). Build PyTreeSave
+    #   args with default SaveArgs per leaf; if optimizer given, also save
+    #   nnx.state(optimizer, OptState) the same way. Call Orbax save with a
+    #   Composite of those, custom_metadata (or {}), and force.
+    # Output: bool returned by Orbax save (whether saved).
+    # Side effects: writes checkpoint files (possibly asynchronously).
     """Saves the params for the given step.
 
     Args:
@@ -149,6 +186,21 @@ class CheckpointManager:
       step: int | None = None,
       restore_only_lora_params: bool = False,
   ) -> Tuple[int, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Inputs: model, optimizer (optional), step (None = latest),
+    #   restore_only_lora_params.
+    # Steps: if disabled return (0, {}); if step None use latest, and if
+    #   none exists return (0, {}). Read checkpoint metadata. Abstract
+    #   target = nnx.state(model[, LoRAParam]) with restore args built from
+    #   it (keeps target shardings). If optimizer given and checkpoint has
+    #   optimizer_state, target the optimizer OptState with shardings fixed
+    #   by fix_sharding, restore both and nnx.update the optimizer; else
+    #   restore model params only. nnx.update the model; log duration.
+    # Output: (restored step, checkpoint custom_metadata or {}).
+    # Exceptions: Orbax errors (e.g. missing step, structure mismatch).
+    # Side effects: mutates model and optimizer in place.
+    # KNOWN ISSUE: docstring says it returns only the step and raises
+    #   RuntimeError; it returns a tuple and raises whatever Orbax raises.
     """Restores the params from the latest checkpoint if available and updates the model provided.
 
     Args:
@@ -191,6 +243,15 @@ class CheckpointManager:
     )
 
     def fix_sharding(state):
+      # [FUNCTION DOC]
+      # HELPER: nested. Input: state (optimizer state pytree). Maps leaves
+      #   to their shardings; if any leaf has a NamedSharding, returns
+      #   nnx.get_named_sharding(optimizer_state, that sharding's mesh) so
+      #   scalar leaves (step/count on a single device) become mesh-placed
+      #   per their partition annotations; otherwise returns the raw
+      #   sharding tree.
+      # KNOWN ISSUE: uses the enclosing variable optimizer_state instead of
+      #   its state argument (they are the same object at the only call).
       # Scalar values in optimizer states like step and count is initialized as
       # SingleDeviceSharding, which will fail if optimizer is sharded. To fix
       # it, we will replicate the scalar values.
@@ -240,6 +301,9 @@ class CheckpointManager:
     return step, custom_metadata
 
   def close(self):
+    # [FUNCTION DOC]
+    # Closes the Orbax manager (waits for pending async saves) if enabled;
+    # otherwise no-op.
     """Closes the checkpoint manager."""
     if self._checkpoint_manager is None:
       return

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines ToolManager, which instantiates tool classes once, exposes their schemas
+# and executes calls by name, converting every failure into a ToolOutput with an
+# error string instead of raising. Supports sync, async and batched (thread-pool
+# parallel or sequential) execution. Uses uuid4 to id calls that lack an id.
 """Manages and executes tools for an agentic system."""
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ from tunix.rl.agentic.tools import base_tool
 
 
 class ToolManager:
+  # [CLASS DOC]
+  # Registry and executor of tool instances. State: a private dict mapping tool name
+  # to BaseTool instance (insertion ordered). Instances are created in the
+  # constructor from a name-to-class map, or added later via register_mcp_tool.
   """Centralized router and executor for managing multiple tools in an agent system.
 
   The ToolManager provides a unified interface for tool registration, discovery,
@@ -44,6 +53,15 @@ class ToolManager:
       *,
       desc_fallback: str = "",
   ):
+    # [FUNCTION DOC]
+    # Instantiate each tool class.
+    # Inputs: tool_map, mapping tool name to BaseTool subclass; keyword-only
+    # desc_fallback (default "") used when a class has no docstring.
+    # Behavior: for each entry, rejects abstract classes, then constructs the class
+    # with keyword arguments name (the map key) and description (the class docstring,
+    # or desc_fallback if missing/empty) and stores it under the key.
+    # Exceptions: TypeError for abstract classes (message names the key and class);
+    # anything the tool constructor raises.
     """Initialize the tool manager with a collection of tool classes.
 
     Instantiates all provided tool classes with appropriate names and
@@ -70,6 +88,8 @@ class ToolManager:
 
   @property
   def names(self) -> List[str]:
+    # [FUNCTION DOC]
+    # Property: list of registered tool names in insertion order.
     """Get a list of all registered tool names.
 
     Returns:
@@ -78,6 +98,8 @@ class ToolManager:
     return list(self._tool_dict.keys())
 
   def get_tools(self) -> List[base_tool.BaseTool]:
+    # [FUNCTION DOC]
+    # Return a new list of registered tool instances in insertion order.
     """Get a list of all registered tool instances.
 
     Returns:
@@ -86,6 +108,8 @@ class ToolManager:
     return list(self._tool_dict.values())
 
   def get_json_schema(self) -> List[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Return the list of each tool's get_json_schema() result (OpenAI format).
     """Get OpenAI-compatible JSON schemas for all registered tools.
 
     Generates function metadata suitable for injection into LLM prompts
@@ -98,6 +122,8 @@ class ToolManager:
     return [tool.get_json_schema() for tool in self._tool_dict.values()]
 
   def get_mcp_schema(self) -> List[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Return the list of each tool's to_mcp_json() result.
     """Get MCP (Model Context Protocol) compatible tool metadata.
 
     Provides tool definitions in the standardized MCP format used by
@@ -110,6 +136,9 @@ class ToolManager:
     return [tool.to_mcp_json() for tool in self._tool_dict.values()]
 
   def register_mcp_tool(self, tool: base_tool.BaseTool):
+    # [FUNCTION DOC]
+    # Add an already-constructed tool keyed by its name attribute, replacing any
+    # existing tool with the same name. Side effects: mutates the registry.
     """Register a pre-instantiated MCP-compatible tool.
 
     Adds a tool instance directly to the registry, useful for tools
@@ -122,6 +151,12 @@ class ToolManager:
     self._tool_dict[tool.name] = tool
 
   def run(self, tool_name: str, **kwargs: Any) -> base_tool.ToolOutput:
+    # [FUNCTION DOC]
+    # Run one tool synchronously.
+    # Inputs: tool_name; keyword arguments forwarded to the tool's apply.
+    # Outputs: the tool's ToolOutput; if the name is unknown, a ToolOutput with
+    # error "Tool '<name>' not registered."; if apply raises any Exception, a
+    # ToolOutput with error "<ExceptionType>: <message>". Never raises Exception.
     """Execute a single tool by name with the provided arguments.
 
     Looks up the tool in the registry, executes it with the given parameters,
@@ -152,6 +187,9 @@ class ToolManager:
   async def run_async(
       self, tool_name: str, **kwargs: Any
   ) -> base_tool.ToolOutput:
+    # [FUNCTION DOC]
+    # Coroutine version of run that awaits the tool's apply_async; same unknown-name
+    # and exception-to-error handling.
     """Asynchronously execute a single tool by name with the provided arguments.
 
     Looks up the tool in the registry, executes it with the given parameters,
@@ -182,6 +220,21 @@ class ToolManager:
   def execute_calls(
       self, calls: List[base_tool.ToolCall], parallel: bool = True
   ) -> Dict[str, str]:
+    # [FUNCTION DOC]
+    # Execute a batch of tool calls and return string outputs.
+    # Inputs: calls, list of ToolCall (arguments must be a mapping, unpacked as
+    # keyword args); parallel flag (default True).
+    # Behavior: each call's id is its "id" attribute if present and truthy, else a new
+    # uuid4 string. Sequential mode runs each call via run in order. Parallel mode
+    # submits each run to a ThreadPoolExecutor (default worker count) and collects
+    # results as they complete; an exception from a future is stored as
+    # "Error: <Type>: <message>".
+    # Outputs: dict mapping call id to str(ToolOutput) (i.e. its display repr).
+    # Exceptions: TypeError if a call's arguments is not a mapping (raised at
+    # submission/run time, outside the per-call guard).
+    # Side effects: tool execution; thread creation in parallel mode.
+    # KNOWN ISSUE: ToolCall has no id field, so ids are always fresh uuids and cannot
+    # be correlated by callers; and if two calls share an id, outputs overwrite.
     """Execute multiple tool calls with optional parallel processing.
 
     Processes a batch of tool calls either sequentially or in parallel

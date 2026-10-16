@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utilities to capture intermediate layer outputs of nnx models via sowing.
+# Defines SowedModule (wrapper that stores its wrapped module's output as
+#   nnx.Intermediate state), pop_sowed_intermediate_outputs, and in-place
+#   wrap/unwrap utilities that replace submodules of given types inside a
+#   model graph. No side effects at import.
 """Utilities for wrapping nnx.Modules to capture their outputs."""
 
 from absl import logging
@@ -19,6 +25,12 @@ from flax import nnx
 
 
 class SowedModule(nnx.Module):
+  # [CLASS DOC]
+  # nnx.Module wrapper. Attribute wrapped_model holds the original module;
+  # class constant _SOW_TAG = "intermediate_output" is the sow name. On each
+  # call it runs the wrapped module and sows its output as nnx.Intermediate
+  # under that tag (nnx default sow semantics append to a tuple per call).
+  # Works under nnx.jit.
   """Wraps an nnx.Module to capture its final output using `sow`.
 
   The captured output is stored in this wrapper module's state
@@ -29,9 +41,17 @@ class SowedModule(nnx.Module):
   _SOW_TAG = "intermediate_output"  # Tag to store the output under
 
   def __init__(self, model_to_wrap: nnx.Module):
+    # [FUNCTION DOC]
+    # Input: model_to_wrap (nnx module). Stores it as wrapped_model.
+    # No output, exceptions, or side effects.
     self.wrapped_model = model_to_wrap
 
   def __call__(self, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Inputs: any args/kwargs. Calls wrapped_model with them, logs a debug
+    #   message (wrapped type name and tag), sows the output as
+    #   nnx.Intermediate under _SOW_TAG and returns the output unchanged.
+    # Side effects: adds intermediate state to this module; logging.
     # Execute the wrapped model's forward pass
     output = self.wrapped_model(*args, **kwargs)
     # Sow the output into this wrapper's state
@@ -47,6 +67,10 @@ class SowedModule(nnx.Module):
 def pop_sowed_intermediate_outputs(
     model: nnx.Module,
 ) -> nnx.State:
+  # [FUNCTION DOC]
+  # HELPER: Input: model. Returns nnx.pop(model, nnx.Intermediate), i.e. an
+  #   nnx.State containing all sown intermediates, removing them from the
+  #   model. Side effect: model's intermediate state is cleared.
   """Returns the intermediate output from a model."""
   return nnx.pop(model, nnx.Intermediate)
 
@@ -55,6 +79,23 @@ def wrap_model_with_sowed_modules(
     model: nnx.Module,
     modules_to_capture: list[type[nnx.Module]],
 ):
+  # [FUNCTION DOC]
+  # Wraps matching submodules in place.
+  # Inputs: model (root module); modules_to_capture (list of classes).
+  # Steps: iterate model.iter_modules() collecting (path, SowedModule(m))
+  #   for each module that is an instance of any listed class and is not
+  #   itself a SowedModule. Then for each: if path is empty (the root)
+  #   raise ValueError; walk path[:-1] from the root (string parts via
+  #   attribute access, int parts via indexing, other types -> TypeError);
+  #   skip if that parent is a SowedModule; else set the last key (string
+  #   -> setattr, int -> item assignment, else TypeError) to the wrapper.
+  # Output: None. Side effects: mutates model.
+  # KNOWN ISSUE: docstring says it returns the number of wrapped layers,
+  #   but it returns None.
+  # KNOWN ISSUE: errors (e.g. root matched) can be raised after some
+  #   replacements were already applied, leaving the model partially
+  #   wrapped; nested matches may fail path traversal once an outer
+  #   ancestor was replaced by a wrapper.
   """Wrap the layers of a model with a SowedModule to capture their outputs.
 
   Recursively finds instances of `modules_to_capture` within the `model`
@@ -121,6 +162,17 @@ def wrap_model_with_sowed_modules(
 
 
 def unwrap_sowed_modules(model: nnx.Module):
+  # [FUNCTION DOC]
+  # Unwraps SowedModule instances in place. Input: model.
+  # Steps: collect (path, module.wrapped_model) for every SowedModule from
+  #   iter_modules (ValueError if one lacks wrapped_model); for each: empty
+  #   path -> ValueError; walk path[:-1] (str via getattr, int via index,
+  #   else TypeError); set last key to the original module (str setattr,
+  #   int item assignment, else TypeError).
+  # Output: None. Side effects: mutates model.
+  # KNOWN ISSUE: the root-module error message suggests reassigning the
+  #   result of a non-existent function unwrap_module_instances; this
+  #   function returns None.
   """Unwraps all instances of `SowedModule` from a model.
 
   Recursively finds instances of `SowedModule` within the `model`

@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Static weight mappings from tunix Qwen2 parameters to the vLLM JAX backend,
+# which here uses Hugging Face style names ('...weight'). Defines
+# TO_HF_MAPPINGS (base params), LORA_TO_HF_MAPPINGS (LoRA params, tunix
+# '<kernel|w>_lora_a/_lora_b' -> '*.weight_lora_a/_lora_b') and
+# VLLM_JAX_MAPPING = {'to_hf_mappings', 'lora_to_hf_mappings',
+# 'to_hf_transpose_keys' (any key containing 'embedding' transposed (1, 0)),
+# 'to_hf_hook_fns' (None)}. Sharding axis name is 'model': embedding on vocab
+# dim, MLP down on input dim, gate/up on output dim, q/k/v on heads dim 1, o on
+# dim 0, lm_head on dim 1, norms replicated, q/k/v biases sharded on dim 0.
+# Mapping entries are (target name pattern, sharding spec), where "*" in a
+# tunix path stands for the layer index and is substituted into the target, and
+# the sharding spec is a tuple of mesh axis names (or None for replicated) per
+# tensor dimension. The consumer (tunix weight-sync utilities) uses these to
+# rename, reshard and optionally transpose tunix parameters when pushing them
+# into the inference engine. No runtime behavior beyond building these dicts at
+# import time; nothing raises.
+# The LoRA map also covers q/k/v bias LoRA params (attn.*_bias_lora_a/b ->
+# self_attn.*_proj.bias_lora_a/b).
+# KNOWN ISSUE: the attention q/k/v/o LoRA targets lack the 'model.' prefix
+# ('layers.*.self_attn...') unlike all other targets, so they likely do not
+# match engine parameter names.
 """vLLM JAX backend mappings for Qwen2 models."""
 
 from __future__ import annotations

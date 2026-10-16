@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CLI script that generates FrozenLake environment-configuration datasets as Parquet files. Each row
+# is a dict {env_name: "frozenlake", seed: int, size: int, p: float}. main parses --local_dir (default
+# <cwd>/data/frozenlake), --hdfs_dir (unused), --train_size (10000), --test_size (100); creates the dir;
+# generates train params with numpy global seed 42 and test params with seed 123; writes train.parquet
+# and test.parquet. Side effects: reseeds numpy global RNG, creates directories, writes files, prints.
+# KNOWN ISSUE: --hdfs_dir is parsed but never used; the "Using local directory" line is printed twice.
 """
 FrozenLake Dataset Generator
 
@@ -27,6 +34,10 @@ DEFAULT_DIR = os.getcwd()
 
 
 def get_frozenlake_dict(seed: int, size: int, p: float) -> dict:
+  # [FUNCTION DOC]
+  # HELPER: returns {"env_name": "frozenlake", "seed": int(seed), "size": int(size), "p": float(p)}.
+  # KNOWN ISSUE: docstring omits env_name and describes p as move-in-intended-direction probability, but
+  # the environment uses p as the probability a generated tile is frozen (map density), not slipping.
   """
   Create a dictionary with FrozenLake environment configuration parameters.
 
@@ -44,6 +55,12 @@ def get_frozenlake_dict(seed: int, size: int, p: float) -> dict:
 def generate_dataset_parameters(
     size: int, random_seed: int = 42
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  # [FUNCTION DOC]
+  # Seeds numpy's global RNG with random_seed and samples size values each of: seeds uniform ints in
+  # [0, 100000), grid sizes uniform ints in [2, 10) i.e. 2..9, and p uniform floats in [0.6, 0.85).
+  # Output: tuple (seeds, sizes, p_values) numpy arrays. Side effect: global RNG reseeded.
+  # KNOWN ISSUE: comments call p a slip probability (0.15-0.4), but the environment uses p as frozen-tile
+  # probability for map generation.
   """Generate random parameters for FrozenLake environments.
 
   This function creates diverse environment configurations by sampling:
@@ -69,6 +86,9 @@ def generate_dataset_parameters(
 
 
 def save_dataset(data: list[dict], filepath: str) -> None:
+  # [FUNCTION DOC]
+  # HELPER: converts the list of dicts to a pandas DataFrame, writes it to filepath as Parquet, prints
+  # the entry count. Raises pandas/pyarrow IO errors. No return value.
   """
     Save dataset to Parquet file format.
 
@@ -85,6 +105,8 @@ def save_dataset(data: list[dict], filepath: str) -> None:
 
 
 def main():
+  # [FUNCTION DOC]
+  # CLI entry point; see module doc for arguments and flow. No inputs (reads sys.argv), returns None.
   """Main function to generate and save FrozenLake datasets.
 
   Parses command line arguments, generates training and test datasets with

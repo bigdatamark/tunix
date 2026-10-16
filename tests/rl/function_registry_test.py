@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.function_registry.FunctionRegistry, a registry of
+# named functions grouped by category (defaults include policy_loss_fn,
+# advantage_estimator, loss_agg and a fourth default category). Covers
+# category listing, decorator-based registration and lookup, duplicate
+# registration (warning and overwrite), and errors for invalid categories.
+# Side effects: none; each test uses its own registry instance.
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from tunix.rl import function_registry
@@ -21,27 +29,40 @@ from tunix.rl import function_registry
 
 # --- Dummy functions for testing ---
 def dummy_func_a(x):
+  # [FUNCTION DOC]
+  # HELPER: test payload function; returns x plus 1.
   return x + 1
 
 
 def dummy_func_b(x, y):
+  # [FUNCTION DOC]
+  # HELPER: test payload function; returns x times y.
   return x * y
 
 
 class FunctionRegistryTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for FunctionRegistry construction, registration, lookup and errors.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: creates self.registry with the default allowed categories.
     super().setUp()
     # Initialize a registry with default categories for most tests
     self.registry = function_registry.FunctionRegistry()
 
   def test_default_categories_instance(self):
+    # [FUNCTION DOC]
+    # Verifies a default registry lists exactly DEFAULT_ALLOWED_CATEGORIES.
     self.assertCountEqual(
         self.registry.list_categories(),
         function_registry.FunctionRegistry.DEFAULT_ALLOWED_CATEGORIES,
     )
 
   def test_custom_categories_instance(self):
+    # [FUNCTION DOC]
+    # Verifies passing allowed_categories cat1, cat2 makes list_categories
+    # return exactly those.
     custom_cats = ["cat1", "cat2"]
     # Test-specific instance for custom categories
     registry = function_registry.FunctionRegistry(
@@ -50,6 +71,12 @@ class FunctionRegistryTest(parameterized.TestCase):
     self.assertCountEqual(registry.list_categories(), custom_cats)
 
   def test_empty_categories_instance(self):
+    # [FUNCTION DOC]
+    # Verifies an empty allowed_categories list falls back to the defaults
+    # (asserts 4 categories are listed).
+    # KNOWN ISSUE: the test name suggests an empty registry, but the expected
+    # behavior is fallback to defaults (empty list treated as unset); the
+    # count 4 is hard-coded rather than tied to DEFAULT_ALLOWED_CATEGORIES.
     # Test-specific instance for empty categories
     registry = function_registry.FunctionRegistry(allowed_categories=[])
     self.assertLen(registry.list_categories(), 4)
@@ -69,6 +96,10 @@ class FunctionRegistryTest(parameterized.TestCase):
       ),
   )
   def test_register_and_get_success_default(self, category, name, func):
+    # [FUNCTION DOC]
+    # Verifies register(category, name) returns a decorator that returns the
+    # function unchanged, get retrieves the same object, and list_functions
+    # for the category contains only that name.
     decorator = self.registry.register(category, name)
     registered_func = decorator(func)
     self.assertIs(registered_func, func)
@@ -78,6 +109,10 @@ class FunctionRegistryTest(parameterized.TestCase):
     self.assertEqual(self.registry.list_functions(category), [name])
 
   def test_register_duplicate_name_logs_warning(self):
+    # [FUNCTION DOC]
+    # Verifies registering a second function under an existing name logs a
+    # WARNING "Function 'my_func' is already registered in category
+    # 'policy_loss_fn'" and the newer function replaces the old one.
     self.registry.register("policy_loss_fn", "my_func")(dummy_func_a)
 
     with self.assertLogs(level="WARNING") as cm:
@@ -97,6 +132,12 @@ class FunctionRegistryTest(parameterized.TestCase):
     )
 
   def test_custom_categories_behavior(self):
+    # [FUNCTION DOC]
+    # Verifies a registry with custom categories accepts registration in
+    # them, while register on a non-allowed category raises ValueError
+    # "Invalid category: '<cat>'" (eagerly, even before applying the
+    # decorator) and list_functions on an unknown category raises
+    # LookupError "No such category: '<cat>'".
     custom_cats = ["custom1", "custom2"]
     # Test-specific instance for custom categories
     registry = function_registry.FunctionRegistry(

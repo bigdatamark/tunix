@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Dr. GRPO ("GRPO done right", arXiv 2503.20783) configuration and learner.
+# Defines DrGRPOConfig, a GRPOConfig subclass that pins the algorithm variant
+# and advantage estimator to "drgrpo" and defaults loss aggregation to
+# "sequence-mean-token-scale", and DrGRPOLearner, an unchanged subclass of the
+# GRPO learner parameterized with that config. Re-exports TrainingInputT,
+# RewardFn and MetricFn aliases from rl_learner. The jax, algo_core and
+# function_registry imports are unused here (algo_core import ensures the
+# registered "drgrpo" functions exist). No other side effects.
+# KNOWN ISSUE: the module docstring says "Helper functions for GRPO Trainer",
+# which does not describe the contents.
 """Helper functions for GRPO Trainer."""
 
 import dataclasses
@@ -27,6 +38,15 @@ MetricFn = rl_learner.MetricFn
 
 @dataclasses.dataclass(kw_only=True)
 class DrGRPOConfig(grpo_learner_lib.GRPOConfig):
+  # [CLASS DOC]
+  # Keyword-only dataclass config for Dr. GRPO. Inherits every GRPOConfig field
+  # and its validation (num_generations > 1, loss_algo in grpo/gspo-token).
+  # Overrides: algo_variant fixed to "drgrpo" and advantage_estimator fixed to
+  # "drgrpo" (both excluded from the constructor), loss_agg_mode default
+  # "sequence-mean-token-scale" (no per-length normalization).
+  # KNOWN ISSUE: "drgrpo" is not in AlgorithmConfig's valid algo_variant or
+  # advantage_estimator lists; it only works because GRPOConfig.__post_init__
+  # does not call the base validation.
   """Configuration for DrGRPO."""
 
   # https://arxiv.org/abs/2503.20783
@@ -37,3 +57,7 @@ class DrGRPOConfig(grpo_learner_lib.GRPOConfig):
 
 class DrGRPOLearner(grpo_learner_lib.GrpoLearner[DrGRPOConfig]):
   """Dr. GRPO Learner."""
+# [CLASS DOC]
+# Dr. GRPO learner: identical behavior to GRPOLearner; the differences come
+# entirely from DrGRPOConfig (the "drgrpo" advantage estimator, which skips
+# std normalization, and the token-scale loss aggregation). Adds no methods.

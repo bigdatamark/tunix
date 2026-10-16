@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Conversation agent for the FrozenLake example. Defines two system prompts (SYSTEM_PROMPT: rules,
+# symbols, valid actions Up/Down/Left/Right, answer inside triple backticks; MULTI_SHOT_SYSTEM_PROMPT:
+# the same plus five worked examples) and FrozenLakeAgent, which turns env text observations into
+# user messages and parses the model's last triple-backtick block into an env action string "1".."4"
+# (Left=1, Down=2, Right=3, Up=4) or "0" (invalid).
 import re
 from typing import Any, Optional
 
@@ -117,12 +123,20 @@ Now it is your turn, please show your thinking process and put the final action 
 
 
 class FrozenLakeAgent(base_agent.ConversationAgentBase):
+  # [CLASS DOC]
+  # Subclass of tunix ConversationAgentBase. State: multistep_prompt flag, last_observation (previous
+  # formatted observation string, used to detect no-op moves), plus base-class _messages, _trajectory,
+  # cur_step and step counter.
 
   def __init__(
       self,
       system_prompt: Optional[str] = None,
       use_multistep_prompt: bool | None = True,
   ):
+    # [FUNCTION DOC]
+    # Chooses MULTI_SHOT_SYSTEM_PROMPT when use_multistep_prompt is truthy (default True), else
+    # SYSTEM_PROMPT, calls the base constructor with it, and sets last_observation to None.
+    # KNOWN ISSUE: the system_prompt argument is ignored (always overwritten).
     self.multistep_prompt = use_multistep_prompt
     system_prompt = (
         SYSTEM_PROMPT
@@ -133,6 +147,8 @@ class FrozenLakeAgent(base_agent.ConversationAgentBase):
     self.last_observation = None
 
   def _init_messages(self, system_prompt: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: resets _messages to a single system message with system_prompt (empty string if falsy).
     """Initialize conversation history with a system prompt.
 
     Subclasses may override this to inject additional content (e.g., tool
@@ -151,6 +167,13 @@ class FrozenLakeAgent(base_agent.ConversationAgentBase):
     info: dict[str, Any] | None = None,
     **kwargs,
   ) -> None:
+    # [FUNCTION DOC]
+    # Formats observation as "Current Observation: \n" plus str(observation); if not done appends a line
+    # saying the goal is not achieved yet. If identical to last_observation, appends a warning that the last
+    # response was invalid / position did not change. Stores it as last_observation, calls the base
+    # update_from_env with the formatted string (which appends the user message via
+    # _observation_to_messages), then sets cur_step to a new Step with that observation.
+    # Extra kwargs ignored. Returns None.
     new_obs_str = str(observation)
     # Base message for the user
     new_obs_str = "Current Observation: \n" + new_obs_str
@@ -168,9 +191,20 @@ class FrozenLakeAgent(base_agent.ConversationAgentBase):
   def _observation_to_messages(
       self, observation: Any, reward: float, done: bool, info: dict[str, Any]
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: appends {"role": "user", "content": str(observation)} to _messages. Other args unused.
     self._messages.append({"role": "user", "content": str(observation)})
 
   def update_from_model(self, response: str, **kwargs) -> agent_types.Action:
+    # [FUNCTION DOC]
+    # Parses a model response. Finds all non-greedy triple-backtick blocks (dotall); if any, takes the
+    # last one stripped, sets thought to the response text before its last occurrence, and lowercases it:
+    # a direction word maps via left 1, down 2, right 3, up 4; a digit string in 1..4 is used directly;
+    # anything else (or no block) leaves the action "0" (INVALID_ACTION). Appends the assistant message,
+    # appends cur_step to the trajectory and fills thought, action (string), model_response; increments
+    # step. Output: Action wrapping the action string. Side effects: mutates history/trajectory.
+    # KNOWN ISSUE: appends self.cur_step without resetting it, so if called twice without an
+    # update_from_env the same Step object is appended twice and overwritten.
     DIRECTION_MAP = {"left": 1, "down": 2, "right": 3, "up": 4}
 
     thought = response
@@ -205,5 +239,7 @@ class FrozenLakeAgent(base_agent.ConversationAgentBase):
     return agent_types.Action(action=cur_step.action)
 
   def reset(self) -> None:
+    # [FUNCTION DOC]
+    # Resets base-agent state and clears last_observation.
     super().reset()
     self.last_observation = None

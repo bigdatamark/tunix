@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Integration test comparing Tunix's vanilla sampler with the SGLang-JAX sampler on
+# meta-llama/Llama-3.2-3B-Instruct. Downloads the checkpoint to the temp dir under models/<repo id>,
+# generates greedy outputs for three prompts with both samplers, checks outputs contain expected
+# keywords, and checks embedding weights were synced into the SGLang-JAX model.
+# Requires TPU devices, network/HF credentials and sglang-jax. Side effects: downloads, device
+# memory use, printed output.
 
 import os
 import re
@@ -33,9 +40,14 @@ from tunix.tests import test_common as tc
 
 
 class SglangJaxSamplerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Integration test suite for SglangJaxSampler.
 
   @classmethod
   def setUpClass(cls) -> None:
+    # [FUNCTION DOC]
+    # HELPER: class fixture creating a (1, N device) mesh with axes ("fsdp", "tp") and Auto axis types,
+    # and downloading the Llama 3.2 3B Instruct checkpoint to cls.model_path.
     super().setUpClass()
     mesh_shape = (1, len(jax.devices()))  # e.g., (1, 8) for v2-8
     axis_names = ("fsdp", "tp")
@@ -54,6 +66,10 @@ class SglangJaxSamplerTest(absltest.TestCase):
     tc.download_from_huggingface(repo_id=cls.repo_id, model_path=cls.model_path)
 
   def load_llama3_model(self, model_version: str):
+    # [FUNCTION DOC]
+    # HELPER: loads a Tunix Llama3 model from the downloaded safetensors. Input model_version must be
+    # one of the 3.2-3B-Instruct or 3.1-8B-Instruct repo ids (mapped to their config factories), else an
+    # AssertionError is raised. Always loads from self.model_path on self.mesh. Returns the model.
     model_config = {
         "meta-llama/Llama-3.2-3B-Instruct": llama_lib.ModelConfig.llama3p2_3b,
         "meta-llama/Llama-3.1-8B-Instruct": llama_lib.ModelConfig.llama3p1_8b,
@@ -70,6 +86,16 @@ class SglangJaxSamplerTest(absltest.TestCase):
     return llama3
 
   def test_sglang_jax_sampler(self):
+    # [FUNCTION DOC]
+    # Verifies end-to-end SGLang-JAX sampling. Loads the Tunix model, prints HBM usage, templatizes three
+    # prompts with the HF tokenizer, runs the vanilla sampler (cache 512, greedy top_k 1, 128 steps,
+    # padded output), builds an sglang_jax MappingConfig from the model, creates SglangJaxSampler
+    # (context 512, mem fraction 0.2, random init, radix cache disabled, non-deterministic sampling,
+    # disable_precompile forwarded as an extra kwarg), asserts the sampler's mesh differs from the test
+    # mesh, loads the Tunix state into it, samples with the same settings, validates both outputs against
+    # expected keywords per prompt, and asserts the embedding table equals the SGLang-JAX embed_tokens.
+    # KNOWN ISSUE: the vanilla sampler cache config hardcodes num_layers 32, while Llama 3.2 3B has 28
+    # layers. The local "args" dict is built but never used.
     tunix_model = self.load_llama3_model(self.repo_id)
 
     args = {}

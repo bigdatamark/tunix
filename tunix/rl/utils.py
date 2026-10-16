@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Assorted utilities for RL code: argument validation, pytree
+# flattening, mesh discovery, weight-sharing checks, batch slicing and
+# micro-batch merging, moving params between device and host memory,
+# building a critic from an actor, unpadding TrainExamples and packing them
+# into fixed-budget 1-D sequences. Defines aliases Mesh and NamedSharding,
+# the tuple of optional per-token fields carried through packing
+# (_OPTIONAL_PER_TOKEN_KEYS: ref/old per-token logps, returns, old values),
+# and the constant VERIFY_UPDATE_PARAMS_KEY (an environment/config key name
+# used elsewhere for verifying parameter sync).
 """Simple utils used by RL algorithms."""
 
 from itertools import chain  # pylint: disable=g-importing-member
@@ -41,6 +51,9 @@ _OPTIONAL_PER_TOKEN_KEYS = (
 
 
 def is_positive_integer(value: int | None, name: str):
+  # [FUNCTION DOC]
+  # HELPER: Raises ValueError (mentioning name) if value is not None and is not
+  # an int or is not positive. Returns None. Booleans pass as ints.
   """Checks if the value is positive."""
   if value is not None and (not isinstance(value, int) or value <= 0):
     raise ValueError(f"{name} must be a positive integer. Got: {value}")
@@ -52,6 +65,9 @@ def check_divisibility(
     small_size_name,
     big_size_name,
 ):
+  # [FUNCTION DOC]
+  # HELPER: Raises ValueError if big_size is not divisible by small_size (zero
+  # small_size raises ZeroDivisionError). Names are used in the message.
   """Checks if big_size is a multiple of small_size."""
   if big_size % small_size != 0:
     raise ValueError(
@@ -62,6 +78,12 @@ def check_divisibility(
 def to_flat_dict(
     tree: jaxtyping.PyTree | statelib.State,
 ) -> tuple[dict[tuple[str, ...], jaxtyping.Array], jaxtyping.PyTreeDef]:
+  # [FUNCTION DOC]
+  # HELPER: Converts an nnx State to a pure dict first if needed, then flattens
+  # the pytree with key paths. Returns a dict from tuples of path-entry keys to
+  # leaves (insertion order equals flatten order) and the tree definition.
+  # Path entries without a key attribute (e.g. sequence indices) raise
+  # AttributeError.
   if isinstance(tree, statelib.State):
     tree = nnx.to_pure_dict(tree)
   flattened, tree_def = jax.tree.flatten_with_path(tree)
@@ -69,10 +91,17 @@ def to_flat_dict(
 
 
 def get_pytree_mesh_info(tree: jaxtyping.PyTree) -> Mesh | None:
+  # [FUNCTION DOC]
+  # HELPER: Collects the distinct meshes of all jax.Array leaves that have a
+  # NamedSharding. Raises ValueError if more than one mesh is found. Returns the
+  # single mesh, or None if none.
   """Returns the mesh info for the pytree."""
   mesh_info = set()
 
   def _get_mesh_info(leaf: jaxtyping.PyTree):
+    # [FUNCTION DOC]
+    # HELPER: Leaf visitor adding the leaf's NamedSharding mesh to the set;
+    # returns the leaf unchanged.
     if isinstance(leaf, jax.Array):
       if hasattr(leaf, "sharding") and leaf.sharding:
         sharding = leaf.sharding
@@ -89,6 +118,10 @@ def get_pytree_mesh_info(tree: jaxtyping.PyTree) -> Mesh | None:
 
 
 def _is_same_state(s1: jaxtyping.PyTree, s2: jaxtyping.PyTree) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: Returns true if every leaf of s1 is the identical object (identity,
+  # not equality) to the corresponding leaf of s2, compared positionally.
+  # Mismatched leaf counts raise an error from tree mapping.
   """Returns whether two states refer to the same Params."""
   return np.all(
       jax.tree.map(
@@ -103,6 +136,9 @@ def is_sharing_weights(
     m1: Optional[nnx.Module],
     m2: Optional[nnx.Module],
 ) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: Returns False if either model is None, else whether their full nnx
+  # states share identical leaf objects.
   """Returns whether two models are sharing same copy of weights."""
   if m1 is None or m2 is None:
     return False
@@ -116,6 +152,9 @@ def is_sharing_backbone(
     m1: nnx.Module,
     m2: nnx.Module,
 ) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: Returns whether the two models share identical non-LoRA parameter
+  # leaves (the backbone), ignoring LoRA params.
   """Returns whether two models are sharing same copy of backbone."""
   s1 = nnx.state(m1, filterlib.Not(nnx.LoRAParam))
   s2 = nnx.state(m2, filterlib.Not(nnx.LoRAParam))
@@ -123,6 +162,10 @@ def is_sharing_backbone(
 
 
 def chunk_slices_by_size(stop: int, step: int):
+  # [FUNCTION DOC]
+  # HELPER: Generator yielding consecutive slices covering 0..stop in chunks of
+  # step; the last may be shorter. Yields nothing if stop is 0. Non-positive
+  # step loops forever (when stop > 0).
   """Yields slices `slice(...)` for samples before `stop`, chunked by `step`.
 
   The last chunk is allowed to be smaller than `step`.
@@ -138,6 +181,10 @@ def chunk_slices_by_size(stop: int, step: int):
 
 
 def get_batch_slice(tree: Any, batch_slice: slice) -> Any:
+  # [FUNCTION DOC]
+  # HELPER: Returns a pytree where each leaf that has ndim at least 1 is indexed
+  # with batch_slice along its first dimension; None leaves stay None and
+  # scalars/non-arrays are kept as is.
   """Slices array-like leaves of a PyTree along the first dimension.
 
   Args:
@@ -149,6 +196,8 @@ def get_batch_slice(tree: Any, batch_slice: slice) -> Any:
   """
 
   def apply_slice(x: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Leaf function implementing the slicing rule above.
     if x is None:
       return None
     # Apply slice if the leaf is an array with at least one dimension.
@@ -163,6 +212,12 @@ def get_batch_slice(tree: Any, batch_slice: slice) -> Any:
 
 
 def merge_micro_batches(batches: List[dict[str, Any]]) -> dict[str, Any]:
+  # [FUNCTION DOC]
+  # HELPER: Merges a list of dicts with identical keys. Returns {} for an empty
+  # list. For each key of the first dict: if values are lists, concatenates
+  # them into one list; otherwise maps over the pytrees and concatenates
+  # corresponding leaves with NumPy (scalars promoted to 1-D). Returns the
+  # merged dict (NumPy arrays, host memory).
   """Merges micro-batch dictionaries into a single batch.
 
   Concatenates values from a list of micro-batch dicts. Values are concatenated
@@ -197,6 +252,17 @@ def put_params_on_memory_kind(
     params: jaxtyping.PyTree,
     memory_kind: str,
 ) -> jaxtyping.PyTree:
+  # [FUNCTION DOC]
+  # Moves params to memory_kind ("device", "pinned_host" or "unpinned_host";
+  # otherwise ValueError). Returns params unchanged if the tree has no leaves.
+  # Determines whether any leaf currently lives in device memory; returns early
+  # if already on device and device was requested, or not on device and
+  # pinned_host requested. Otherwise builds new shardings with the requested
+  # memory kind (NamedSharding rebuilt, others via with_memory_kind) and
+  # device_puts the params. Returns the moved params. Debug-logs shardings.
+  # KNOWN ISSUE: the early-exit check treats any non-device placement as
+  # pinned_host (unpinned params requested as pinned are not moved), and a
+  # tree partly on device is considered fully on device.
   """Puts params on the given memory kind."""
   if memory_kind not in ["device", "pinned_host", "unpinned_host"]:
     raise ValueError(
@@ -242,6 +308,14 @@ def put_params_on_memory_kind(
 def create_critic_model(
     actor_model: nnx.Module, seed: int = 0, lm_head_to_replace: str = "lm_head"
 ) -> nnx.Module:
+  # [FUNCTION DOC]
+  # Inputs: actor model, seed (default 0), name of the head attribute (default
+  # "lm_head"). Splits the actor, deep-copies every state leaf, merges a new
+  # model, determines the hidden size from the head (first dimension if it has
+  # a shape, else in_features), and replaces the head with a bias-free
+  # nnx.Linear from hidden size to 1 initialized with Rngs(seed). Returns the
+  # critic (outputs one value per token). Raises AttributeError if the head
+  # attribute is missing. Side effect: doubles memory for weights.
   """Creates a critic model from an actor model."""
   g, state = nnx.split(actor_model)
   # TODO(tsbao): if actor model is a LoRA model, then we can potentially share
@@ -268,6 +342,8 @@ def create_critic_model(
 def get_partition_spec(
     sharding: jax.sharding.Sharding,
 ) -> jax.sharding.PartitionSpec:
+  # [FUNCTION DOC]
+  # HELPER: Returns the spec of a NamedSharding, else an empty PartitionSpec.
   """Returns the partition spec for the given sharding."""
   if isinstance(sharding, jax.sharding.NamedSharding):
     return sharding.spec
@@ -276,6 +352,17 @@ def get_partition_spec(
 
 
 def unpad_train_example(example: common.TrainExample) -> list[dict[str, Any]]:
+  # [FUNCTION DOC]
+  # Converts a padded TrainExample (or subclass) to a list of per-sample dicts
+  # of NumPy arrays. For each row: prompt length and completion length are the
+  # mask sums; prompt values are the last prompt-length entries (assumes left
+  # padding), completion values the first completion-length entries (assumes
+  # right padding). Keys: prompt_ids, prompt_mask, completion_ids,
+  # completion_mask, advantages (per-token slice if advantages are 2-D, else
+  # the scalar), adv_is_per_token, ref_per_token_logps, old_per_token_logps,
+  # returns, old_values (sliced or None when absent; the last two via optional
+  # attributes), policy_version (the whole array, not per row, or None).
+  # Side effect: transfers device arrays to host.
   """Unpads a TrainExample into a list of dictionaries with numpy arrays."""
   # TODO(noghabi): Skip padding and unpadding directly in the learner.
   res = []
@@ -336,12 +423,35 @@ def pack_sequences(
     max_token_budget: int,
     pad_id: int = 0,
 ) -> Iterator[list[common.TrainExample]]:
+  # [FUNCTION DOC]
+  # Generator: packs a stream of lists of TrainExamples into single-row packed
+  # TrainExamples whose total tokens do not exceed max_token_budget. Each
+  # example is unpadded; items longer than the budget are skipped with a
+  # warning; if adding an item would exceed the budget, the current buffer is
+  # flushed and yielded first. The example class of the most recently seen
+  # example is used to build outputs. Any remaining buffer is flushed at the
+  # end. Each yield is a list containing one packed example.
   """Packs a stream of TrainExamples into 1D sequences up to a token budget."""
   buffer = []
   current_tokens = 0
   example_cls = common.TrainExample
 
   def _flush_buffer() -> list[common.TrainExample]:
+    # [FUNCTION DOC]
+    # HELPER: Builds one packed example from the buffer (returns [] if empty).
+    # For each item i (starting at 1), appends prompt then completion ids to
+    # completion_ids; completion mask is zeros for the prompt part and the item
+    # mask for the completion part; advantages are zeros for the prompt and the
+    # per-token advantages or the scalar broadcast over the completion; each
+    # tracked optional per-token field (those non-None in the first buffered
+    # item) gets zeros for the prompt then the item values; segment ids are i
+    # over the whole sequence and positions restart at 0 per sequence. All are
+    # concatenated and right padded to max_token_budget (ids with pad_id, others
+    # with 0) and given a leading batch dim of 1. Prompt ids/mask are empty
+    # (1 by 0). ref/old logps default to None unless tracked; policy_version
+    # from the first item. Clears the buffer and token count (nonlocal state).
+    # KNOWN ISSUE: assumes all items share the same optional fields as the first
+    # item (KeyError/type errors otherwise) and the same policy_version.
     nonlocal buffer, current_tokens
     if not buffer:
       return []
@@ -393,6 +503,9 @@ def pack_sequences(
       packed_positions.append(np.arange(seq_len, dtype=np.int32))
 
     def _pad(arr_list, val, length):
+      # [FUNCTION DOC]
+      # HELPER: Concatenates the list (empty float array if empty) and right pads
+      # by length with val.
       arr = np.concatenate(arr_list) if arr_list else np.array([])
       return np.pad(arr, (0, length), constant_values=val)
 

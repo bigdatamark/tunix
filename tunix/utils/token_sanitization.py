@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Small safety utility module that strips chat-template control tokens
+# (Gemma, Llama 3, ChatML styles) from untrusted text, to prevent prompt
+# injection in RL agent environments/tool outputs.
+# Module state: a private list of default control token strings
+# ("<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>", "<|begin_of_text|>",
+# "<|end_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+# "<|im_start|>", "<|im_end|>") and a precompiled regex alternation of their
+# escaped literal forms.
 """Safety utilities for RL agents."""
 
 import re
@@ -39,6 +48,27 @@ def sanitize_control_tokens(
     extra_tokens: Iterable[str] | None = None,
     include_default: bool = True,
 ) -> str:
+  # [FUNCTION DOC]
+  # Removes control tokens from content.
+  # Inputs: content - str, bytes/bytearray, memoryview, any object with a
+  #   decode method, or other objects; extra_tokens - optional iterable of extra
+  #   literal token strings (empty strings are ignored); include_default -
+  #   whether the default token list is included.
+  # Behavior: normalize content to text: bytes/bytearray decoded as UTF-8 with
+  #   replacement of invalid bytes; memoryview converted to bytes then decoded;
+  #   other non-str objects with a decode method are decoded (falling back to
+  #   string conversion if decoding raises); other non-None objects are
+  #   string-converted. If the result is falsy (empty or None), return it as is.
+  #   Choose the regex: the precompiled default one when defaults are included
+  #   and no extra tokens are given; otherwise the union of default (if enabled)
+  #   and non-empty extra tokens, sorted, escaped, joined as an alternation;
+  #   if that union is empty, return the content unchanged. Then repeatedly
+  #   delete all matches until a fixed point, so tokens reassembled by removal
+  #   of inner tokens (nesting tricks) are also removed.
+  # Output: sanitized string (or None/empty input returned unchanged).
+  # Exceptions: none raised deliberately. Side effects: none.
+  # KNOWN ISSUE: the return annotation says str but None is returned when
+  # content is None.
   """Sanitize control tokens from the content.
 
   Args:

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Numerical alignment tests between HuggingFace PyTorch Qwen models and Tunix JAX implementations
+# (DeepSeek-R1-Distill-Qwen-1.5B and Qwen2.5-1.5B-Instruct via qwen2, Qwen3-0.6B via qwen3).
+# Downloads each checkpoint to the temp dir under models/<name>, loads it in both frameworks in
+# float32, checks the first query weight is identical, then compares all-decoder-layer hidden states
+# and full-model logits for input tokens 1..128 with causal masks within a per-model tolerance.
+# Side effects: network downloads, prints, and deletion of the downloaded directory on success.
+# The constant K_MASK is the large negative additive mask value used for PyTorch masks.
 """Check the model correctness for Tunix nnx implemented models.
 
 The test will compare the first N decoder layer output between Tunix model and
@@ -25,6 +33,11 @@ K_MASK = -2.3819763e38
 
 
 def create_pytorch_causal_mask(seq_len):
+  # [FUNCTION DOC]
+  # HELPER: builds a (seq_len, seq_len) float additive causal mask: 0 where column index is at most the
+  # row index, K_MASK elsewhere.
+  # KNOWN ISSUE: the docstring says a boolean True/False tensor is returned, but the result is a float
+  # tensor of 0 and K_MASK values.
   """Creates a causal attention mask for a sequence of a given length.
 
   Args:
@@ -43,6 +56,9 @@ def create_pytorch_causal_mask(seq_len):
 
 
 def get_hf_output(model, seq_len: int):
+  # [FUNCTION DOC]
+  # HELPER: runs the HF model on tokens 1..seq_len (batch 1) with positions 0..seq_len-1 and a
+  # [1, 1, seq, seq] additive causal mask passed positionally; returns logits as a numpy array.
   x = (torch.arange(seq_len) + 1).reshape(1, -1)
   position_ids = torch.arange(seq_len).reshape(1, -1)
   attn_mask = create_pytorch_causal_mask(seq_len).unsqueeze(0).unsqueeze(0)
@@ -50,6 +66,9 @@ def get_hf_output(model, seq_len: int):
 
 
 def get_jax_output(model, seq_len: int):
+  # [FUNCTION DOC]
+  # HELPER: runs the Tunix model on tokens 1..seq_len with positions 0..seq_len-1, no cache, and a
+  # causal mask from utils.make_causal_attn_mask over an all-ones input mask; returns the logits.
   x = (jnp.arange(seq_len) + 1).reshape(1, -1)
   positions = jnp.arange(seq_len).reshape(1, -1)
   attn_mask = utils.make_causal_attn_mask(jnp.ones((1, seq_len)))
@@ -58,6 +77,14 @@ def get_jax_output(model, seq_len: int):
 
 
 def get_per_layer_hf_output(model, seq_len: int, num_layer_to_run: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: computes HF decoder hidden states after the first num_layer_to_run layers (default 1): embeds
+  # tokens 1..seq_len, computes rotary position embeddings, applies each layer in turn with the additive
+  # causal mask and position ids, and returns the first output of the last layer for batch element 0 as
+  # numpy.
+  # KNOWN ISSUE: the docstring says it returns the first layer's output, but it runs num_layer_to_run
+  # layers. Indexing the layer result with zero assumes the layer returns a tuple; on versions where it
+  # returns a tensor this selects the first batch row instead (which still works for batch 1).
   """Get the first decoder layer output from the HF model."""
   x = (torch.arange(seq_len) + 1).reshape(1, -1)
   position_ids = torch.arange(seq_len).reshape(1, -1)
@@ -79,6 +106,12 @@ def get_per_layer_hf_output(model, seq_len: int, num_layer_to_run: int = 1):
 def get_per_layer_jax_output(
     model_name: str, model, seq_len: int, num_layer_to_run: int = 1
 ):
+  # [FUNCTION DOC]
+  # HELPER: computes Tunix hidden states after num_layer_to_run decoder layers. For the two qwen2-based
+  # model names it generates sin/cos rotary embeddings via qwen2_model._generate_pos_embeddings and calls
+  # each layer with (hidden, no cache, mask, sin, cos); for Qwen3-0.6B it calls each layer with (hidden,
+  # positions, no cache, mask). Each layer returns (cache, hidden). Returns the final hidden states.
+  # Raises ValueError for any other model name.
   """Get the first decoder layer output from the Tunix model."""
   x = (jnp.arange(seq_len) + 1).reshape(1, -1)
   positions = jnp.arange(seq_len).reshape(1, -1)
@@ -108,6 +141,8 @@ def get_per_layer_jax_output(
 
 
 class QwenAlignTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized alignment test across Qwen-family checkpoints.
 
   @parameterized.named_parameters(
       dict(
@@ -135,6 +170,12 @@ class QwenAlignTest(parameterized.TestCase):
   def test_qwen_model_alignment(
       self, model_name, model_config, model_params, tolerance
   ):
+    # [FUNCTION DOC]
+    # Verifies alignment for one model. Inputs: model_name (HF repo id), model_config (config factory),
+    # model_params (Tunix params module with create_model_from_safe_tensors), tolerance (atol and rtol).
+    # Loads both models, asserts exact equality of the HF layer-0 q_proj weight with the Tunix q_proj
+    # weight reshaped to (embed, heads*head_dim) and transposed, compares hidden states after all layers
+    # and then full logits with assert_allclose, prints success and deletes the model directory.
     model_path = os.path.join(tempfile.gettempdir(), "models", model_name)
 
     tc.download_from_huggingface(repo_id=model_name, model_path=model_path)

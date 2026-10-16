@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.models.gemma3.utils.get_attention_mask, which builds a boolean causal
+# attention mask of shape [batch, seq, seq] from token ids. Padding tokens (utils._PADDING_ID) are
+# never attended to; contiguous image placeholder tokens (id 219 here) attend bidirectionally
+# within their block; an optional precomputed inputs mask further removes columns.
+# Inputs: small hand-built token arrays. Outputs: absltest results. No side effects.
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -23,8 +29,13 @@ _TOKEN_PLACEHOLDER = 219
 
 
 class UtilsTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests attention mask construction for text-only, multimodal and precomputed-mask inputs.
 
   def test_get_attention_mask_not_multimodal(self):
+    # [FUNCTION DOC]
+    # Verifies text-only tokens with two trailing pads give a lower-triangular causal mask over the
+    # three real tokens, where pad rows attend to all real tokens and no pad column is ever attended.
     tokens = jnp.array([[1, 2, 3, utils._PADDING_ID, utils._PADDING_ID]])
     attention_mask = utils.get_attention_mask(
         tokens, token_placeholder_id=_TOKEN_PLACEHOLDER
@@ -43,6 +54,9 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(attention_mask, expected_attention_mask)
 
   def test_get_attention_mask_multimodal(self):
+    # [FUNCTION DOC]
+    # Verifies that two adjacent placeholder (image) tokens attend to each other bidirectionally
+    # (both rows see both placeholder columns) while the rest stays causal and padding is masked.
     tokens = jnp.array([[
         1,
         2,
@@ -69,6 +83,9 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(attention_mask, expected_attention_mask)
 
   def test_get_attention_mask_precomputed_mask(self):
+    # [FUNCTION DOC]
+    # Verifies that when inputs_mask is given, columns with a zero in inputs_mask (position 1 and the
+    # pads) are masked out of the causal mask for every row.
     tokens = jnp.array([[1, 2, 3, utils._PADDING_ID, utils._PADDING_ID]])
     inputs_mask = jnp.array([[1, 0, 1, 0, 0]])
     attention_mask = utils.get_attention_mask(

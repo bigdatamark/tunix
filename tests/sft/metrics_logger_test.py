@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Unit tests for tunix.sft.metrics_logger: MetricsLoggerOptions backend
+# creation (default Tensorboard + W&B backends externally, CLU internally,
+# custom backend factories via backend_kwargs['custom_backend'], per-backend
+# kwargs) and MetricsLogger (registers each backend's log_scalar with
+# jax.monitoring, records scalars as '<prefix>/<mode>/<name>', aggregates
+# metric means / geometric mean for perplexity, keeps history, creates no
+# backends on non-zero process index, closes backends on close()).
+# Side effects: temp directories; backend classes are mocked.
 """Metrics logger unittest."""
 
 import copy
@@ -13,8 +22,16 @@ from tunix.utils import env_utils
 
 
 class MetricLoggerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for MetricsLogger. Fixture patches the default backend classes
+  # (CluBackend if internal env, else TensorboardBackend and WandbBackend) and
+  # stores the mocks in self.mock_backends in that order.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture. Creates a TemporaryDirectory (kept on self so it lives for
+    # the test), sets self.log_dir, and patches backend classes via enter_context
+    # so patches are undone at test teardown.
     super().setUp()
     self._temp_dir_obj = tempfile.TemporaryDirectory()
     self.log_dir = self._temp_dir_obj.name
@@ -40,6 +57,11 @@ class MetricLoggerTest(absltest.TestCase):
 
   @mock.patch.object(jax.monitoring, "register_scalar_listener")
   def test_custom_backends_override_defaults(self, mock_register):
+    # [FUNCTION DOC]
+    # Verifies a 'custom_backend' factory list replaces defaults: no default
+    # backend constructed, factory called once, only its instance in
+    # logger._backends, its log_scalar registered as listener, and close()
+    # closes it. Input: patched register_scalar_listener.
     """Tests that providing a 'backends' list overrides the defaults."""
     mock_backend_instance = mock.Mock(spec=metrax_logging.LoggingBackend)
     mock_factory = mock.Mock(return_value=mock_backend_instance)
@@ -61,6 +83,9 @@ class MetricLoggerTest(absltest.TestCase):
 
   @mock.patch.object(jax.monitoring, "register_scalar_listener")
   def test_defaults_are_used_when_no_backends_provided(self, mock_register):
+    # [FUNCTION DOC]
+    # Verifies default backends are each constructed once, registered as
+    # listeners, stored in logger._backends, and closed by close().
     """Tests that defaults are created when 'backends' is None."""
     options = metrics_logger.MetricsLoggerOptions(log_dir=self.log_dir)
 
@@ -79,6 +104,9 @@ class MetricLoggerTest(absltest.TestCase):
 
   @mock.patch.object(jax.monitoring, "register_scalar_listener")
   def test_logger_handles_missing_wandb_gracefully(self, mock_register):
+    # [FUNCTION DOC]
+    # Verifies (external env only; returns early internally) that an ImportError
+    # from the W&B backend constructor is tolerated: only Tensorboard remains.
     """Tests that the logger doesn't crash if wandb is not installed."""
     # wandb is not supported in internal environment.
     if env_utils.is_internal_env():
@@ -98,6 +126,10 @@ class MetricLoggerTest(absltest.TestCase):
     mock_tensorboard_instance.close.assert_called_once()
 
   def test_options_deepcopy_safety(self):
+    # [FUNCTION DOC]
+    # Verifies deep-copying options and changing log_dir produces a second logger
+    # whose backends are constructed again with the new log_dir (Tensorboard also
+    # with flush_every_n_steps=100).
     """Tests that deepcopying options and creating new loggers is safe."""
     options1 = metrics_logger.MetricsLoggerOptions(log_dir=self.log_dir)
     logger1 = metrics_logger.MetricsLogger(metrics_logger_options=options1)
@@ -125,6 +157,10 @@ class MetricLoggerTest(absltest.TestCase):
 
   @mock.patch.object(jax.monitoring, "record_scalar")
   def test_log_metrics(self, mock_record_scalar):
+    # [FUNCTION DOC]
+    # Verifies log() forwards to jax.monitoring.record_scalar with name
+    # 'test_prefix/train/loss' and step, and that metric_exists, get_metric
+    # (mean 0.075 of 0.1 and 0.05) and get_metric_history work. No backends.
     options = metrics_logger.MetricsLoggerOptions(
         log_dir=self.log_dir, backend_kwargs={"custom_backend": []}
     )
@@ -146,6 +182,9 @@ class MetricLoggerTest(absltest.TestCase):
 
   @mock.patch.object(jax.monitoring, "record_scalar")
   def test_log_perplexity(self, mock_record_scalar):
+    # [FUNCTION DOC]
+    # Verifies perplexity aggregation uses the geometric mean
+    # (sqrt(10*100) = 31.6227766) rather than the arithmetic mean.
     options = metrics_logger.MetricsLoggerOptions(
         log_dir=self.log_dir, backend_kwargs={"custom_backend": []}
     )
@@ -168,6 +207,9 @@ class MetricLoggerTest(absltest.TestCase):
       mock_register,
       mock_jax_process_index,
   ):
+    # [FUNCTION DOC]
+    # Verifies that with jax.process_index patched to 1 no backends are created
+    # or registered and close() still works.
     del mock_jax_process_index
     options = metrics_logger.MetricsLoggerOptions(log_dir=self.log_dir)
     logger = metrics_logger.MetricsLogger(metrics_logger_options=options)
@@ -181,6 +223,10 @@ class MetricLoggerTest(absltest.TestCase):
   def test_raises_when_clu_backend_missing_in_internal_env(
       self, mock_is_internal_env
   ):
+    # [FUNCTION DOC]
+    # Verifies create_backends raises ImportError ('Internal environment
+    # detected, but CluBackend not available.') when is_internal_env is True and
+    # CluBackend is None.
     del mock_is_internal_env
     # We need to patch CluBackend to be None in the module.
     with mock.patch.object(metrics_logger, "CluBackend", new=None):
@@ -192,6 +238,11 @@ class MetricLoggerTest(absltest.TestCase):
         options.create_backends()
 
   def test_backend_kwargs_are_passed_to_backends(self):
+    # [FUNCTION DOC]
+    # Verifies backend_kwargs are forwarded: internally CLU gets log_dir plus
+    # 'clu' kwargs; externally Tensorboard gets log_dir, flush_every_n_steps=100
+    # and 'tensorboard' kwargs, and W&B gets project 'tunix', name '' and the
+    # 'wandb' kwargs.
     """Tests that backend_kwargs are passed to the backends initialization."""
     mock_wandb = mock.Mock()
     options = metrics_logger.MetricsLoggerOptions(

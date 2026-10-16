@@ -12,12 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Small utility module with a metaclass that marks instances as
+# "locked" once construction is complete, enabling classes to implement
+# immutability in their own attribute-setting hook.
 """Utilities for enforcing immutability in Python objects."""
 
 import abc
 
 
 class ImmutableMeta(abc.ABCMeta):
+  # [CLASS DOC]
+  # Metaclass deriving from the abstract-base-class metaclass (so it is usable
+  # with ABCs). It only overrides instance creation: after the normal creation
+  # and full initializer chain run, it sets the private attribute "_locked" to
+  # True on the instance via the base object attribute setter (bypassing any
+  # overridden setattr). Enforcement (raising on assignment when locked) is the
+  # responsibility of the class using the metaclass.
   """Metaclass that sets `self._locked = True` after `__init__` completes.
 
   By overriding `__call__`, this metaclass ensures that the `_locked` flag is
@@ -40,6 +51,12 @@ class ImmutableMeta(abc.ABCMeta):
   """
 
   def __call__(cls, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Instance creation hook. Inputs: cls (the class being instantiated) plus
+    # arbitrary positional/keyword constructor arguments, forwarded unchanged to
+    # the default creation. Output: the fully initialized instance.
+    # Side effects: sets instance attribute "_locked" = True, bypassing the
+    # class's own setattr. Exceptions: whatever construction raises.
     """Create and initialize a new instance, then lock it against modification."""
     # This calls __new__ and __init__, completing the full initialization chain
     instance = super().__call__(*args, **kwargs)

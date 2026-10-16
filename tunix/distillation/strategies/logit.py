@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Logit (response-based) distillation strategy (Hinton et al. 2015).
+# Defines LogitStrategy: loss = alpha * T^2 * mean KL(teacher_soft ||
+#   student_soft) + (1 - alpha) * mean softmax cross-entropy(student, labels),
+#   optionally restricting the KL to the teacher's top-k logits.
+# ModelForwardCallable is re-aliased from base_strategy. No side effects.
 """Implements Logit Distillation Strategy."""
 
 from typing import Callable
@@ -25,6 +31,14 @@ ModelForwardCallable = base_strategy.ModelForwardCallable
 
 
 class LogitStrategy(base_strategy.BaseStrategy):
+  # [CLASS DOC]
+  # Logit distillation. Forward fns must return logits arrays (last axis =
+  # vocabulary/classes); labels_fn must return one-hot/probability labels of
+  # the same shape (consumed by optax.softmax_cross_entropy).
+  # Attributes: temperature (float > 0), alpha (in [0, 1]) weight on the
+  # distillation term, distill_top_k (int; > 0 enables top-k KL).
+  # KNOWN ISSUE: docstring calls the KL term an "attention loss"; it is a
+  #   logit KL loss.
   """Implements Logit Distillation.
 
   This strategy minimizes the KL divergence between the student and teacher
@@ -41,6 +55,15 @@ class LogitStrategy(base_strategy.BaseStrategy):
       alpha: float = 0.5,
       distill_top_k: int = 0,
   ):
+    # [FUNCTION DOC]
+    # Inputs: student/teacher forward fns, labels_fn (see BaseStrategy),
+    #   temperature (default 2.0), alpha (default 0.5), distill_top_k
+    #   (default 0 = full vocabulary).
+    # Behavior: initialize BaseStrategy (jits the fns), validate, store
+    #   temperature as float, alpha and distill_top_k.
+    # Exceptions: ValueError if temperature <= 0; ValueError if alpha is not
+    #   within [0.0, 1.0]. distill_top_k is not validated (negative acts as 0).
+    # Side effects: none.
     """Initializes the Logit strategy.
 
     Args:
@@ -71,6 +94,11 @@ class LogitStrategy(base_strategy.BaseStrategy):
       student_output: jax.Array,
       labels: jax.Array,
   ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    # [FUNCTION DOC]
+    # Eval loss. Inputs: student_output logits, labels. Casts logits to
+    #   float32, computes optax softmax cross-entropy per example against
+    #   labels and returns (mean over all elements, empty dict).
+    # Exceptions: shape mismatch errors from optax. No side effects.
     """Computes the task loss.
 
     Args:
@@ -97,6 +125,25 @@ class LogitStrategy(base_strategy.BaseStrategy):
       teacher_output: jax.Array,
       labels: jax.Array,
   ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    # [FUNCTION DOC]
+    # Training loss. Inputs: student_output and teacher_output logits (same
+    #   shape), labels. Steps:
+    #   1. Cast both logits to float32.
+    #   2. If distill_top_k > 0: take the teacher's top-k logits and indices
+    #      along the last axis; gather the student logits at those indices;
+    #      student log-probs = log_softmax(student_k / T); teacher probs =
+    #      softmax(teacher_k / T) (both renormalized over the k entries).
+    #      Otherwise do the same over the full last axis.
+    #   3. kl = optax.kl_divergence(student log-probs, teacher probs) (per
+    #      position, summed over last axis); distillation_loss = mean(kl*T^2).
+    #   4. task_loss = mean softmax CE(student full logits, labels).
+    #   5. teacher_task_loss = mean softmax CE(teacher logits, labels)
+    #      (monitoring only).
+    #   6. combined = alpha*distillation_loss + (1-alpha)*task_loss.
+    # Output: (combined, metrics) with metrics keys "distill/soft_loss"
+    #   (distillation_loss), "distill/hard_loss" (task_loss), "distill/kl_div"
+    #   (mean unscaled kl), "distill/teacher_loss". No masking of padding
+    #   tokens is applied. Exceptions: shape errors. No side effects.
     """Computes the loss for logit distillation.
 
     Args:

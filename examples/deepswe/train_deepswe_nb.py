@@ -1,3 +1,48 @@
+# [MODULE DOC]
+# Notebook-style script ("# %%" cells, top-level code) reproducing DeepSWE: multi-turn agentic GRPO
+# training of a Qwen3 model (default Qwen3-32B) on R2E-Gym-Subset software-engineering tasks executed
+# in Kubernetes-hosted Docker sandboxes. Steps:
+# 0. Registers a faulthandler dump on SIGINT; parses known CLI args (model/data/batch sizes, LoRA,
+# GRPO clip/beta/off-policy, rollout lengths and sampling, optimizer, checkpointing, micro-batch sizes,
+# max_turns 50, per-turn timeout 300 s, max_concurrency 200, overlong filter, mesh overrides
+# rollout/train fsdp/tp/sp, rollout_split_fraction 0.5, filter_statuses (TrajectoryStatus names),
+# loss_agg_mode, advantage_estimator "rloo", use_rollout_logps, degenerate_group_masking, dtypes,
+# flash attention, metric_logger_dir, logging_level) and configures Python/absl logging.
+# 1. Puts cwd and cwd/{tunix,pathways-utils,r2egym} on sys.path, checks imports, and initializes
+# pathwaysutils when JAX_PLATFORMS is "proxy".
+# 2-3. Imports tunix and DeepSWE modules; creates the dataset cache dir; sets KUBECONFIG and the node
+# selector env vars; loads the kube config (failures only printed).
+# 4. Downloads Qwen/<model_version> from HF into <cwd>/<models_base_dir>/<model_version> if the dir
+# is missing or empty; derives hyperparameters (kv cache = prompt + response + 128; vLLM max seqs =
+# rollout micro batch * num generations; batched tokens = seqs * kv cache / 8).
+# 5. Builds the model config via call_model_config, applies remat policy, dtype and flash attention.
+# Mesh resolution: if any rollout override is given, only provided dims become axes; else rollout gets
+# int(total * split_fraction) devices with tp = gcd(devices, num_kv_heads) and the rest fsdp. Train:
+# if any override, axes fsdp (default 1), optional sp, tp (default 1); else the remaining devices with
+# fsdp = gcd(devices, train micro batch * num generations). Raises ValueError if more devices are
+# requested than exist. Rollout uses the first devices, train the following ones. Enables sequence
+# parallel sharding if train sp is set.
+# 6-7. Loads the reference model on the train mesh in param dtype; actor is a LoRA wrapper or a deep
+# copy of the reference params; loads tokenizer and Qwen chat template parser.
+# 8. Loads R2E-Gym-Subset (train) and JSON-encodes list fields.
+# 9. Creates checkpoint options (unused), metrics logger options, AdamW with injectable hyperparams
+# chained after global-norm clipping.
+# 10. Builds the rollout config (sglang_jax, vllm (server mode, async scheduling, prefix caching, dp/tp
+# from the rollout mesh, optional LoRA rank), or vanilla; else ValueError), ClusterConfig with actor and
+# reference on the train mesh and checkpointing disabled, and RLCluster.
+# 11. Builds agentic GRPOConfig (episode timeout = per-turn timeout * max turns, etc.) and GRPOLearner
+# with SWEAgent / SWEEnv(max_steps=max_turns) and no reward fns (reward from the env), shuffles and
+# batches the dataset with mixed_type_batch_fn (prompt key problem_statement), optionally inits wandb,
+# and trains.
+# KNOWN ISSUE: the parser defines --metric_logger_dir but the code reads args.metrics_logger_dir, which
+# raises AttributeError when building metrics_logging_options.
+# KNOWN ISSUE: KUBECONFIG is set to a literal "~/.kube/config" (tilde is not expanded by most clients).
+# KNOWN ISSUE: if the verification imports fail, pathwaysutils is undefined and the following check
+# raises NameError.
+# KNOWN ISSUE: boolean flags use type=bool, so any non-empty string (including "False") is True.
+# KNOWN ISSUE: the module name agentic_grpo_learner is rebound to the learner instance; the
+# system_prompt in GRPOConfig (SWE_SYSTEM_PROMPT) is independent of the prompt SWEAgent actually uses;
+# --ckpt_dir, --optimizer_offload and the checkpointing options are not used.
 # %%
 # [WIP] Reproduction of [DeepSWE](https://www.together.ai/blog/deepswe)
 # with Multi-turn Agentic framework.
@@ -589,6 +634,11 @@ qwen_reference = params_lib.create_model_from_safe_tensors(
 
 
 def get_lora_model(base_model, model_mesh):
+  # [FUNCTION DOC]
+  # Applies qwix LoRA (rank RANK, alpha ALPHA) to Llama/Qwen-style q/k/v/o and gate/down/up projection
+  # modules of base_model, using base_model.get_model_input() as sample inputs, then under model_mesh
+  # applies sharding constraints from the state's partition specs and writes the state back.
+  # Output: the LoRA model. Used only when --train_with_lora is set.
   lora_provider = qwix.LoraProvider(
       module_path=(
           ".*q_proj|.*k_proj|.*v_proj|.*o_proj|"
@@ -648,6 +698,9 @@ dataset = load_dataset(
 
 
 def transform(entry):
+  # [FUNCTION DOC]
+  # HELPER: replaces each list value of entry with its JSON string in place and returns entry (makes
+  # R2E-Gym rows Arrow/grain friendly).
   for k, v in entry.items():
     if isinstance(v, list):
       entry[k] = json.dumps(v)
@@ -827,6 +880,13 @@ dataset = dataset.shuffle(seed=SEED)
 grain_dataset = grain.MapDataset.source(dataset)
 
 def mixed_type_batch_fn(elements):
+  # [FUNCTION DOC]
+  # Custom batch function for post_init_dataset. For each key of the first element: keys in the string
+  # set or dict set, and unknown keys, become Python lists of values; keys in int_set (counts plus prompt,
+  # problem_statement, expected_output_json) become numpy arrays. Output: dict of batched values.
+  # Raises IndexError for an empty list.
+  # KNOWN ISSUE: int_set contains string fields despite its name; the str/dict branch is identical to the
+  # fallback branch.
   """elements: A list of dicts."""
   batched_data = {}
   str_set = {

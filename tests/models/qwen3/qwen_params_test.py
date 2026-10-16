@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for Qwen3 parameter handling: LoRA merged-model saving/loading (via the shared
+# lora_params_test_base.LoraParamsTestBase, which this module specializes with Qwen3 hooks) and
+# tied-embedding configuration behavior. Uses a tiny 2-layer config (vocab 256, embed 64, hidden 128,
+# 2 heads of dim 32, 2 kv heads, dense MLP). Side effects: writes safetensors and config.json into the
+# base class's checkpoint directory. When run directly in Colab it runs only Qwen3ParamsTest via the
+# unittest runner; otherwise absltest.main.
 
 """Tests for Qwen3 model parameters and LoRA merged model saving."""
 
@@ -29,9 +36,15 @@ from tunix.tests import test_common
 
 
 class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
+  # [CLASS DOC]
+  # Qwen3 specialization of the shared LoRA params test base; supplies config, model class, LoRA target
+  # regex, HF projection key names, save/load functions and a checkpoint writer.
   """Tests for Qwen3 model parameters and LoRA merging."""
 
   def create_config(self):
+    # [FUNCTION DOC]
+    # HELPER: returns a tiny Qwen3 ModelConfig (2 layers, vocab 256, embed 64, hidden 128, 2 heads, head
+    # dim 32, 2 kv heads, rope theta 10000, norm eps 1e-6, no experts).
     """Create Qwen3 model config for testing."""
     return qwen3_model.ModelConfig(
         num_layers=2,
@@ -48,16 +61,24 @@ class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def get_model_class(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the Qwen3 model class.
     """Get Qwen3 model class."""
     return qwen3_model.Qwen3
 
   def get_lora_module_path(self) -> str:
+    # [FUNCTION DOC]
+    # HELPER: returns a regex alternation matching q/k/v/o attention projections and gate/up/down MLP
+    # projections as LoRA targets.
     """Get LoRA target modules for Qwen3."""
     return (
         ".*q_proj|.*k_proj|.*v_proj|.*o_proj|.*gate_proj|.*up_proj|.*down_proj"
     )
 
   def get_projection_keys(self, layer_idx: int) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: returns the seven HF safetensors weight names for the given layer index:
+    # model.layers.<i>.self_attn.{q,k,v,o}_proj.weight and model.layers.<i>.mlp.{gate,up,down}_proj.weight.
     """Get projection keys for Qwen3."""
     prefix = f"model.layers.{layer_idx}"
     return [
@@ -71,6 +92,9 @@ class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
     ]
 
   def save_merged_model(self, lora_model):
+    # [FUNCTION DOC]
+    # HELPER: calls qwen3 params save_lora_merged_model_as_safetensors with the base checkpoint dir, merged
+    # output dir, the LoRA model, and the base class's rank and alpha. Side effect: writes files.
     """Save Qwen3 LoRA merged model."""
     qwen3_params.save_lora_merged_model_as_safetensors(
         local_model_path=self.base_checkpoint_dir,
@@ -81,6 +105,8 @@ class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def create_model_from_checkpoint(self, checkpoint_dir: str):
+    # [FUNCTION DOC]
+    # HELPER: loads a Qwen3 model from a safetensors directory with self.config, no mesh, float32.
     """Load Qwen3 model from checkpoint."""
     return qwen3_params.create_model_from_safe_tensors(
         file_dir=checkpoint_dir,
@@ -90,6 +116,16 @@ class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def create_checkpoint(self, model) -> str:
+    # [FUNCTION DOC]
+    # HELPER: writes the model's weights as an HF-format safetensors checkpoint. Creates the base checkpoint
+    # dir, saves embed_tokens, final norm and transposed lm_head; for each layer saves input/post-attention
+    # layernorms and q/k norms; q/k/v projections stored as (heads, embed, head_dim) are permuted to (embed,
+    # heads, head_dim), flattened to (embed, heads*head_dim) and transposed; o_proj (heads, head_dim, embed)
+    # is permuted to (embed, heads, head_dim), flattened and transposed; MLP kernels are transposed. Each
+    # projection is written only if present. Writes model.safetensors and a minimal config.json with
+    # model_type "qwen3". Returns the checkpoint directory path.
+    # KNOWN ISSUE: lm_head is read unconditionally, so this fails if the config used tied embeddings (no
+    # lm_head attribute).
     """Extract model weights and save in safetensors format.
 
     Uses the model's actual weights and applies inverse transformations
@@ -203,9 +239,13 @@ class Qwen3ParamsTest(lora_params_test_base.LoraParamsTestBase):
 
 
 class Qwen3ModelConfigTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests Qwen3 tied-embedding configuration defaults and their effect on model structure.
   """Tests specific to Qwen3 configurations and architectural flags."""
 
   def test_tied_embeddings_config_values(self):
+    # [FUNCTION DOC]
+    # Verifies qwen3_0p6b and qwen3_1p7b configs enable use_tied_embedding and qwen3_8b disables it.
     """Verify that smaller Qwen3 models correctly default to tied embeddings."""
     # 0.5B / 0.6B model should use tied embeddings
     config_0p6b = qwen3_model.ModelConfig.qwen3_0p6b()
@@ -229,6 +269,8 @@ class Qwen3ModelConfigTest(absltest.TestCase):
     )
 
   def test_model_instantiation_with_tied_embeddings(self):
+    # [FUNCTION DOC]
+    # Verifies a Qwen3 built with use_tied_embedding True has no lm_head attribute.
     """Verify that the Qwen3 model omits the lm_head when embeddings are tied."""
     rngs = nnx.Rngs(params=0)
 
@@ -254,6 +296,8 @@ class Qwen3ModelConfigTest(absltest.TestCase):
     )
 
   def test_model_instantiation_without_tied_embeddings(self):
+    # [FUNCTION DOC]
+    # Verifies a Qwen3 built with use_tied_embedding False has an lm_head attribute.
     """Verify that the Qwen3 model includes the lm_head when embeddings are not tied."""
     rngs = nnx.Rngs(params=0)
 

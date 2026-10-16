@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.sft.profiler.Profiler, which starts a JAX trace at
+# step initial_step + skip_first_n_steps and stops it at that step plus
+# profiler_steps, only on process 0 and only when ProfilerOptions are given,
+# allows only one active profiler at a time (class flag _is_active), and
+# raises ValueError for step windows that do not fit before max_step or are
+# empty. jax.profiler start/stop and jax.process_index are mocked.
 """Unit tests for `profiler`."""
 
 from unittest import mock
@@ -24,8 +31,14 @@ import tempfile
 
 
 class ProfilerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for Profiler. Fixture resets the class-level
+  # Profiler._is_active flag for isolation.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture creating self.log_dir and resetting Profiler._is_active.
+    # Side effect: mutates class state of profiler.Profiler.
     super().setUp()
     try:
       self.log_dir = self.create_tempdir().full_path
@@ -40,6 +53,10 @@ class ProfilerTest(parameterized.TestCase):
   def test_profiler_active_with_options_process_0(
       self, mock_stop_trace, mock_start_trace, _
   ):
+    # [FUNCTION DOC]
+    # Verifies on process 0 with options (skip 10, steps 5): profiling enabled,
+    # output path is log_dir, window [10, 15], start_trace called with log_dir at
+    # step 10 and stop_trace at step 15. Inputs: the three injected mocks.
     profiler_options = profiler.ProfilerOptions(
         log_dir=self.log_dir, skip_first_n_steps=10, profiler_steps=5
     )
@@ -66,6 +83,9 @@ class ProfilerTest(parameterized.TestCase):
   def test_profiler_inactive_for_non_zero_process(
       self, mock_stop_trace, mock_start_trace, _
   ):
+    # [FUNCTION DOC]
+    # Verifies on process 1 profiling is disabled and neither start nor stop
+    # trace is ever called.
     profiler_options = profiler.ProfilerOptions(
         log_dir=self.log_dir, skip_first_n_steps=10, profiler_steps=5
     )
@@ -89,6 +109,8 @@ class ProfilerTest(parameterized.TestCase):
   def test_profiler_inactive_without_options(
       self, mock_stop_trace, mock_start_trace, _
   ):
+    # [FUNCTION DOC]
+    # Verifies profiler_options None disables profiling entirely.
     p = profiler.Profiler(initial_step=0, max_step=100, profiler_options=None)
 
     self.assertTrue(p._do_not_profile)
@@ -144,6 +166,11 @@ class ProfilerTest(parameterized.TestCase):
       expect_start_called,
       profiler_options_none=False,
   ):
+    # [FUNCTION DOC]
+    # Verifies maybe_activate starts the trace only exactly at the first profile
+    # step and never when options are None. Inputs: mocks plus parameterized
+    # initial_step, skip_first_n_steps, current_step, expectation and the
+    # profiler_options_none flag.
     profiler_options = None
     if not profiler_options_none:
       profiler_options = profiler.ProfilerOptions(
@@ -206,6 +233,12 @@ class ProfilerTest(parameterized.TestCase):
       expect_stop_called,
       profiler_options_none=False,
   ):
+    # [FUNCTION DOC]
+    # Verifies maybe_deactivate does not stop the trace before or after the last
+    # profile step (5 + 10 = 15) or when options are None; activates first when
+    # options are present.
+    # KNOWN ISSUE: no case checks that the trace is stopped exactly at the last
+    # step, so expect_stop_called is always False.
     profiler_options = None
     if not profiler_options_none:
       profiler_options = profiler.ProfilerOptions(
@@ -233,6 +266,9 @@ class ProfilerTest(parameterized.TestCase):
   def test_multiple_profiler_instances(
       self, mock_start_trace, mock_stop_trace, _
   ):
+    # [FUNCTION DOC]
+    # Verifies only one profiler can be active: the second instance neither
+    # starts nor stops the trace while the first one owns it.
     profiler_options = profiler.ProfilerOptions(
         log_dir=self.log_dir, skip_first_n_steps=5, profiler_steps=10
     )
@@ -292,6 +328,9 @@ class ProfilerTest(parameterized.TestCase):
   def test_invalid_step_numbers(
       self, max_step, initial_step, skip_first_n_steps, profiler_steps
   ):
+    # [FUNCTION DOC]
+    # Verifies constructing a Profiler raises ValueError when the window exceeds
+    # max_step or profiler_steps is 0.
     profiler_options = profiler.ProfilerOptions(
         log_dir=self.log_dir,
         skip_first_n_steps=skip_first_n_steps,

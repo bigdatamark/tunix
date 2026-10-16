@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Unit tests for PPO helpers in tunix.rl.algo_core (imported as ppo_helpers):
+# compute_gae_advantages (checked against a NumPy port of the verl reference
+# implementation), masked_mean and masked_var. No side effects.
 """Unit tests for PPO helper functions."""
 
 from absl.testing import absltest
@@ -28,16 +33,37 @@ def _ref_compute_gae_advantages(
     gamma,
     lam,
 ):
+  # [FUNCTION DOC]
+  # HELPER: reference GAE (verl port). Inputs: per-token rewards, values and
+  # response mask, each of shape (batch, gen_len); discount gamma; GAE lambda.
+  # Iterates time steps from last to first keeping running next-value and
+  # last-GAE accumulators (both start at 0). At each step computes TD error
+  # delta = reward + gamma * next_value - value and candidate GAE = delta +
+  # gamma * lam * last_gae; where mask is 1 the accumulators take the current
+  # value / candidate GAE, where mask is 0 they carry over unchanged (masked
+  # tokens are skipped). The collected per-step GAEs, reversed back to time
+  # order, are the raw advantages. Returns (whitened advantages, returns)
+  # where returns = raw advantages + values and whitening subtracts the
+  # masked mean and divides by sqrt(masked unbiased variance + 1e-8).
+  # No exceptions or side effects.
   """Verl implementation of GAE advantages computation."""
 
   def masked_sum(values, mask, axis=None):
+    # [FUNCTION DOC]
+    # HELPER: sum of values times mask over the given axis (all if None).
     return (values * mask).sum(axis=axis)
 
   def masked_mean(values, mask, axis=None):
+    # [FUNCTION DOC]
+    # HELPER: masked sum divided by (mask sum + 1e-8) over the given axis.
     s = masked_sum(values, mask, axis)
     return s / (mask.sum(axis=axis) + 1e-8)
 
   def masked_var(values, mask):
+    # [FUNCTION DOC]
+    # HELPER: global masked variance with Bessel correction: masked mean of
+    # squared deviations from the masked mean, times n / (n - 1) where n is
+    # the mask sum. Divides by zero if n equals 1.
     mean = masked_mean(values, mask)
     centered_values = values - mean
     variance = masked_mean(centered_values**2, mask)
@@ -48,6 +74,9 @@ def _ref_compute_gae_advantages(
     return variance
 
   def masked_whiten(values, mask):
+    # [FUNCTION DOC]
+    # HELPER: (values - masked mean) / sqrt(masked var + 1e-8); masked-out
+    # positions are transformed too, not zeroed.
     mean, var = masked_mean(values, mask), masked_var(values, mask)
     whitened = (values - mean) / np.sqrt(var + 1e-8)
     return whitened
@@ -80,8 +109,14 @@ def _ref_compute_gae_advantages(
 
 
 class PPOHelpersTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for GAE advantage computation and masked statistics helpers.
 
   def test_compute_gae_advantages(self):
+    # [FUNCTION DOC]
+    # Verifies compute_gae_advantages (gamma 0.9, lambda 0.7) on random
+    # 3 x 10 rewards/values with trailing, full and arbitrary masks matches
+    # the reference implementation for both advantages and returns (1e-5).
     bsz, seq_len = 3, 10
     rewards = jax.random.uniform(jax.random.PRNGKey(0), (bsz, seq_len))
     values = jax.random.uniform(jax.random.PRNGKey(1), (bsz, seq_len))
@@ -135,6 +170,9 @@ class PPOHelpersTest(parameterized.TestCase):
       ),
   )
   def test_masked_mean(self, x, mask, axis, expected_mean):
+    # [FUNCTION DOC]
+    # Verifies masked_mean averages only mask-true entries, globally when
+    # axis is None or per row when axis is 1.
     computed = ppo_helpers.masked_mean(x, mask, axis)
     np.testing.assert_allclose(computed, expected_mean, rtol=1e-5, atol=1e-5)
 
@@ -155,6 +193,9 @@ class PPOHelpersTest(parameterized.TestCase):
       ),
   )
   def test_masked_var(self, x, mask, expected_var):
+    # [FUNCTION DOC]
+    # Verifies masked_var returns the unbiased (Bessel-corrected) variance
+    # of the mask-true entries across the whole array.
     computed = ppo_helpers.masked_var(x, mask=mask)
     np.testing.assert_allclose(computed, expected_var, rtol=1e-5, atol=1e-5)
 

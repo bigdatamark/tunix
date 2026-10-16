@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.feature_extraction.projection:
+# setup_models_with_feature_projection wraps the student's and teacher's
+# target layers (here nnx.LinearGeneral) so their outputs are sowed, adds a
+# projection from student feature shape to teacher feature shape and returns
+# a ModelWithFeatureProjection (returning (logits, projected features)) plus
+# the modified teacher; remove_feature_projection_from_models undoes this,
+# restoring the original layer objects.
 """Unit tests for wrapping models with feature projection."""
 
 from absl.testing import absltest
@@ -25,8 +33,15 @@ from tunix.distillation.feature_extraction import sowed_module
 
 
 class DummyModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: toy nnx model with one LinearGeneral layer mapping an input of
+  # shape in_features (int or tuple; contracted over all its axes) to
+  # out_features, initialized with Rngs(0).
 
   def __init__(self, in_features=3, out_features=10):
+    # [FUNCTION DOC]
+    # HELPER: normalizes an int in_features to a 1-tuple and creates self.linear
+    # contracting over every input axis.
     if isinstance(in_features, int):
       in_features = (in_features,)
     self.linear = nnx.LinearGeneral(
@@ -37,11 +52,15 @@ class DummyModel(nnx.Module):
     )
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # HELPER: returns self.linear(x).
     x = self.linear(x)
     return x
 
 
 class TestModelWithFeatureProjection(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for feature-projection setup and removal.
 
   @parameterized.named_parameters(
       dict(
@@ -83,6 +102,13 @@ class TestModelWithFeatureProjection(parameterized.TestCase):
   def test_setup_models_with_feature_projection(
       self, student_features, teacher_features
   ):
+    # [FUNCTION DOC]
+    # Verifies for various student/teacher feature shapes (scalar or
+    # multi-axis): the wrapped student returns unchanged logits plus projected
+    # features whose shape equals the teacher's sowed feature stack; the
+    # student's and teacher's linear layers are wrappers whose wrapped_model is
+    # the original layer; the teacher stays a DummyModel.
+    # Inputs: student_features and teacher_features shapes.
     student_model = DummyModel(
         in_features=student_features, out_features=student_features
     )
@@ -133,6 +159,9 @@ class TestModelWithFeatureProjection(parameterized.TestCase):
     npt.assert_allclose(new_student_logits, student_logits, rtol=1e-6)
 
   def test_remove_feature_projection_from_models(self):
+    # [FUNCTION DOC]
+    # Verifies remove_feature_projection_from_models returns the original
+    # student and teacher objects with their original linear layers restored.
     student_model = DummyModel()
     teacher_model = DummyModel(out_features=20)
     dummy_input = {"x": jnp.ones(3)}

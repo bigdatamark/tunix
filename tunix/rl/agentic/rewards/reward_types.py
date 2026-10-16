@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Small types module for rewards. Defines RewardOutput and module aliases
+# field and dataclass for dataclasses.field / dataclasses.dataclass.
 """Common types used for reward computation and representation."""
 
 import dataclasses
@@ -23,6 +26,10 @@ dataclass = dataclasses.dataclass
 
 @dataclass
 class RewardOutput:
+  # [CLASS DOC]
+  # Dataclass holding a reward result. Fields: reward (float, required, positional
+  # first) and metadata (dict of str to any, default empty dict) for diagnostic
+  # breakdowns. No methods beyond the dataclass-generated ones.
   """Standardized container for reward computation results.
 
   This class encapsulates both the numerical reward signal and associated

@@ -12,13 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.algorithm_config.AlgorithmConfig, a keyword-only,
+# slotted, mutable dataclass whose post-init validates algo_variant,
+# advantage_estimator and policy_loss_fn against allowed sets (raising
+# ValueError "<field> must be one of ... Received: ...") and logs its values
+# at INFO. Also checks the optional kl_clamp_value field.
+# Side effects: none beyond captured logs.
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from tunix.rl import algorithm_config
 
 class AlgorithmConfigTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for AlgorithmConfig defaults, validation, dataclass properties and
+  # logging.
 
   def test_defaults_are_valid(self):
+    # [FUNCTION DOC]
+    # Verifies the default config constructs without ValueError and uses
+    # "grpo" for algo_variant, advantage_estimator and policy_loss_fn.
     """Ensures the default constructor values pass validation."""
     try:
       config = algorithm_config.AlgorithmConfig()
@@ -44,6 +58,9 @@ class AlgorithmConfigTest(parameterized.TestCase):
       ),
   )
   def test_valid_combinations(self, algo: str, adv: str, loss: str):
+    # [FUNCTION DOC]
+    # Verifies valid (algo_variant, advantage_estimator, policy_loss_fn)
+    # triples such as gspo-token/gae/ppo construct and are stored unchanged.
     """Tests various valid combinations of core algorithm parameters."""
     try:
       config = algorithm_config.AlgorithmConfig(
@@ -63,6 +80,9 @@ class AlgorithmConfigTest(parameterized.TestCase):
       dict(testcase_name="invalid_algo_else", value="something_else"),
   )
   def test_invalid_algo_variant(self, value: str):
+    # [FUNCTION DOC]
+    # Verifies an unknown algo_variant raises ValueError whose message
+    # includes the received value in repr form.
     """Tests that invalid algo_variant values raise ValueError."""
     with self.assertRaisesRegex(
         ValueError, f"algo_variant must be one of .* Received: {value!r}"
@@ -74,6 +94,8 @@ class AlgorithmConfigTest(parameterized.TestCase):
       dict(testcase_name="invalid_adv_ppo", value="ppo"),
   )
   def test_invalid_advantage_estimator(self, value: str):
+    # [FUNCTION DOC]
+    # Verifies advantage_estimator values "other" and "ppo" raise ValueError.
     """Tests that invalid advantage_estimator values raise ValueError."""
     with self.assertRaisesRegex(
         ValueError, f"advantage_estimator must be one of .* Received: .*"
@@ -85,6 +107,8 @@ class AlgorithmConfigTest(parameterized.TestCase):
       dict(testcase_name="invalid_loss_mse", value="mse"),
   )
   def test_invalid_policy_loss_fn(self, value: str):
+    # [FUNCTION DOC]
+    # Verifies policy_loss_fn values "gspo" and "mse" raise ValueError.
     """Tests that invalid policy_loss_fn values raise ValueError."""
     with self.assertRaisesRegex(
         ValueError,
@@ -93,6 +117,9 @@ class AlgorithmConfigTest(parameterized.TestCase):
       algorithm_config.AlgorithmConfig(policy_loss_fn=value)
 
   def test_kw_only_enforcement(self):
+    # [FUNCTION DOC]
+    # Verifies positional construction raises TypeError (kw_only dataclass)
+    # and keyword construction of a valid triple succeeds.
     """Ensures that positional arguments are not allowed."""
     with self.assertRaises(TypeError):
       # Attempt to initialize with positional arguments
@@ -109,12 +136,20 @@ class AlgorithmConfigTest(parameterized.TestCase):
       self.fail("Keyword arguments failed for kw_only dataclass")
 
   def test_slots_enabled(self):
+    # [FUNCTION DOC]
+    # Verifies assigning an undeclared attribute raises AttributeError.
     """Checks that slots are active, preventing arbitrary attribute assignment."""
     config = algorithm_config.AlgorithmConfig()
     with self.assertRaises(AttributeError):
       config.new_attribute = "test"
 
   def test_field_assignment(self):
+    # [FUNCTION DOC]
+    # Verifies fields are mutable after construction and that validation is
+    # not re-run on assignment, so even invalid values are stored.
+    # KNOWN ISSUE: assigns "gspo", which is not a valid variant at
+    # construction time (valid is "gspo-token"); this documents that
+    # post-init validation can be bypassed by later assignment.
     """Tests that fields can be set after initialization (since frozen=False)."""
     config = algorithm_config.AlgorithmConfig()
     config.algo_variant = "gspo"
@@ -125,6 +160,9 @@ class AlgorithmConfigTest(parameterized.TestCase):
     self.assertEqual(config.algo_variant, "invalid_after_init")
 
   def test_config_logging(self):
+    # [FUNCTION DOC]
+    # Verifies construction logs at INFO "Initializing AlgorithmConfig" and
+    # each core field as "<name>: <value>".
     """Tests that configuration is logged correctly upon initialization."""
     # assertLogs catches logs at the specified level or higher
     with self.assertLogs(level="INFO") as log:
@@ -143,6 +181,8 @@ class AlgorithmConfigTest(parameterized.TestCase):
     self.assertIn("policy_loss_fn: ppo", full_log_output)
 
   def test_kl_clamp_value_default_is_none(self):
+    # [FUNCTION DOC]
+    # Verifies kl_clamp_value defaults to None (no KL clamping).
     """Default `kl_clamp_value` is None (no clamp, prior behavior)."""
     config = algorithm_config.AlgorithmConfig()
     self.assertIsNone(config.kl_clamp_value)
@@ -153,6 +193,8 @@ class AlgorithmConfigTest(parameterized.TestCase):
       ("explicit_none", None),
   )
   def test_kl_clamp_value_round_trips(self, value):
+    # [FUNCTION DOC]
+    # Verifies kl_clamp_value is stored exactly as passed (float or None).
     """`kl_clamp_value` is stored as-set on the config."""
     config = algorithm_config.AlgorithmConfig(kl_clamp_value=value)
     self.assertEqual(config.kl_clamp_value, value)

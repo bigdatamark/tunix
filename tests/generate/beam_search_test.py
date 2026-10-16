@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for tunix.generate.beam_search: init_batched_beam_state (expands batch tensors and cache to
+# batch*beam rows and creates uninitialized scores of shape [batch, beam]), beam_search_step (accumulates
+# log-softmax scores, keeps the top beam_size candidates per batch item, reorders token buffer and cache
+# rows by parent beam, writes the chosen token at decoding_step+1, and keeps finished beams frozen when
+# they remain in the top set), and finalize_beam_search_state (selects the best beam per batch item).
+# Inputs: small synthetic logits (vocab 3), batch 2 and beam 2, seq length 10, pad id -1. No side effects.
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
@@ -6,8 +13,13 @@ from tunix.generate import sampler as sampler_lib
 
 
 class BeamSearchTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test suite for beam search state initialization, stepping and finalization.
 
   def setUp(self) -> None:
+    # [FUNCTION DOC]
+    # HELPER: fixture setting batch_size 2, beam_size 2, vocab_size 3, seq_length 10 and pad_token_id as a
+    # one-element array holding -1.
     super().setUp()
     self.batch_size = 2
     self.beam_size = 2
@@ -18,6 +30,13 @@ class BeamSearchTest(absltest.TestCase):
   def _check_content_equal_per_beam(
       self, beam_content: jnp.ndarray, original_content: jnp.ndarray
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: asserts that beam_content has beam_size times as many rows as original_content and, for
+    # multi-dimensional inputs, the same trailing shape and matching content between expanded rows and
+    # original rows.
+    # KNOWN ISSUE: the loop variable already steps by beam_size and is then multiplied by beam_size again
+    # and also used directly to index original_content, so it compares the wrong rows (and indexes beyond the
+    # batch, which JAX clamps silently); one-dimensional inputs get only the row-count check.
     self.assertEqual(
         beam_content.shape[0], original_content.shape[0] * self.beam_size
     )
@@ -29,6 +48,9 @@ class BeamSearchTest(absltest.TestCase):
         )
 
   def test_initialization(self) -> None:
+    # [FUNCTION DOC]
+    # Verifies init_batched_beam_state returns an uninitialized state with scores of shape [batch, beam] and
+    # that cache, token buffer, done, logits and positions are expanded per beam.
     cache = sampler_lib._init_cache(
         n_layers=2,
         cache_size=16,
@@ -72,6 +94,13 @@ class BeamSearchTest(absltest.TestCase):
     )
 
   def test_beam_search_step_without_stop(self) -> None:
+    # [FUNCTION DOC]
+    # Verifies two beam_search_step calls from an uninitialized state. Step one: scores equal the top-2
+    # log-softmax values of each batch item's first-beam logits, and tokens are written at column 0, done and
+    # cache unchanged. Step two: scores equal the top-2 of accumulated scores over both beams' log-softmax,
+    # columns 0 and 1 of the token buffer match the expected reordered beams [1,2,1,1] and [1,1,1,2], the rest
+    # stays padding, cache rows are reordered to parents [1,0,2,2], and finalize returns shape [batch, seq]
+    # with each batch item's first beam.
     # b0: [[0.2, 0.35, 0.45]]
     decoding_step = -1
     original_cache = {
@@ -124,6 +153,8 @@ class BeamSearchTest(absltest.TestCase):
     self.assertTrue(jnp.allclose(updated_params['done'], done))
 
     def _check(x, y) -> None:
+      # [FUNCTION DOC]
+      # HELPER: asserts two arrays are elementwise close.
       self.assertTrue(jnp.allclose(x, y))
 
     jax.tree.map(
@@ -217,6 +248,10 @@ class BeamSearchTest(absltest.TestCase):
     )
 
   def test_beam_search_step_with_stop_picked(self) -> None:
+    # [FUNCTION DOC]
+    # Verifies that a finished beam with the best score (0.2 vs -2) stays done and unchanged (only its first
+    # token, rest padding) across five steps, while the other beam keeps generating non-pad tokens up to
+    # decoding_step and padding afterwards (batch size 1).
     self.batch_size = 1
     initial_scores = jnp.zeros(
         (self.batch_size, self.beam_size), dtype=jnp.float32
@@ -271,6 +306,9 @@ class BeamSearchTest(absltest.TestCase):
       self.assertEqual(token_buffer[1, i], self.pad_token_id)
 
   def test_beam_search_step_with_stop_not_picked(self) -> None:
+    # [FUNCTION DOC]
+    # Verifies that a finished beam with a very low score (-100) is dropped after one step, so neither
+    # resulting beam is marked done.
     self.batch_size = 1
     initial_scores = jnp.zeros(
         (self.batch_size, self.beam_size), dtype=jnp.float32

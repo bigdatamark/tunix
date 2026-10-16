@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utilities for feature-projection distillation: wrap a student model so
+#   its sown intermediate features are passed through a learned linear
+#   projection to the teacher's feature shape, plus setup/teardown helpers
+#   used by FeatureProjectionStrategy. Relies on sowed_module for capture.
+# Side effects at import: none.
 """Utilities for feature projection for distillation."""
 
 from typing import Any
@@ -24,6 +30,12 @@ from tunix.distillation.feature_extraction import sowed_module
 
 
 class ModelWithFeatureProjection(nnx.Module):
+  # [CLASS DOC]
+  # nnx.Module wrapping a model whose target sublayers were already wrapped
+  # with SowedModule. Attributes: model (the wrapped model) and
+  # projection_layer (nnx.LinearGeneral contracting all axes of the stacked
+  # feature array into feature_target_shape). Calling it returns
+  # (model output, projected features).
   """Wraps a model with a projection layer for extracted features.
 
   This module takes a base model, extracts its intermediate features using
@@ -38,6 +50,19 @@ class ModelWithFeatureProjection(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Inputs: model (sowed nnx module); feature_shape (int or tuple; full
+    #   shape of the stacked feature array); feature_target_shape (int or
+    #   tuple); rngs (keyword-only).
+    # Behavior: normalize an int feature_shape to a 1-tuple; store model;
+    #   create LinearGeneral(in_features=feature_shape,
+    #   out_features=feature_target_shape, axis=every input axis 0..n-1).
+    # Output: none. Exceptions: from LinearGeneral. Side effects: draws
+    #   params from rngs.
+    # KNOWN ISSUE: feature_shape is the whole stacked array shape (layers,
+    #   batch, seq, ...), so the projection is tied to the batch size and
+    #   sequence length of the dummy input, and its kernel size is the
+    #   product of both full shapes (potentially huge).
     """Initializes a ModelWithFeatureProjection.
 
     Args:
@@ -57,6 +82,13 @@ class ModelWithFeatureProjection(nnx.Module):
     )
 
   def __call__(self, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Forward pass. Inputs: any args/kwargs for the wrapped model.
+    # Steps: output = model(*args, **kwargs); pop the model's
+    #   nnx.Intermediate state; stack its leaves into one array; apply
+    #   projection_layer. Output: (output, projected_features).
+    # Exceptions: stacking/shape errors. Side effect: clears sown
+    #   intermediates on the wrapped model.
     output = self.model(*args, **kwargs)
     model_features = sowed_module.pop_sowed_intermediate_outputs(self.model)
     model_features = jnp.stack(jax.tree.leaves(model_features))
@@ -74,6 +106,19 @@ def setup_models_with_feature_projection(
     *,
     rngs: nnx.Rngs,
 ) -> tuple[ModelWithFeatureProjection, nnx.Module]:
+  # [FUNCTION DOC]
+  # Prepares student/teacher for feature projection distillation.
+  # Inputs: student_model, teacher_model, student_layer_to_capture and
+  #   teacher_layer_to_capture (module classes), dummy_student_input and
+  #   dummy_teacher_input (kwargs dicts), rngs (keyword-only).
+  # Steps: wrap matching sublayers of each model in place with SowedModule;
+  #   run each model once on its dummy input (outputs discarded); pop and
+  #   stack each model's sown features to obtain their shapes; build
+  #   ModelWithFeatureProjection(student, student stacked shape, teacher
+  #   stacked shape, rngs).
+  # Output: (projected student wrapper, teacher model).
+  # Exceptions: from wrapping, the forward passes, or stacking.
+  # Side effects: mutates both models in place, runs forward passes.
   """Builds a student model with feature projection.
 
   This function takes a student and a teacher model, wraps them with sowed
@@ -122,6 +167,12 @@ def setup_models_with_feature_projection(
 def remove_feature_projection_from_models(
     student_model: nnx.Module, teacher_model: nnx.Module
 ) -> tuple[nnx.Module, nnx.Module]:
+  # [FUNCTION DOC]
+  # Reverses setup_models_with_feature_projection. Inputs: student (maybe a
+  #   ModelWithFeatureProjection), teacher. If student is the wrapper,
+  #   replace it with its inner model (projection discarded); then remove
+  #   SowedModule wrappers in place from both. Output: (student, teacher).
+  # Exceptions: from unwrap_sowed_modules. Side effects: mutates models.
   """Returns original models from models modified with feature projection setup.
 
   Args:

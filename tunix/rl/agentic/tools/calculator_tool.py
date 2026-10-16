@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines CalculatorTool, a simple BaseTool doing one binary arithmetic operation
+# (+, -, *, /) on two numbers. Mainly an example/test tool for ToolAgent.
 """A tool for performing basic arithmetic calculations.
 
 This module defines the `CalculatorTool` class, which is a subclass of
@@ -25,6 +28,10 @@ from tunix.rl.agentic.tools import base_tool
 
 
 class CalculatorTool(base_tool.BaseTool):
+  # [CLASS DOC]
+  # Stateless calculator tool (immutable after construction, name and description
+  # given by the base constructor). Implements get_json_schema and synchronous
+  # apply; apply_async is inherited and raises NotImplementedError.
   """A basic calculator tool that performs arithmetic operations.
 
   Supports the four fundamental arithmetic operations: addition, subtraction,
@@ -35,6 +42,11 @@ class CalculatorTool(base_tool.BaseTool):
   """
 
   def get_json_schema(self) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Return the OpenAI function schema: type "function"; function name and
+    # description from the instance; parameters an object with number properties "a"
+    # (first operand) and "b" (second operand), and string property "op" restricted to
+    # the enum "+", "-", "*", "/"; all three required.
     """Generate OpenAI-compatible function schema for the calculator tool.
 
     Defines the tool's interface with strongly typed parameters and
@@ -71,6 +83,18 @@ class CalculatorTool(base_tool.BaseTool):
     }
 
   def apply(self, **kwargs: Any) -> base_tool.ToolOutput:
+    # [FUNCTION DOC]
+    # Compute a op b.
+    # Inputs: keyword arguments a, b, op.
+    # Behavior and outputs (all ToolOutput with name = tool name):
+    # missing a, b or op (None) gives error "Missing required arguments: 'a', 'b', and
+    # 'op'"; a or b not int/float (bool counts as int) gives error "Operands 'a' and
+    # 'b' must be numbers (int or float)"; op not a string gives error "Operator 'op'
+    # must be a string". Then "+", "-", "*" compute directly; "/" with b equal to 0
+    # gives error "Division by zero is not allowed", else true division; any other op
+    # gives error "Unsupported operator: <op>". On success output is str(result).
+    # Any exception during arithmetic (e.g. OverflowError) becomes error
+    # "<Type>: <message>". Never raises. Extra keyword arguments are ignored.
     """Execute the arithmetic operation with the provided operands and operator.
 
     Performs the requested calculation while handling edge cases and potential

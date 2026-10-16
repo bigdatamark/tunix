@@ -25,6 +25,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Integration test checking that Tunix's Qwen3 vLLM-JAX weight mapping (mapping_vllm_jax.VLLM_JAX_MAPPING)
+# covers every source key when syncing Tunix weights into a vLLM sampler.
+# Inputs: downloads "Qwen/Qwen3-1.7B" from HuggingFace into the system temp dir under models/<repo id>;
+# needs TPU/JAX devices and vLLM. Outputs: test results. Side effects: network download, device
+# memory allocation, temporary replacement of sys.stderr during weight loading.
 
 from io import StringIO
 import os
@@ -44,9 +50,15 @@ from tunix.tests import test_common as tc
 
 
 class VllmSamplerQwenTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test suite for vLLM sampler weight syncing with Qwen3 mappings.
 
   @classmethod
   def setUpClass(cls) -> None:
+    # [FUNCTION DOC]
+    # HELPER: class fixture. Sets repo_id to Qwen/Qwen3-1.7B, model_path to the temp dir models/<repo_id>,
+    # downloads the checkpoint via test_common.download_from_huggingface, and creates a (1, N device) mesh
+    # with axes ("fsdp", "tp") and Auto axis types stored as cls.mesh.
     super().setUpClass()
     cls.repo_id = "Qwen/Qwen3-1.7B"
     temp_dir = tempfile.gettempdir()
@@ -64,6 +76,16 @@ class VllmSamplerQwenTest(absltest.TestCase):
     )
 
   def test_qwen3_base_mapping_no_errors(self):
+    # [FUNCTION DOC]
+    # Verifies that loading a Tunix Qwen3 model state into VllmSampler produces no "No mapping for source key"
+    # log lines. Loads a 1-layer Qwen3 1.7B from safetensors, builds a MappingConfig from VLLM_JAX_MAPPING,
+    # creates a VllmSampler (jax backend, 0.3 HBM utilization, random init, max_model_len 128, not server
+    # mode), redirects sys.stderr to an in-memory buffer, patches the LLM's reset_prefix_cache and
+    # collective_rpc, calls load_checkpoint with the model state, then restores stderr and stops the sampler
+    # and asserts the captured text lacks the missing-mapping message.
+    # KNOWN ISSUE: replacing sys.stderr only captures Python-level writes; logs written by native code
+    # directly to file descriptor 2 (which the comment says it intends to trap) are not captured, so the
+    # assertion may pass vacuously. A comment also refers to a "mocked logger" that does not exist.
     """Tests that vLLM accepts Tunix's Qwen3 LoRA mappings without logging missing keys."""
 
     # 1. Create Tunix Actor Model

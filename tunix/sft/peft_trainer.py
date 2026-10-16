@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Core supervised fine-tuning trainer (PeftTrainer) used directly for SFT /
+#   LoRA and as the base class for DPO and distillation trainers.
+# Defines TrainingConfig, TrainingInput, MetricsBuffer,
+#   _calculate_global_batch_size, PeftTrainer and _default_loss_fn. Module
+#   aliases: _ModelInputT (dict of str -> array), P (ParamSpec),
+#   MetricsLogger / MetricsLoggerOptions (from tunix.sft.metrics_logger).
+# Training model: optimizer updates only nnx.LoRAParam when the model has
+#   LoRA params, otherwise all nnx.Param; optional gradient accumulation via
+#   optax.MultiSteps; jitted train/eval steps; checkpoint restore on init and
+#   periodic save; metrics buffered per update step and written one step
+#   late to overlap host I/O; optional eval every N steps, profiler window,
+#   progress bar, hooks, inflight throttling and perf tracing spans.
+# No side effects at import.
 """PEFT trainer."""
 
 from collections.abc import Iterable
@@ -53,6 +67,20 @@ MetricsLoggerOptions = sft_metrics_logger.MetricsLoggerOptions
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class TrainingConfig:
+  # [CLASS DOC]
+  # Keyword-only slotted trainer config. Fields: eval_every_n_steps
+  # (required; eval cadence in update steps), max_steps (update-step cap or
+  # None), gradient_accumulation_steps (None = 1), checkpoint_root_directory
+  # (None disables checkpointing), checkpointing_options (Orbax v0
+  # CheckpointManagerOptions), metrics_logging_options, profiler_options,
+  # perf_metrics_options (not used by PeftTrainer itself),
+  # data_sharding_axis (("fsdp",)), max_inflight_computations (2; <= 0 means
+  # unlimited), metrics_prefix (""), pbar_description ("Training"),
+  # max_seq_token_per_tpu (sequence packing; must be None unless the trainer
+  # class supports packing).
+  # KNOWN ISSUE: the comment says checkpoints contain the train data
+  #   iterator state, but only model/optimizer state and custom metadata
+  #   are saved; resumption skips already-consumed examples instead.
   """Configuration for the trainer."""
 
   eval_every_n_steps: int
@@ -90,6 +118,9 @@ class TrainingConfig:
   max_seq_token_per_tpu: int | None = None
 
   def get_with_default(self, key: str, default: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Inputs: key (attribute name), default. Returns the attribute
+    #   value, or default when it is None. AttributeError for unknown keys.
     val = getattr(self, key)
     if val is None:
       return default
@@ -98,6 +129,9 @@ class TrainingConfig:
 
 @flax.struct.dataclass(frozen=True)
 class TrainingInput:
+  # [CLASS DOC]
+  # Frozen flax struct (pytree) batch: input_tokens [B, L], input_mask
+  # [B, L] (valid-token mask), optional images.
   # Input tokens provided to the model.
   input_tokens: jax.Array | np.ndarray
 
@@ -110,6 +144,10 @@ class TrainingInput:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class MetricsBuffer:
+  # [CLASS DOC]
+  # Per-update-step metric accumulator (keyword-only, slotted dataclass).
+  # Fields: step, losses (list of per-micro-step losses), additional_metrics
+  # (name -> (list of values, aggregation fn)).
   """Metrics collected for a specific step.
 
   Attributes:
@@ -129,6 +167,9 @@ class MetricsBuffer:
 
   @property
   def loss(self):
+    # [FUNCTION DOC]
+    # Returns the arithmetic mean of all recorded losses after converting
+    # each to numpy (forces device-to-host transfer).
     """Returns the mean of the recorded losses for the step."""
     return np.mean(np.array([np.array(x) for x in self.losses]))
 
@@ -146,6 +187,12 @@ def _calculate_global_batch_size(train_example: Any) -> int:
   Raises:
     TypeError: If the batch size cannot be determined from the training example.
   """
+  # [FUNCTION DOC]
+  # HELPER: Input: train_example (dataclass, dict, or object with __dict__).
+  #   Collects its fields (dataclasses.asdict / the dict / vars()), and
+  #   returns shape[0] of the first value that is a jax or numpy array.
+  # Exceptions: TypeError if no array field exists (vars() raises TypeError
+  #   for objects without __dict__). Not used within this module.
   if dataclasses.is_dataclass(train_example):
     attributes = dataclasses.asdict(train_example)
   elif isinstance(train_example, dict):
@@ -166,6 +213,20 @@ def _calculate_global_batch_size(train_example: Any) -> int:
 
 class PeftTrainer:
   """PEFT trainer for LoRA. Only LoRA parameters are updated.
+  # [CLASS DOC]
+  # Generic trainer. Class attribute supports_sequence_packing = False.
+  # Key state: model, config, optimizer (nnx.Optimizer, wrt LoRAParam or
+  # Param), loss_fn / eval_loss_fn (called as fn(model, **model_inputs)),
+  # gen_model_input_fn (batch -> kwargs dict for the loss; identity by
+  # default), checkpoint_manager, metrics_logger, metrics_prefix,
+  # is_managed_externally (if True: no max_steps stop, no skipping of
+  # already-trained examples, no auto close), training_hooks, data_hooks,
+  # _train_steps (optimizer updates), _iter_steps (micro steps), _mode,
+  # _has_aux, _pbar, _prof, metric buffers, jitted step caches.
+  # Subclasses customize via _prepare_inputs, _post_process_train_step,
+  # _post_process_eval_step and custom_checkpoint_metadata.
+  # KNOWN ISSUE: docstring says only LoRA params are updated; without LoRA
+  #   params all nnx.Param are trained.
 
   Attributes:
     model: The model to train.
@@ -197,6 +258,23 @@ class PeftTrainer:
       perf_tracer: perf_trace.Tracer | None = None,
       perf_tracer_v2: perf_tracer_lib.Tracer | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: model, optimizer (optax transform), training_config,
+    #   metrics_logger (optional; created from config if None), perf_tracer
+    #   and perf_tracer_v2 (optional; no-op tracers by default).
+    # Steps: ValueError if max_seq_token_per_tpu is set and the class does
+    #   not support packing. Detect LoRA; wrap optimizer in optax.MultiSteps
+    #   if gradient_accumulation_steps set; build nnx.Optimizer wrt LoRAParam
+    #   or Param. Default loss fns = _default_loss_fn; identity input fn.
+    #   Build CheckpointManager from config; metrics logger; throttler;
+    #   mode TRAIN; _has_aux False. Restore from the latest checkpoint
+    #   (model + optimizer, LoRA-only if LoRA) giving _train_steps and
+    #   restored custom metadata; _iter_steps = _train_steps * accumulation.
+    #   Build Profiler with initial step _iter_steps and max step
+    #   max_steps * accumulation. Init buffers/hooks/jit cache to empty.
+    # Exceptions: ValueError above; checkpoint/profiler errors (profiler
+    #   ValueError if its window is empty). Side effects: restores model and
+    #   optimizer state in place; creates logging backends.
     # TODO(noghabi): Implement sequence packing for SFT and remove this check.
     if (
         training_config.max_seq_token_per_tpu is not None
@@ -282,12 +360,19 @@ class PeftTrainer:
     self._mini_batch_size = None
 
   def with_training_hooks(self, training_hooks: hooks.TrainingHooks):
+    # [FUNCTION DOC]
+    # Sets self.training_hooks. Returns None (not chainable).
     self.training_hooks = training_hooks
 
   def with_data_hooks(self, data_hooks: hooks.DataHooks):
+    # [FUNCTION DOC]
+    # Sets self.data_hooks (batch loading callbacks). Returns None.
     self.data_hooks = data_hooks
 
   def clear_jit_cache(self):
+    # [FUNCTION DOC]
+    # Resets cached jitted train/eval step fns to None so the next
+    # jit_train_and_eval_step rebuilds them. No output.
     """Clears the JIT cache of the train and eval step functions.
 
     This function should be called when the trainer is being reused after
@@ -303,6 +388,10 @@ class PeftTrainer:
       ],
       has_aux: bool = False,
   ):
+    # [FUNCTION DOC]
+    # Inputs: loss_fn (model first, then kwargs from gen_model_input_fn;
+    #   returns loss or (loss, aux)), has_aux. Clears jit cache, sets both
+    #   loss_fn and eval_loss_fn, stores has_aux. Returns self.
     self.clear_jit_cache()
     self.loss_fn = loss_fn
     self.eval_loss_fn = loss_fn
@@ -312,6 +401,9 @@ class PeftTrainer:
   def with_gen_model_input_fn(
       self, gen_model_input_fn: Callable[[Any], _ModelInputT]
   ):
+    # [FUNCTION DOC]
+    # Input: gen_model_input_fn (batch -> kwargs dict for the loss fn).
+    #   Clears jit cache, stores it, returns self.
     """Generates model input from training input.
 
     NB: output of this function will be passed to the loss function, so the args
@@ -331,6 +423,14 @@ class PeftTrainer:
   def _train_step(
       self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any
   ) -> Tuple[ArrayLike, Any | None, ArrayLike]:
+    # [FUNCTION DOC]
+    # Train step body (jitted later). Inputs: model, optimizer, inputs
+    #   (prepared, sharded batch). Steps: kwargs = gen_model_input_fn(inputs);
+    #   value_and_grad of loss_fn w.r.t. the model (restricted to LoRAParam
+    #   when LoRA enabled) with has_aux; compute optax.global_norm of grads;
+    #   optimizer.update(model, grads).
+    # Output: (loss, aux or None, grad_norm). Side effects: updates model
+    #   params and optimizer state in place.
     """Main body for one train step.
 
     Args:
@@ -361,6 +461,12 @@ class PeftTrainer:
   def _eval_step(
       self, model: nnx.Module, inputs: Any
   ) -> ArrayLike | Tuple[ArrayLike, Any]:
+    # [FUNCTION DOC]
+    # Eval step body. Inputs: model, inputs. kwargs = gen_model_input_fn;
+    #   out = eval_loss_fn(model, **kwargs). Output: (loss, aux) if has_aux
+    #   else (out, None). No side effects.
+    # KNOWN ISSUE: the return annotation suggests a bare loss is possible,
+    #   but a 2-tuple is always returned.
     inputs = self.gen_model_input_fn(inputs)
     out = self.eval_loss_fn(model, **inputs)
     if self._has_aux:
@@ -372,10 +478,16 @@ class PeftTrainer:
   def create_train_step_fn(
       self,
   ) -> Callable[..., Tuple[ArrayLike, Any | None, ArrayLike]]:
+    # [FUNCTION DOC]
+    # Returns the unjitted train step callable (self._train_step). Override
+    # point for subclasses.
     """Creates the train step function."""
     return self._train_step
 
   def create_eval_step_fn(self) -> Callable[..., ArrayLike]:
+    # [FUNCTION DOC]
+    # Returns the unjitted eval step callable (self._eval_step). Override
+    # point for subclasses.
     """Creates the eval step function."""
     return self._eval_step
 
@@ -387,6 +499,12 @@ class PeftTrainer:
     Args:
       mesh: The mesh used for sharding.
     """
+    # [FUNCTION DOC]
+    # HELPER: Input: mesh. No-op if the mesh is empty. Otherwise reads the
+    #   optimizer OptState, gets its partition specs from nnx metadata,
+    #   applies jax.lax.with_sharding_constraint with those specs and writes
+    #   the result back so the jitted step is not compiled twice.
+    # Side effects: mutates optimizer state placement.
     if mesh.empty:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
@@ -411,6 +529,16 @@ class PeftTrainer:
     Returns:
       A tuple of train and eval step functions.
     """
+    # [FUNCTION DOC]
+    # Inputs: skip_jit, cache_nnx_graph. If skip_jit, return the raw
+    #   (train_step, eval_step) fns (which expect model/optimizer args).
+    #   Otherwise, if not cached: shard optimizer on the active mesh; jit the
+    #   train step (donating the optimizer argument) and eval step with
+    #   nnx.jit; bind model and optimizer (train) / model (eval) as leading
+    #   arguments via functools.partial, using nnx.cached_partial first when
+    #   cache_nnx_graph. Cache and return (train_fn(batch), eval_fn(batch)).
+    # KNOWN ISSUE: with skip_jit the returned fns are not bound to
+    #   model/optimizer, yet train() calls them with only the batch.
     train_step = self.create_train_step_fn()
     eval_step = self.create_eval_step_fn()
     if skip_jit:
@@ -424,6 +552,12 @@ class PeftTrainer:
       self._jitted_eval_step_fn = nnx.jit(eval_step)
 
       def maybe_cache_and_partial(f, *args):
+      # [FUNCTION DOC]
+      # HELPER: nested. Inputs: f, positional args to bind. Returns
+      #   functools.partial(nnx.cached_partial(f, *args)) when
+      #   cache_nnx_graph (graph traversal cached), else
+      #   functools.partial(f, *args); the outer partial gives a uniform
+      #   .func attribute.
         if cache_nnx_graph:
           # wrap with partial so we can access jitted_fn in a consistent way.
           return functools.partial(nnx.cached_partial(f, *args))
@@ -439,18 +573,33 @@ class PeftTrainer:
     return self._jitted_train_step_fn, self._jitted_eval_step_fn
 
   def _prepare_inputs(self, input_data: Any) -> Any:
+    # [FUNCTION DOC]
+    # Override hook: transform a raw batch before sharding. Default returns
+    # it unchanged.
     """Override this function for additional input preparation."""
     return input_data
 
   def _post_process_train_step(self, aux: Any) -> None:
+    # [FUNCTION DOC]
+    # Override hook receiving aux from each train step. Default no-op.
     """Override this function for post processing aux data from train step."""
     pass
 
   def _post_process_eval_step(self, aux: Any) -> None:
+    # [FUNCTION DOC]
+    # Override hook receiving aux from each eval step. Default no-op.
     """Override this function for post processing aux data from eval step."""
     pass
 
   def _try_get_learning_rate(self) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: returns the current learning rate if exposed via
+    #   optax.inject_hyperparams. Tries opt_state.hyperparams
+    #   ["learning_rate"].value; on AttributeError iterates opt_state
+    #   elements (chain parts), stops at the first optax.EmptyState, and
+    #   returns the first part's hyperparams learning rate if any; else None.
+    # KNOWN ISSUE: a KeyError (hyperparams without "learning_rate") or a
+    #   non-iterable opt_state is not caught.
     """Returns the learning rate from the optimizer state if available."""
     try:
       return self.optimizer.opt_state.hyperparams["learning_rate"].value
@@ -468,6 +617,12 @@ class PeftTrainer:
       step: int | None = None,
       additional_metrics: dict[str, ArrayLike] | None = None,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Inputs: loss, step, additional_metrics (name -> value).
+    #   Logs "loss", "perplexity" (= exp(loss) on host) and, if available,
+    #   "learning_rate" under the current mode; in TRAIN mode also writes an
+    #   info log line; then logs each additional metric. Side effects:
+    #   metrics logger writes.
     """Logs the metrics to the metrics logger and console."""
     perplexity = np.exp(jax.device_get(loss))
     self.metrics_logger.log(self.metrics_prefix, "loss", loss, self._mode, step)
@@ -503,6 +658,13 @@ class PeftTrainer:
           dict[str, Tuple[ArrayLike, Callable[[ArrayLike], ArrayLike]]] | None
       ) = None,
   ) -> MetricsBuffer:
+    # [FUNCTION DOC]
+    # HELPER: Inputs: metrics_buffer (or None), loss, step,
+    #   additional_metrics (name -> (value, aggregation fn)). Creates a
+    #   buffer for step with [loss] if None; else asserts the buffer step
+    #   matches (AssertionError otherwise) and appends loss. Appends each
+    #   additional value to its list (creating (list, fn) entries).
+    #   Output: the buffer.
     """Buffers metrics for the current step."""
     if metrics_buffer is None:
       metrics_buffer = MetricsBuffer(
@@ -521,6 +683,13 @@ class PeftTrainer:
     return metrics_buffer
 
   def _write_train_metrics(self):
+    # [FUNCTION DOC]
+    # HELPER: delayed train metric writing. If there is no previous buffer,
+    #   move the current buffer to "previous" and return (first update step
+    #   is written later to overlap I/O). Otherwise increment the previous
+    #   buffer's step by 1 (log 1-based step), write it, update the progress
+    #   bar / step-end hook with its step and mean loss, then move the
+    #   current buffer to previous and clear current.
     """Writes previous buffered train metrics."""
     if self._prev_buffered_train_metrics is None:
       # skip the first step so we can overlap I/O with next step.
@@ -540,7 +709,14 @@ class PeftTrainer:
     self._buffered_train_metrics = None
 
   def _write_metrics(self, metrics_buffer: MetricsBuffer):
+    # [FUNCTION DOC]
+    # HELPER: Input: metrics_buffer. Logs its mean loss at its step and each
+    #   additional metric aggregated by its op applied to the value list
+    #   (jax arrays converted to float32 numpy, recursively through lists).
     def _to_np_array(v):
+      # [FUNCTION DOC]
+      # HELPER: nested. Converts a jax.Array to a float32 numpy array, maps
+      #   lists recursively, and returns other values unchanged.
       if isinstance(v, jax.Array):
         return np.asarray(v, dtype=np.float32)
       elif isinstance(v, list):
@@ -561,6 +737,9 @@ class PeftTrainer:
 
   @contextlib.contextmanager
   def _switch_mode(self, mode: sft_metrics_logger.Mode):
+    # [FUNCTION DOC]
+    # HELPER: context manager temporarily setting self._mode to mode and
+    #   restoring the original on exit (even on exceptions).
     original_mode = self._mode
     self._mode = mode
     try:
@@ -570,6 +749,9 @@ class PeftTrainer:
 
   @property
   def _tqdm_train_metrics(self) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: property listing metric names shown in the progress bar:
+    #   ["loss", "perplexity", "learning_rate"].
     return ["loss", "perplexity", "learning_rate"]
 
   def _may_update_pbar(
@@ -578,6 +760,11 @@ class PeftTrainer:
       step: int | None = None,
       loss: ArrayLike | None = None,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Inputs: metrics (names), step, loss. If a progress bar exists,
+    #   update its metrics for the current mode and advance it by one. If
+    #   training hooks exist and mode is TRAIN, call
+    #   on_train_step_end(self, step, loss).
     """Updates the progress bar with the given metrics if available."""
     if self._pbar is not None:
       self._pbar.update_metrics(metrics, self._mode, ndigits=3)
@@ -594,6 +781,32 @@ class PeftTrainer:
       *,
       cache_nnx_graph: bool = True,
   ) -> None:
+    # [FUNCTION DOC]
+    # Main training loop. Inputs: train_ds (iterable of batches), eval_ds
+    #   (optional iterable, re-iterated for each eval), skip_jit,
+    #   cache_nnx_graph (keyword-only, default True).
+    # Steps: get step fns; if jitted, log compile cache size when new. If
+    #   eval_ds is truthy run an initial eval. Create a progress bar if
+    #   max_steps set. Call on_train_start. Loop: activate profiler at
+    #   _iter_steps; fetch a batch from data_hooks or the iterator (on
+    #   resume, unless externally managed, skip the first _iter_steps
+    #   examples); stop when the batch is None/exhausted or (not externally
+    #   managed) _train_steps >= max_steps. Prepare inputs, shard, throttle,
+    #   on_train_step_start, compute perf tags (global step and mini batch
+    #   derived from custom_checkpoint_metadata "global_step"/"role", micro
+    #   batch = _iter_steps mod accumulation), run the train step inside
+    #   perf spans, register the loss with the throttler, buffer loss and
+    #   grad_norm, call _post_process_train_step(aux), increment
+    #   _iter_steps. At each accumulation boundary: increment _train_steps,
+    #   write delayed metrics, ask the checkpoint manager to save (policy
+    #   decides), and run eval every eval_every_n_steps. Deactivate profiler.
+    #   After the loop: wait for inflight work, log duration, on_train_end,
+    #   and close() unless externally managed.
+    # Exceptions: from steps, data, hooks, checkpointing.
+    # Side effects: trains the model, writes metrics/checkpoints/traces.
+    # KNOWN ISSUE: when eval_ds is a one-shot iterator it is exhausted after
+    #   the first eval, so later evals see no data; the max_steps check runs
+    #   after a batch was already pulled from the iterator.
     """Training loop."""
     logging.log_first_n(
         logging.INFO,
@@ -755,6 +968,10 @@ class PeftTrainer:
       self.close()
 
   def _save_last_checkpoint(self):
+    # [FUNCTION DOC]
+    # HELPER: forces a checkpoint save at _train_steps (with LoRA-only
+    #   params if LoRA) when no checkpoint exists or the latest saved step is
+    #   older. No custom metadata is attached to this final save.
     last_saved_step = self.checkpoint_manager.latest_step()
     if last_saved_step is None or last_saved_step < self._train_steps:
       self.checkpoint_manager.save(
@@ -768,15 +985,22 @@ class PeftTrainer:
   @property
   def train_steps(self) -> int:
     """Returns the number of train steps taken."""
+    # [FUNCTION DOC]
+    # Property: number of optimizer updates performed (_train_steps).
     return self._train_steps
 
   @property
   def iter_steps(self) -> int:
     """Returns the number of iterator steps taken."""
+    # [FUNCTION DOC]
+    # Property: number of micro steps (batches) processed (_iter_steps).
     return self._iter_steps
 
   def custom_checkpoint_metadata(self) -> dict[str, Any]:
     """Override this function to return the custom metadata for the checkpoint manager."""
+    # [FUNCTION DOC]
+    # Override hook returning a dict saved as checkpoint custom metadata and
+    # used for perf tags ("global_step", "role"). Default: empty dict.
     return {}
 
   def close(self):
@@ -785,6 +1009,13 @@ class PeftTrainer:
     This includes writing any buffered metrics, saving the last checkpoint,
     and closing the checkpoint manager and metrics logger.
     """
+    # [FUNCTION DOC]
+    # Finalizes: writes pending delayed train metrics, saves a last
+    #   checkpoint if needed, closes checkpoint manager (waits for async
+    #   saves) and metrics logger (closes backends, clears jax.monitoring
+    #   listeners), and closes the progress bar.
+    # KNOWN ISSUE: metrics of a partially accumulated final step move to
+    #   the "previous" buffer and are never written.
     self._write_train_metrics()
     self._save_last_checkpoint()
     self.checkpoint_manager.close()
@@ -798,6 +1029,19 @@ class PeftTrainer:
       eval_ds: Iterable[Any],
       eval_step_fn: Callable[..., Any],
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: evaluation loop. Inputs: eval_ds, eval_step_fn (batch ->
+    #   (loss, aux)). In EVAL mode: iterate batches (data_hooks or
+    #   iterator) until None/exhausted; prepare, shard, on_eval_step_start,
+    #   run step, stop_gradient the loss, buffer it at the current train
+    #   step, _post_process_eval_step(aux), accumulate sum of losses. If no
+    #   batches, warn and return. Else write eval metrics (mean loss,
+    #   perplexity of mean loss, aux metrics), log the running eval loss /
+    #   perplexity averages from the logger, clear the buffer and call
+    #   on_eval_step_end(self, summed eval loss).
+    # KNOWN ISSUE: the logged "eval loss" is the mean over all evals so far
+    #   (MetricsLogger history), not just this eval; the hook receives the
+    #   sum, not the mean, of batch losses.
     """Runs evaluation loop."""
     logging.info("Running evaluation on train step %d.", self._train_steps)
     eval_iterator = iter(eval_ds)
@@ -858,6 +1102,19 @@ def _default_loss_fn(
     attention_mask: jax.Array,
     images: jax.Array | None = None,
 ) -> ArrayLike:
+  # [FUNCTION DOC]
+  # HELPER: default next-token NLL loss. Inputs: model, input_tokens [B, L],
+  #   input_mask [B, L], positions, attention_mask, images (optional; only
+  #   passed when not None).
+  # Steps: logits, _ = model(input_tokens, positions, None (cache),
+  #   attention_mask[, images=...]); drop the last logit position; targets
+  #   = tokens shifted left by one with mask shifted likewise; one-hot the
+  #   targets, zero rows where the target mask is 0; loss = -sum(log_softmax
+  #   (logits) * one_hot) / (number of valid targets + 1e-8).
+  # Output: scalar mean token NLL. No side effects.
+  # KNOWN ISSUE: the default gen_model_input_fn is the identity, but this
+  #   loss needs positions and attention_mask that TrainingInput lacks, so
+  #   callers must supply a gen_model_input_fn that builds them.
   """Default loss function for PEFT training."""
   # Weird kwargs workaround because not all models support `images` right now.
   kwargs = {} if images is None else {"images": images}

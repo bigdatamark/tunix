@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.cli.utils.model: create_tokenizer, apply_lora_to_model and create_model, with
+# the tokenizer adapter, qwix LoRA functions, resharding, AutoModel and nnx.display mocked out.
+# Inputs: parameterized configs. Outputs: test results. No real models or downloads are used.
 
 import os
 from unittest import mock
@@ -28,6 +32,8 @@ from tunix.tests import test_common
 
 
 class ModelTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests CLI model/tokenizer creation helpers with mocks.
 
   @parameterized.named_parameters(
       dict(
@@ -45,6 +51,10 @@ class ModelTest(parameterized.TestCase):
   def test_create_tokenizer(
       self, mock_tokenizer, tokenizer_path, expected_path
   ):
+    # [FUNCTION DOC]
+    # Verifies create_tokenizer constructs tokenizer_adapter.Tokenizer once with positional arguments
+    # (tokenizer_type, path, add_bos, add_eos, any fifth value), where path is the explicit tokenizer_path
+    # argument when given and otherwise the config's tokenizer_path.
     tokenizer_config = {
         'tokenizer_path': 'path1',
         'tokenizer_type': 'type1',
@@ -82,6 +92,11 @@ class ModelTest(parameterized.TestCase):
   def test_apply_lora_to_model(
       self, mock_reshard, mock_apply_lora, mock_lora_provider, lora_config
   ):
+    # [FUNCTION DOC]
+    # Verifies apply_lora_to_model builds qwix.LoraProvider with exactly the given lora_config keys
+    # (with and without quantization fields tile_size/weight_qtype), calls qwix.apply_lora_to_model once
+    # and reshards the result to the mesh once. Uses an autospec ToyTransformer whose get_model_input
+    # returns an empty dict.
     base_model = mock.create_autospec(
         test_common.ToyTransformer, instance=True, spec_set=True
     )
@@ -178,6 +193,13 @@ class ModelTest(parameterized.TestCase):
       apply_lora,
       model_display,
   ):
+    # [FUNCTION DOC]
+    # Verifies create_model: AutoModel.from_pretrained is called once and returns (model, "mock_model_path");
+    # the returned tokenizer path is the default path for HuggingFace models, the gemma3 GCS tokenizer path
+    # for a gemma-3 GCS model, or "mock_model_path/tokenizer.model" for a Kaggle gemma model when the
+    # default tokenizer path is configured. If lora_config is present, apply_lora_to_model is called with
+    # (model, mesh, lora_config) and its result is returned; otherwise the base model is returned.
+    # nnx.display is called with the returned model only when model_display is True.
     mesh = mock.create_autospec(jax.sharding.Mesh, instance=True, spec_set=True)
     mock_model = mock.create_autospec(nnx.Module, instance=True, spec_set=True)
     mock_automodel.from_pretrained.return_value = (

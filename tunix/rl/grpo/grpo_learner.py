@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GRPO (Group Relative Policy Optimization) config and learner. GRPOConfig
+# extends AlgorithmConfig with group-sampling and loss hyperparameters.
+# GRPOLearner extends RLLearner: it installs the registered policy loss as the
+# actor trainer's loss, and implements the per-batch rollout step: generate
+# num_generations completions per prompt, optionally compute reference and
+# old-policy per-token log-probs, compute rewards and group-relative
+# advantages, log metrics, and pack everything into a TrainExample.
+# Also exports aliases GrpoConfig and GrpoLearner, and TrainingInputT, RewardFn
+# and MetricFn from rl_learner. Importing algo_core registers the algorithm
+# functions as a side effect.
 """GRPO learner."""
 
 from __future__ import annotations
@@ -40,11 +51,26 @@ MetricFn = rl_learner.MetricFn
 
 @flax.struct.dataclass(frozen=True)
 class TrainExample(common.TrainExample):
+  # [CLASS DOC]
+  # Frozen flax struct dataclass identical to common.TrainExample (prompt ids
+  # and mask, completion ids and mask, advantages, optional reference and old
+  # per-token log-probs); exists to give GRPO its own named type.
   pass
 
 
 @dataclasses.dataclass(kw_only=True)
 class GRPOConfig(algo_config_lib.AlgorithmConfig):
+  # [CLASS DOC]
+  # Keyword-only dataclass for GRPO-family algorithms. Fields beyond the base:
+  # loss_agg_mode (default "sequence-mean-token-mean"; how per-token losses are
+  # reduced), loss_algo ("grpo" or "gspo-token", legacy selector),
+  # num_generations (G, samples per prompt, default 2), num_iterations (mu,
+  # optimizer passes per sampled batch, default 1), beta (KL penalty weight,
+  # default 0.04; 0 disables reference model use), kl_loss_mode (KL estimator
+  # name, default "kl"), epsilon (clip range, default 0.2). Learner code also
+  # sets an extra attribute temperature at runtime.
+  # KNOWN ISSUE: the docstring documents epsilon_high, which is not a field here
+  # (only defined in subclasses such as DAPO), and lists loss_algo twice.
   """Configuration for GRPO algorithms.
 
   Attributes:
@@ -97,6 +123,12 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
   epsilon: float = 0.2
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Validates: raises ValueError if num_generations is not greater than 1, or if
+    # loss_algo is not "grpo" or "gspo-token". Returns None.
+    # KNOWN ISSUE: does not call the parent AlgorithmConfig.__post_init__, so
+    # algo_variant/advantage_estimator/policy_loss_fn are never validated and the
+    # config is never logged for GRPO configs and subclasses.
     if self.num_generations <= 1:
       raise ValueError(
           "num_generations must be greater than 1. Received: "
@@ -115,6 +147,10 @@ TGrpoConfig = TypeVar("TGrpoConfig", bound=GRPOConfig)
 
 class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
   """GRPO (Group Relative Policy Optimization) learner.
+  # [CLASS DOC]
+  # Generic RL learner over a GRPOConfig-bounded config type. Holds no extra
+  # state beyond RLLearner; implements the abstract hooks for rollout and
+  # advantage computation, trajectory ids, iteration and generation counts.
 
   GRPO is a reinforcement learning algorithm designed to enhance the reasoning
   abilities of large language models, like mathematical problem-solving. It is
@@ -133,6 +169,20 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       metric_fns: Sequence[MetricFn] | None = None,
       data_shuffle_seed: int | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: rl_cluster (RLCluster with actor/reference/rollout), algo_config,
+    # reward_fns (one callable or list), optional metric_fns, optional
+    # data_shuffle_seed. Calls RLLearner.__init__ with them. Then: copies the
+    # TRAIN-mode rollout temperature into algo_config.temperature (mutates the
+    # config); looks up the policy loss function by algo_config.policy_loss_fn in
+    # function_registry (raises if unknown); registers on the actor trainer a loss
+    # closure that calls that policy loss with the model, the train example, this
+    # learner's algo_config, and the rollout pad and eos ids (the algo_config
+    # argument passed by the trainer is ignored), with has_aux enabled; sets the
+    # model input function to map an example to keyword arguments train_example
+    # and algo_config; registers "kl" and "pg_clipfrac" RL metrics averaged with
+    # mean; and shows "kl" in the progress bar only when beta is non-zero.
+    # KNOWN ISSUE: the docstring calls it GRPOTrainer.
     """Initializes the `GRPOTrainer`.
 
     Args:
@@ -207,6 +257,33 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       training_input: TrainingInputT,
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
   ) -> TrainExample:
+    # [FUNCTION DOC]
+    # Inputs: training_input (dict with "prompts" plus arbitrary extra columns,
+    # already repeated num_generations times per prompt by the base class), mode
+    # (TRAIN or EVAL, default TRAIN). Steps:
+    # 1) Resolve the rollout config (index by mode when it is a dict); convert
+    # prompts to a list in place (mutates training_input); get pad and eos ids.
+    # 2) Call rl_cluster.generate with micro batch size equal to the rollout
+    # micro batch size times num_generations and a perf tag of the global step.
+    # 3) Right-pad each completion token list to max_tokens_to_generate with the
+    # pad id; take left-padded prompt tokens; masks are "token != pad id".
+    # 4) If beta is non-zero, compute reference per-token log-probs inside perf
+    # spans (micro batch = compute-logps micro batch times num_generations);
+    # otherwise None. If num_iterations > 1, compute old-policy per-token
+    # log-probs similarly; otherwise None.
+    # 5) Compute rewards via _compute_rewards (prompts, completion text, mode and
+    # all other input columns) and advantages via the registered estimator named
+    # by advantage_estimator with num_generations.
+    # 6) Buffer metrics: reward mean/max/min, completion length mean/max/min, and
+    # each user metric function's output (called with prompts, completions,
+    # advantages, rewards and extra columns).
+    # Returns a TrainExample with prompt ids/mask, completion ids/mask (device
+    # arrays), reference logps, device-placed advantages and old logps.
+    # Side effects: rollout, model inference, metric buffering, perf tracing.
+    # Exceptions propagate from generation, reward or estimator lookup.
+    # KNOWN ISSUE: pad_to_length truncation behavior aside, a pad id equal to a
+    # real token id would be masked out; completions are masked by pad id rather
+    # than by EOS position.
     """Generate text completions and compute the advantages for GRPO training.
 
     Args:
@@ -374,6 +451,13 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
   def _compute_trajectory_ids(
       self, example: TrainingInputT, steps: int
   ) -> List[str]:
+    # [FUNCTION DOC]
+    # Inputs: example (dict with "prompts" of length batch_size times
+    # num_generations), steps (number of prior batches). Computes batch_size as
+    # prompt count integer-divided by num_generations, row offsets starting at
+    # steps times batch_size each repeated num_generations times, and group
+    # offsets 0..num_generations-1 tiled batch_size times. Returns list of strings
+    # formatted as row offset, underscore, group offset. No side effects.
     """Computes the trajectory ID for each prompt in the batch.
 
     Trajectory id is a string of format {row_offset}_{group_offset} where
@@ -403,9 +487,13 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     ]
 
   def _num_iterations(self) -> int:
+    # [FUNCTION DOC]
+    # Returns algo_config.num_iterations (optimizer passes per sampled batch).
     return self.algo_config.num_iterations
 
   def _num_generations(self) -> int:
+    # [FUNCTION DOC]
+    # Returns algo_config.num_generations (completions sampled per prompt).
     return self.algo_config.num_generations
 
   def train(  # pylint: disable=useless-parent-delegation
@@ -414,6 +502,12 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
       eval_ds: Iterable[TrainingInputT] | None = None,
       skip_jit: bool = False,
   ) -> None:
+    # [FUNCTION DOC]
+    # Runs the GRPO training loop by delegating unchanged to RLLearner.train with
+    # train_ds, optional eval_ds and skip_jit. Returns None. Side effects are
+    # those of the base loop (rollouts, training, checkpointing, metrics). The
+    # docstring explains the paper algorithm; the outer reference-update loop is
+    # not implemented.
     """GRPO training loop.
 
     Algorithm as below: extract from https://arxiv.org/abs/2402.03300 ::

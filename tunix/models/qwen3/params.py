@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Checkpoint I/O for Qwen3 (dense and MoE). Provides: expert-stacking
+# preprocessing of HF safetensors params, the HF-key to tunix-path regex mapping,
+# a model loader wrapping safetensors_loader.load_and_create_model, and a LoRA
+# merge-and-save wrapper around safetensors_saver with Qwen3-specific key naming
+# and transpose rules.
 """Utils for loading and converting Qwen3 PT weights."""
 
 import re
@@ -24,6 +30,23 @@ from tunix.models.qwen3 import model as model_lib
 
 
 def _stack_experts(params: dict[str, jax.Array]):
+  # [FUNCTION DOC]
+  # HELPER: Preprocessing for MoE checkpoints, applied by the loader AFTER key
+  # mapping, so the input is a flat dict of tunix key to array (e.g.
+  # 'layers.0.mlp.experts.3.gate_proj.kernel', already transposed to [D, F]).
+  # For each of 'gate', 'up', 'down': finds keys matching
+  # "<prefix>experts.<id>.<kw>_proj.<rest>", groups them by prefix (everything
+  # before 'experts.', e.g. 'layers.0.mlp.'), sorts each group by numeric expert
+  # id, removes the individual keys from a copy of the dict and adds one key
+  # "<prefix><kw>_proj" (e.g. 'layers.0.mlp.gate_proj', the MoELayer parameter
+  # path) holding the arrays stacked on a new leading expert axis ([E, D, F] or
+  # [E, F, D]); stacking runs on the first CPU device. Returns the new dict; the
+  # input dict is not mutated. Raises KeyError/AttributeError on odd keys.
+  # KNOWN ISSUE: the docstring says "pytorch params" but keys are already tunix
+  # keys. The loader's 'original' mode calls this per safetensors file, so if one
+  # layer's experts are split across files, partial stacks are produced and the
+  # later file's stack overwrites the earlier one. Grouping uses
+  # startswith(prefix), safe only because prefixes end in '.'.
   """Stack experts in the loaded pytorch params."""
   key_fn = lambda x: int(re.match(r"(.*?)experts\.([0-9]+)\..*", x).group(2))  # pytype: disable=attribute-error
   updated_dict = dict(params).copy()
@@ -45,6 +68,15 @@ def _stack_experts(params: dict[str, jax.Array]):
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: Returns the regex mapping from HF key to (tunix path, transform) where
+  # transform is None or (permutation, reshape-shape-or-None). Same as dense
+  # models for embedding, q/k/v/o (transposed and reshaped to head layouts using
+  # cfg.embed_dim/num_heads/num_kv_heads/head_dim), MLP gate/up/down (transposed),
+  # final norm, q_norm/k_norm, input/post-attention layernorms and lm_head
+  # (transposed). Adds MoE entries: mlp.gate.weight -> mlp.router.kernel
+  # (transposed) and per-expert mlp.experts.<e>.<gate|up|down>_proj.weight ->
+  # mlp.experts.<e>.<kind>_proj.kernel (transposed). No side effects.
   # Mapping of torch_keys -> (nnx_keys, (permute_rule, reshape_rule)).
   return {
       r"model\.embed_tokens\.weight": ("embedder.input_embedding", None),
@@ -118,6 +150,11 @@ def create_model_from_safe_tensors(
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ) -> model_lib.Qwen3:
+  # [FUNCTION DOC]
+  # Loads a Qwen3 model from safetensors in file_dir via
+  # safetensors_loader.load_and_create_model with model_class Qwen3, the key
+  # mapping above, _stack_experts as preprocess_fn, optional mesh, dtype and mode.
+  # Returns the populated model. Raises/side effects: those of the loader.
   """Load tensors from the safetensors file and create a Qwen3 model."""
   return safetensors_loader.load_and_create_model(
       file_dir=file_dir,
@@ -132,6 +169,10 @@ def create_model_from_safe_tensors(
 
 
 def _qwen3_state_key_to_safetensors_key(lora_name: str) -> str:
+  # [FUNCTION DOC]
+  # HELPER: Converts a tunix LoRA module path (e.g. 'layers.0.attn.q_proj') to the
+  # HF state key by prefixing 'model.', suffixing '.weight' and replacing every
+  # '.attn.' with '.self_attn.'. Returns the string.
   """Transform Qwen3 layer path to safetensors state dict key.
 
   Args:
@@ -162,6 +203,16 @@ def save_lora_merged_model_as_safetensors(
     rank: int,
     alpha: float,
 ):
+  # [FUNCTION DOC]
+  # Merges LoRA deltas of a Qwen3 model into the base checkpoint at
+  # local_model_path and saves to output_dir. Delegates to
+  # safetensors_saver.save_lora_merged_model_as_safetensors with the key
+  # transform above and transpose rules that transpose (1,0) every projection
+  # (q/k/v/o/up/down/gate_proj and router 'gate'), since tunix kernels are
+  # [in, out] while HF weights are [out, in]. Outputs none; side effects and
+  # exceptions are those of the generic saver (deletes/recreates output_dir).
+  # KNOWN ISSUE: MoE expert/router paths (e.g. mlp.router) are not renamed to HF
+  # names by the key transform, so LoRA on those would fail the saver's assertion.
   """Saves a Qwen3 model with LoRA weights merged in safetensors format.
 
   Args:

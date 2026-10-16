@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.distillation.strategies.attention
+# .AttentionTransferStrategy: distillation that sows outputs of layers of
+# type attention_layer and combines alpha times an attention-transfer loss
+# between student and teacher attentions with (1 - alpha) times the task
+# loss; alpha must be within [0, 1] else ValueError. Eval loss is the task
+# loss only. Module setup disables jax_threefry_partitionable.
 """Tests for attention transfer strategy."""
 
 from absl.testing import absltest
@@ -28,30 +35,47 @@ AttentionTransferStrategy = attention.AttentionTransferStrategy
 
 
 class DummyModel(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: toy nnx model with one Linear(in_features -> out_features) layer
+  # seeded with Rngs(0).
 
   def __init__(self, in_features=3, out_features=1):
+    # [FUNCTION DOC]
+    # HELPER: creates the Linear layer.
     self.linear = nnx.Linear(
         in_features=in_features, out_features=out_features, rngs=nnx.Rngs(0)
     )
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # HELPER: returns linear(x).
     x = self.linear(x)
     return x
 
 
 class AttentionTransferStrategyTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for AttentionTransferStrategy.
 
   def _get_dummy_logits(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: standard normal logits (batch_size, num_classes).
     return jax.random.normal(key, (batch_size, num_classes))
 
   def _get_dummy_labels(self, key, batch_size, num_classes):
+    # [FUNCTION DOC]
+    # HELPER: random one-hot labels (batch_size, num_classes).
     labels_int = jax.random.randint(key, (batch_size,), 0, num_classes)
     return jax.nn.one_hot(labels_int, num_classes)
 
   def model_forward_fn(self, model: nnx.Module, x: jax.Array):
+    # [FUNCTION DOC]
+    # HELPER: forward function; returns model(x).
     return model(x)
 
   def get_labels_fn(self, x: jax.Array):
+    # [FUNCTION DOC]
+    # HELPER: labels function; returns mean of x.
     return jnp.mean(x)
 
   @parameterized.named_parameters(
@@ -60,6 +84,8 @@ class AttentionTransferStrategyTest(parameterized.TestCase):
       ("alpha_one", 1.0),
   )
   def test_init_valid(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies construction stores alpha for 0, 0.5 and 1.
     strategy = AttentionTransferStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,
@@ -75,6 +101,8 @@ class AttentionTransferStrategyTest(parameterized.TestCase):
       ("alpha_over", 1.1),
   )
   def test_init_invalid(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies ValueError for alpha outside [0, 1].
     with self.assertRaises(ValueError):
       AttentionTransferStrategy(
           student_forward_fn=self.model_forward_fn,
@@ -90,6 +118,9 @@ class AttentionTransferStrategyTest(parameterized.TestCase):
       ("alpha_zero", 0.0),
   )
   def test_compute_eval_loss(self, alpha):
+    # [FUNCTION DOC]
+    # Verifies compute_eval_loss returns 2.49732 regardless of alpha (task loss
+    # only) with empty attentions.
     s_key, l_key = jax.random.split(jax.random.key(0), 2)
     batch_size, num_classes = 4, 10
     student_logits = self._get_dummy_logits(s_key, batch_size, num_classes)
@@ -112,6 +143,9 @@ class AttentionTransferStrategyTest(parameterized.TestCase):
     npt.assert_allclose(computed_loss, expected_loss, rtol=1e-5)
 
   def test_get_train_loss(self):
+    # [FUNCTION DOC]
+    # Verifies with identical student/teacher DummyModels after
+    # pre_process_models: teacher output is 2.016251 and train loss is 0.
     strategy = AttentionTransferStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,
@@ -139,6 +173,8 @@ class AttentionTransferStrategyTest(parameterized.TestCase):
     npt.assert_allclose(computed_loss, expected_loss, atol=1e-5)
 
   def test_get_eval_loss(self):
+    # [FUNCTION DOC]
+    # Verifies eval loss of the preprocessed student is 0 on the sample input.
     strategy = AttentionTransferStrategy(
         student_forward_fn=self.model_forward_fn,
         teacher_forward_fn=self.model_forward_fn,

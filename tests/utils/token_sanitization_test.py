@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.utils.token_sanitization.sanitize_control_tokens,
+# which repeatedly removes known chat-template control tokens (Gemma, Llama,
+# ChatML) plus optional extra tokens until no more occur, passing through
+# empty strings and None unchanged.
 from absl.testing import absltest
 from absl.testing import parameterized
 from tunix.utils import token_sanitization
 
 
 class TokenSanitizationTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for sanitize_control_tokens.
 
   @parameterized.parameters(
       ('', ''),
@@ -33,11 +40,18 @@ class TokenSanitizationTest(parameterized.TestCase):
       ('Recursive <bos<bos>>', 'Recursive '),
   )
   def test_sanitize_control_tokens(self, content, expected):
+    # [FUNCTION DOC]
+    # Verifies default-token stripping for many inputs, including None/empty
+    # passthrough, nested tokens, and tokens that reappear after an inner token
+    # is removed (removal is repeated until a fixed point).
+    # Inputs: content and expected output.
     self.assertEqual(
         token_sanitization.sanitize_control_tokens(content), expected
     )
 
   def test_sanitize_control_tokens_with_extra(self):
+    # [FUNCTION DOC]
+    # Verifies extra_tokens are stripped in addition to defaults.
     content = '[CUSTOM]user\nHello![/CUSTOM]'
     extra_tokens = ['[CUSTOM]', '[/CUSTOM]']
     expected = 'user\nHello!'
@@ -49,6 +63,8 @@ class TokenSanitizationTest(parameterized.TestCase):
     )
 
   def test_sanitize_control_tokens_recursive_with_extra(self):
+    # [FUNCTION DOC]
+    # Verifies recursive removal also applies to extra tokens.
     content = '[CUSTOM[CUSTOM]]nested[/CUSTOM]'
     extra_tokens = ['[CUSTOM]', '[/CUSTOM]']
     expected = 'nested'
@@ -60,6 +76,8 @@ class TokenSanitizationTest(parameterized.TestCase):
     )
 
   def test_sanitize_control_tokens_with_empty_extra(self):
+    # [FUNCTION DOC]
+    # Verifies empty-string and None entries in extra_tokens are ignored.
     content = 'hello world'
     extra_tokens = ['', None]
     expected = 'hello world'
@@ -71,6 +89,8 @@ class TokenSanitizationTest(parameterized.TestCase):
     )
 
   def test_sanitize_control_tokens_no_default(self):
+    # [FUNCTION DOC]
+    # Verifies include_default False strips only extra tokens, keeping <bos>/<eos>.
     content = '<bos>[CUSTOM]hello[/CUSTOM]<eos>'
     extra_tokens = ['[CUSTOM]', '[/CUSTOM]']
     # <bos> and <eos> should remain
@@ -83,6 +103,8 @@ class TokenSanitizationTest(parameterized.TestCase):
     )
 
   def test_sanitize_control_tokens_no_default_no_extra(self):
+    # [FUNCTION DOC]
+    # Verifies include_default False with no extras leaves content unchanged.
     content = '<bos>hello<eos>'
     expected = '<bos>hello<eos>'
     self.assertEqual(

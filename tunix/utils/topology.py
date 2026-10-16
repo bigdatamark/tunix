@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# TPU topology helpers for mesh allocation: map a device pool / device kind to a
+# TPU family key and choose the best (most cubical) legal physical slice shape
+# for a requested chip count, optionally constrained by an available per-axis
+# bound. Also provides per-host device keys (Pathways aware).
+# Module constants: per-host bound (2, 2, 1); edge families {"v5e", "v6e"}
+# (2D torus, shapes canonicalized to 3D with z=1); fish families {"v4", "v5p",
+# "v7x"} (3D torus); fish sub-cube shapes by chip count {4: 2x2x1, 8: 2x2x2,
+# 16: 2x2x4, 32: 2x4x4}; fish cube edge 4 (cube volume 64); edge shapes by chip
+# count {1: 1x1x1, 4: 2x2x1, 8: 2x4x1, 16: 4x4x1, 32: 4x8x1, 64: 8x8x1,
+# 128: 8x16x1, 256: 16x16x1}.
+# Public entry point: best_topology_shapes_for_chip_count. All other functions
+# are private helpers. No module-level side effects.
 """Accelerator topology helpers used by Tunix mesh allocation.
 
 This module resolves a device pool's accelerator family and the supported
@@ -80,6 +93,15 @@ def _best_single_host_fish_shape(
     required_chips: int,
     available_chip_shape: Sequence[int] | None,
 ) -> tuple[int, int, int] | None:
+  # [FUNCTION DOC]
+  # HELPER: Finds a within-one-host fish shape for small requests.
+  # Inputs: required_chips; available_chip_shape (optional 3D bound).
+  # Behavior: host bound is (2, 2, 1), capped per axis by the available shape
+  #   (integer-converted); a non-3D available shape returns None. Enumerates all
+  #   (x, y, z) with 1 <= each <= bound whose product equals required_chips and
+  #   picks the minimum by the key (max dimension, dimensions sorted descending,
+  #   negated dimensions so larger earlier axes win, the shape itself).
+  # Output: best 3-tuple or None if none has that product. No side effects.
   """Returns the most cubical fish-family subslice that fits within one host.
 
   Below the first full cube a request may be a fraction of a host (e.g. 1 or 2
@@ -128,6 +150,9 @@ def _best_single_host_fish_shape(
 def _topology_shape_sort_key(
     shape: tuple[int, ...],
 ) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+  # [FUNCTION DOC]
+  # HELPER: Sort key for cubicality: (largest dimension, dimensions sorted in
+  # descending order, the shape itself). Smaller keys are more cubical.
   """Ranks valid shapes from more cubical to less cubical.
 
   Args:
@@ -147,6 +172,9 @@ def _topology_shape_sort_key(
 def _shape_fits_within(
     shape: Sequence[int], available_shape: Sequence[int]
 ) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: True when every dimension is <= the corresponding bound (pairs
+  # are zipped, so extra axes on either side are ignored).
   """Returns whether `shape` fits axis-by-axis within `available_shape`.
 
   Args:
@@ -161,6 +189,11 @@ def _shape_fits_within(
 
 @functools.cache
 def _is_pathways_backend_used() -> bool:
+  # [FUNCTION DOC]
+  # HELPER: Cached (computed once per process) check for a Pathways backend:
+  # imports pathwaysutils and returns its truthiness of
+  # is_pathways_backend_used(); False on ImportError.
+  # Side effects: import; result is cached forever.
   """Returns whether the current process is attached to a Pathways backend.
 
   Returns:
@@ -175,6 +208,14 @@ def _is_pathways_backend_used() -> bool:
 
 
 def _pathways_device_host_attr(device: Any, attr_name: str) -> Any:
+  # [FUNCTION DOC]
+  # HELPER: Extracts a field value from a Pathways device's text repr.
+  # Inputs: device, attr_name. Searches the repr for the attribute name
+  # preceded by start-of-string, a comma or an opening parenthesis, followed
+  # by "=" and then either a bracketed list (no nested closing bracket) or
+  # characters up to the next comma or closing parenthesis. Returns None if
+  # absent; otherwise the stripped captured text evaluated as a Python literal,
+  # or the raw string when literal evaluation fails (SyntaxError/ValueError).
   """Parses a named attribute out of a Pathways device's repr string.
 
   Pathways does not expose per-host metadata (such as ``logical_task``) as a
@@ -211,6 +252,9 @@ def _pathways_device_host_attr(device: Any, attr_name: str) -> Any:
 
 
 def _device_attr(device: Any, attr_name: str, default: Any = None) -> Any:
+  # [FUNCTION DOC]
+  # HELPER: Reads attribute attr_name from device (default when missing); if
+  # the value is callable, calls it with no arguments and returns the result.
   """Returns a raw device attribute, calling it first when exposed lazily.
 
   Args:
@@ -226,6 +270,11 @@ def _device_attr(device: Any, attr_name: str, default: Any = None) -> Any:
 
 
 def _normalize_device_kind(device_kind: str) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: Lower-cases the device kind and maps by substring, in order:
+  # contains "v7" -> "v7x"; contains "v6" (covers "v6 lite"/"v6e") -> "v6e";
+  # contains "v5 lite" or "v5e" -> "v5e"; contains "v5" -> "v5p"; contains
+  # "v4" -> "v4"; else None.
   """Maps a raw JAX ``device_kind`` string to a normalized family key.
 
   Args:
@@ -251,6 +300,9 @@ def _normalize_device_kind(device_kind: str) -> str | None:
 
 
 def _resolve_family(device_kind_or_family: str) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: Tries _normalize_device_kind first; if that yields None, accepts
+  # the lower-cased input if it is one of the supported family keys; else None.
   """Resolves a raw device kind or normalized family key to a known family.
 
   Args:
@@ -269,6 +321,10 @@ def _resolve_family(device_kind_or_family: str) -> str | None:
 
 
 def _device_family(devices: Sequence[Any]) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: Family of a device pool from the first device's device_kind (read
+  # via _device_attr). None for an empty pool, a non-string kind or an
+  # unrecognized family.
   """Returns the normalized accelerator family for a device pool.
 
   Args:
@@ -288,6 +344,11 @@ def _device_family(devices: Sequence[Any]) -> str | None:
 
 
 def _device_host_key(device: Any) -> tuple[Any, ...] | None:
+  # [FUNCTION DOC]
+  # HELPER: Per-host identity key. Task id: on Pathways, the "logical_task"
+  # field parsed from the device repr; otherwise the device's process_index.
+  # Returns None if the task id is None; otherwise (slice_index attribute or
+  # None, task id).
   """Returns a stable per-host key when runtime metadata exposes one.
 
   Pathways does not expose a per-host task attribute, so the task component is
@@ -315,6 +376,10 @@ def _device_host_key(device: Any) -> tuple[Any, ...] | None:
 def _canonicalize_chip_shape_to_3d(
     shape: Sequence[int],
 ) -> tuple[int, int, int] | None:
+  # [FUNCTION DOC]
+  # HELPER: Converts each dimension to int; a 2D shape gets a trailing 1, a 3D
+  # shape is returned as a tuple, other ranks return None.
+  # Exceptions: ValueError/TypeError if dimensions are not int-convertible.
   """Canonicalizes a chip topology shape to `(x, y, z)` form.
 
   Shapes may come from edge runtimes that expose 2D chip coordinates. Those
@@ -338,6 +403,16 @@ def _best_fish_cube_shape(
     required_chips: int,
     available_chip_shape: Sequence[int] | None,
 ) -> tuple[int, int, int] | None:
+  # [FUNCTION DOC]
+  # HELPER: Best fish shape at or above the 4x4x4 cube.
+  # Inputs: required_chips; available_chip_shape (optional, assumed 3D).
+  # Behavior: below 64 chips -> None. Not a multiple of 64 -> ValueError.
+  #   With n = required/64, per-axis maximum factors are n, capped by
+  #   available axis // 4 when a bound is given. Enumerates factorizations
+  #   n = i*j*k with i <= j <= k (loops bounded by i*i <= n and i*j <= n and
+  #   the per-axis maxima, k must also be within its maximum), forming shapes
+  #   (4i, 4j, 4k), and keeps the minimum by _topology_shape_sort_key.
+  # Output: best shape or None if nothing fits.
   """Returns the most cubical fish-family ``4i x 4j x 4k`` shape, if any.
 
   At or above the first full cube (``4x4x4`` = 64 chips), fish topologies are
@@ -411,6 +486,24 @@ def best_topology_shapes_for_chip_count(
     chip_rank: int = 3,
     available_chip_shape: Sequence[int] | None = None,
 ) -> list[tuple[int, ...]]:
+  # [FUNCTION DOC]
+  # Public entry point: chooses the best legal TPU slice shape for a chip count.
+  # Inputs: device_kind_or_family (raw kind or family key); required_chips;
+  #   chip_rank (keyword, default 3); available_chip_shape (keyword, optional
+  #   per-axis bound).
+  # Behavior: non-positive chips or unknown family -> empty list.
+  #   Edge family: look up the fixed shape for the count (missing -> []); if a
+  #   bound is given and canonicalizes to 3D, the shape must fit it (else []);
+  #   a malformed bound is ignored. Return [first two dims] for rank 2, [shape]
+  #   for rank 3, [] otherwise.
+  #   Fish family: rank must be 3 and a given bound must be 3D, else []. Then,
+  #   in order: the fixed sub-cube shape for the count if it fits the bound;
+  #   else the single-host search result; else the cube-multiple search;
+  #   else [].
+  # Output: list with zero or one shape tuple.
+  # Exceptions: ValueError from the cube search when the count is >= 64 and
+  #   not a multiple of 64 (only reached if earlier branches fail).
+  # Side effects: none.
   """Returns the best legal topology shape(s) for a requested chip count.
 
   Shapes are ranked from more cubical to less cubical. For fish families this

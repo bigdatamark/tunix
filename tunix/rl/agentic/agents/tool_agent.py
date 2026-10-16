@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Defines ToolAgent, a multi-turn chat agent that can call tools. It combines a
+# ToolManager (registry and executor of tool instances), a ToolParser chosen by
+# name from the parser registry (extracts tool calls from model text and produces
+# the tools prompt), and ConversationAgentBase (history and trajectory).
+# Uses absl logging for warnings and uuid4 for tool-call ids.
 """Agent implementation that supports tool usage."""
 
 import copy
@@ -29,6 +35,12 @@ from tunix.rl.agentic.tools import tool_manager
 
 
 class ToolAgent(base_agent.ConversationAgentBase):
+  # [CLASS DOC]
+  # Tool-using agent. Attributes: tool_manager (ToolManager built from tool_map),
+  # tool_parser (instance of the selected parser class), tools_prompt (parser's
+  # tool instructions appended to the system prompt), plus base-class state.
+  # Actions it returns are lists of OpenAI-style tool-call dicts; when no tool call
+  # is parsed, a synthetic "finish" call carrying the raw response is produced.
   """Agent implementation that supports tool usage within ConversationAgentBase.
 
   This agent extends the base conversation agent functionality to enable
@@ -44,6 +56,15 @@ class ToolAgent(base_agent.ConversationAgentBase):
       tool_parser_name: str = "qwen",
       tool_map: dict[str, type[base_tool.BaseTool]] | None = None,
   ):
+    # [FUNCTION DOC]
+    # Construct the agent.
+    # Inputs: system_prompt string; tool_parser_name (default "qwen"); tool_map,
+    # optional mapping from tool name to BaseTool subclass (defaults to empty).
+    # Behavior: builds ToolManager(tool_map), looks up and instantiates the parser
+    # class, computes tools_prompt with the parser's get_tool_prompt over the
+    # manager's tool instances (default schema style), and only then calls the base
+    # constructor (order matters: the overridden _init_messages reads tools_prompt).
+    # Exceptions: ValueError for unknown parser names; whatever ToolManager raises.
     # Tool management system for routing and executing tool calls.
     self.tool_manager = tool_manager.ToolManager(tool_map=tool_map or {})
 
@@ -66,6 +87,10 @@ class ToolAgent(base_agent.ConversationAgentBase):
   # ─────────────────────────────────────────────────────────────
 
   def _init_messages(self, system_prompt: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Initialize history with one system message whose content is
+    # system_prompt (or "") directly concatenated with tools_prompt (or ""), with no
+    # separator between them.
     """Initialize conversation history with system prompt + tools prompt."""
     # Build a single string with tools prompt appended to system prompt.
     content = (system_prompt or "") + (self.tools_prompt or "")
@@ -78,6 +103,17 @@ class ToolAgent(base_agent.ConversationAgentBase):
       done: bool,
       info: Dict[str, Any],
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Convert observations to messages, including tool results.
+    # Inputs: observation, reward/done/info (ignored).
+    # Behavior: for a dict observation: if it has "tool_outputs" (a mapping of call
+    # id to output string), append one "tool" role message per entry with key
+    # tool_call_id and content "Tool returned result: " + output (or ""); else if it
+    # has "question", append it as a user message (or ""); otherwise log a warning.
+    # For a string observation, append it as a user message. Other types are ignored.
+    # Side effects: mutates self._messages; may log.
+    # Exceptions: TypeError if a tool output is a non-string truthy value
+    # (concatenation with str).
     """Convert environment observation into messages, including tool outputs."""
     del reward, done, info  # Unused in this implementation.
     if isinstance(observation, dict):
@@ -104,6 +140,22 @@ class ToolAgent(base_agent.ConversationAgentBase):
   # ─────────────────────────────────────────────────────────────
 
   def update_from_model(self, response: str, **kwargs) -> agent_types.Action:
+    # [FUNCTION DOC]
+    # Parse a model response into tool calls and record the step.
+    # Inputs: response string; kwargs ignored.
+    # Behavior: parses with tool_parser; any exception is logged as a warning and
+    # treated as no calls. If no calls: action list is a single dict with a new uuid4
+    # string "id", "type" "function", and "function" containing name "finish" and
+    # arguments as a dict with key "response" holding the raw text. Otherwise one
+    # dict per parsed call with new uuid4 id, type "function", and function name and
+    # arguments, where dict arguments are JSON-encoded to a string (other types kept
+    # as is). Appends an assistant message with the response to history, then
+    # appends a Step with a deep copy of history, Action wrapping the call list and
+    # model_response.
+    # Outputs: a new Action wrapping the same call list.
+    # Side effects: mutates history and trajectory; logging.
+    # KNOWN ISSUE: the fallback "finish" call keeps arguments as a dict while parsed
+    # calls carry JSON strings, so consumers see inconsistent argument types.
     """Parse LLM response to extract tool calls and create structured action.
 
     Attempts to parse the model response for tool calls using the configured

@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.sft.checkpoint_options: resolve_checkpointing_defaults
+# (normalizes None, Tunix v1 options, or legacy Orbax v0
+# CheckpointManagerOptions into a TunixCheckpointingOptions with defaults
+# filled) and create_checkpointing_options (factory). Uses Orbax v0 and v1.
 """Tests for Tunix Checkpointing Options custom implementation for Orbax v1."""
 
 from unittest import mock
@@ -22,17 +27,27 @@ from tunix.sft import checkpoint_options
 
 
 class CheckpointOptionsTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test case for checkpoint option resolution and construction.
   def test_resolve_checkpointing_defaults_with_none(self):
+    # [FUNCTION DOC]
+    # Verifies None resolves to DEFAULT_CHECKPOINTING_OPTIONS.
     opts = checkpoint_options.resolve_checkpointing_defaults(None)
     self.assertEqual(opts, checkpoint_options.DEFAULT_CHECKPOINTING_OPTIONS)
 
   def test_resolve_checkpointing_defaults_with_empty_options(self):
+    # [FUNCTION DOC]
+    # Verifies an all-default TunixCheckpointingOptions resolves to
+    # DEFAULT_CHECKPOINTING_OPTIONS (unset fields filled with defaults).
     opts = checkpoint_options.resolve_checkpointing_defaults(
         checkpoint_options.TunixCheckpointingOptions()
     )
     self.assertEqual(opts, checkpoint_options.DEFAULT_CHECKPOINTING_OPTIONS)
 
   def test_resolve_checkpointing_defaults_with_deprecated_options(self):
+    # [FUNCTION DOC]
+    # Verifies v0 options (save_interval_steps=100, max_to_keep=5) are converted
+    # with a 'Using v0' WARNING into FixedIntervalPolicy(100) and LatestN(5).
     legacy_opts = ocp_v0.CheckpointManagerOptions(
         save_interval_steps=100, max_to_keep=5
     )
@@ -58,6 +73,10 @@ class CheckpointOptionsTest(parameterized.TestCase):
     )
 
   def test_resolve_checkpointing_defaults_with_legacy_options_dataclass(self):
+    # [FUNCTION DOC]
+    # Verifies a v0 ContinuousCheckpointingPolicy(minimum_interval_secs=10) is
+    # translated into the v1 ContinuousCheckpointingPolicy preserving the
+    # minimum_interval_secs value.
     legacy_opts = ocp_v0.CheckpointManagerOptions(
         save_decision_policy=ocp_v0.checkpoint_managers.ContinuousCheckpointingPolicy(
             minimum_interval_secs=10,
@@ -75,6 +94,9 @@ class CheckpointOptionsTest(parameterized.TestCase):
     # pytype: enable=attribute-error
 
   def test_resolve_checkpointing_defaults_with_async_timeout(self):
+    # [FUNCTION DOC]
+    # Verifies async_options (timeout_secs=5000) supplied on an autospec'd
+    # options object with all other fields None are preserved in the result.
     async_opts = ocp.options.AsyncOptions(timeout_secs=5000)
     options = mock.create_autospec(
         checkpoint_options.TunixCheckpointingOptions, instance=True
@@ -91,6 +113,9 @@ class CheckpointOptionsTest(parameterized.TestCase):
     self.assertEqual(opts.async_options.timeout_secs, 5000)
 
   def test_resolve_checkpointing_defaults_with_modern_options(self):
+    # [FUNCTION DOC]
+    # Verifies explicitly-set v1 options (FixedIntervalPolicy(50), LatestN(10),
+    # async disabled) are passed through unchanged.
     modern_opts = checkpoint_options.TunixCheckpointingOptions(
         save_decision_policy=ocp.training.save_decision_policies.FixedIntervalPolicy(
             50
@@ -110,6 +135,9 @@ class CheckpointOptionsTest(parameterized.TestCase):
     self.assertFalse(opts.enable_async_checkpointing)
 
   def test_create_checkpointing_options(self):
+    # [FUNCTION DOC]
+    # Verifies create_checkpointing_options returns a TunixCheckpointingOptions
+    # holding the given save/preservation policies and async flag.
     opts = checkpoint_options.create_checkpointing_options(
         save_decision_policy=ocp.training.save_decision_policies.FixedIntervalPolicy(
             50

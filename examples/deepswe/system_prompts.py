@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# HELPER: constants-only module holding prompt templates for the DeepSWE agent (no functions).
+# SWE_SYSTEM_PROMPT_FN_CALL: short system prompt for models using native function calling (tools
+# supplied separately). SWE_SYSTEM_PROMPT: system prompt for the r2egym scaffold describing the
+# file_editor, search, execute_bash and finish tools and the XML call format
+# (function=NAME wrapping parameter=NAME blocks), one call per response. SWEAGENT_SYSTEM_PROMPT: the same
+# for the sweagent scaffold (execute_bash, str_replace_editor, submit). User prompt templates
+# SWE_USER_PROMPT_FN_CALL, SWE_USER_PROMPT and SWEAGENT_USER_PROMPT each contain a {problem_statement}
+# placeholder (to be filled with str.format) and give step-by-step instructions for fixing the issue
+# in /testbed without modifying tests.
+# KNOWN ISSUE: SWE_USER_PROMPT_FN_CALL asks for a 20-second timeout and then refers to 30 seconds, and
+# names the script both reproduce_issue.py and reproduce_script.py.
 SWE_SYSTEM_PROMPT_FN_CALL = """You are a programming agent who is provided a github issue and repository bash environment and is tasked to solve certain tasks (e.g., file localization, testcase generation, code repair and editing etc) to resolve the issue.
 """
 

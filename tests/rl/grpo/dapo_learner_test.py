@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.grpo.dapo_learner: DAPO shares GRPO's registered
+# policy loss function but differs in loss aggregation and has no KL term;
+# DAPOConfig post-init validation (epsilon_high at least epsilon; when
+# overlong_buffer is enabled it must include non-None
+# overlong_buffer_length, overlong_buffer_penalty and max_response_length,
+# and the penalty must be non-negative); and reward_shaping, the overlong
+# length penalty. No side effects.
+
 from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,8 +33,15 @@ from tunix.tests import test_common as tc
 
 
 class DAPOlearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Compares DAPO and GRPO loss behavior on identical inputs.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: builds shared fixtures: mock model, pad_id 0, eos_id 1,
+    # batch 2 x seq 4 prompt/completion ids, a completion mask with 3 and 2
+    # valid tokens, advantages [0.5, -0.2], reference logps -0.2 and old
+    # logps -0.15 everywhere.
     super().setUp()
     self.mock_model = mock.MagicMock()
     self.pad_id = 0
@@ -52,6 +68,9 @@ class DAPOlearnerTest(parameterized.TestCase):
     )
 
   def create_train_example(self):
+    # [FUNCTION DOC]
+    # HELPER: returns a MagicMock training example carrying the setUp
+    # tensors, with segment fields and sampler_is_weights set to None.
     example = mock.MagicMock()
     example.prompt_ids = self.prompt_ids
     example.completion_ids = self.completion_ids
@@ -65,6 +84,11 @@ class DAPOlearnerTest(parameterized.TestCase):
     return example
 
   def test_diff_loss(self):
+    # [FUNCTION DOC]
+    # Verifies DAPO and GRPO resolve to the same registered loss function,
+    # yet with temperature 1.0 on a toy transformer the DAPO loss (with
+    # reference logps None) differs from the GRPO loss, both aux dicts have
+    # "kl", and DAPO's kl is 0.0.
     dapo_config = dapo_lib.DAPOConfig()
     grpo_config = grpo_lib.GRPOConfig()
     dapo_config.temperature = 1.0
@@ -118,8 +142,12 @@ class DAPOlearnerTest(parameterized.TestCase):
 
 
 class TestDAPOConfigPostInit(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for DAPOConfig post-init validation.
 
   def test_valid_default(self):
+    # [FUNCTION DOC]
+    # Verifies default DAPOConfig construction raises no ValueError.
     """Tests that default values pass validation."""
     try:
       dapo_lib.DAPOConfig()
@@ -145,6 +173,9 @@ class TestDAPOConfigPostInit(parameterized.TestCase):
       ),
   )
   def test_valid_configurations(self, **kwargs):
+    # [FUNCTION DOC]
+    # Verifies valid configs construct: epsilon_high above or equal to
+    # epsilon, overlong_buffer disabled or None, or a complete buffer dict.
     """Tests various valid custom configurations."""
     try:
       dapo_lib.DAPOConfig(**kwargs)
@@ -227,18 +258,29 @@ class TestDAPOConfigPostInit(parameterized.TestCase):
       ),
   )
   def test_invalid_configurations(self, config_kwargs, expected_regex):
+    # [FUNCTION DOC]
+    # Verifies ValueError with a matching message for epsilon_high below
+    # epsilon, an enabled buffer missing (or None for) any required key, and
+    # a negative overlong penalty.
     """Tests various invalid configurations that should raise ValueError."""
     with self.assertRaisesRegex(ValueError, expected_regex):
       dapo_lib.DAPOConfig(**config_kwargs)
 
 
 class RewardShapingTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for dapo_learner.reward_shaping overlong penalty.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: creates a MagicMock cluster whose Mode attribute is passed as
+    # the mode argument.
     super().setUp()
     self.mock_cluster = mock.MagicMock()
 
   def test_raises_error_on_none_buffer(self):
+    # [FUNCTION DOC]
+    # Verifies reward_shaping raises ValueError when overlong_buffer is None.
     with self.assertRaisesRegex(
         ValueError, "reward_shaping is called but with empty overlong_buffer."
     ):
@@ -289,6 +331,12 @@ class RewardShapingTest(parameterized.TestCase):
       ),
   )
   def test_reward_scores(self, lengths, expected_scores, penalty=10):
+    # [FUNCTION DOC]
+    # With max_response_length 100 and buffer length 20 (expected length
+    # 80), verifies the score per completion is 0 up to length 80 and
+    # otherwise negative (length - 80) / 20 times penalty, unclipped beyond
+    # the max (110 gives -1.5 times penalty); penalty 0 gives 0.
+    # Completion length is measured in characters here.
     completions = ["a" * length for length in lengths]
     overlong_buffer = {
         "overlong_buffer_length": 20,

@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.reward_manager. SequenceRewardManager calls each
+# reward function with (prompts, completions, plus kwargs), injecting
+# algorithm-config fields whose names match the function's signature,
+# sums per-sample rewards across functions with NaN treated as 0, and
+# returns a dict with "rewards" (per-sample array) and "log_metrics"
+# (per-function "rewards/<fn name>", "rewards/sum", "rewards/min",
+# "rewards/max" and others; each value is a list whose first element is the
+# per-sample array). It raises RuntimeError for None results or length
+# mismatches and ValueError for an empty reward_fns list.
+# AgenticSequenceRewardManager additionally logs "trajectory_rewards/*"
+# metrics from passed trajectory_rewards and allows reward_fns None.
+# No side effects.
+
 import dataclasses
 import inspect
 from typing import Any, List
@@ -29,6 +43,9 @@ from tunix.rl import reward_manager
 def len_reward(
     prompts: List[str], completions: List[str], **kwargs: Any
 ) -> List[float]:
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning the character length of each completion as
+  # a float.
   del prompts, kwargs  # Unused
   res = [float(len(c)) for c in completions]
   return res
@@ -43,8 +60,11 @@ def prompt_len_reward(
     custom_param: float = 1.0,
     **kwargs: Any,
 ) -> List[float]:
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning custom_param (default 1.0) times the length
+  # of each prompt; custom_param is meant to be injected from the config.
   del completions, kwargs  # Unused
-  res = [custom_param * len(p) for p in prompts]
+  res =[custom_param * len(p) for p in prompts]
   return res
 
 
@@ -54,6 +74,8 @@ prompt_len_reward.__name__ = "prompt_len_reward"
 def nan_reward(
     prompts: List[str], completions: List[str], **kwargs: Any
 ) -> List[float]:
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning NaN for every prompt.
   del completions, kwargs  # Unused
   return [np.nan] * len(prompts)
 
@@ -63,6 +85,12 @@ nan_reward.__name__ = "nan_reward"
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class TestAlgoConfig(algo_config_lib.AlgorithmConfig):
+  # [CLASS DOC]
+  # HELPER: slotted kw-only AlgorithmConfig adding reward_manager
+  # ("sequence-level") and custom_param (2.0), the latter for injection
+  # into reward fns.
+  # KNOWN ISSUE: the "Test" prefix may cause pytest to try collecting this
+  # dataclass as a test class (it emits a collection warning).
   """Test Algorithm Config."""
 
   reward_manager: str = "sequence-level"
@@ -71,14 +99,22 @@ class TestAlgoConfig(algo_config_lib.AlgorithmConfig):
 
 # --- Test Class ---
 class SequenceRewardManagerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for SequenceRewardManager aggregation, metrics, param injection
+  # and errors.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: creates the test config, two prompts and two completions.
     super().setUp()
     self.test_algo_config = TestAlgoConfig()
     self.prompts = ["p1", "p22"]
     self.completions = ["c1_long", "c2"]
 
   def test_initialization(self):
+    # [FUNCTION DOC]
+    # Verifies a single callable reward_fns is wrapped into a list and the
+    # config is stored.
     manager = reward_manager.SequenceRewardManager(
         reward_fns=len_reward,
         algo_config=self.test_algo_config,
@@ -87,6 +123,9 @@ class SequenceRewardManagerTest(parameterized.TestCase):
     self.assertEqual(manager.algo_config, self.test_algo_config)
 
   def test_single_reward_fn(self):
+    # [FUNCTION DOC]
+    # Verifies rewards equal the single fn's outputs and exactly 7 log
+    # metric entries are produced.
     manager = reward_manager.SequenceRewardManager(
         reward_fns=[len_reward],
         algo_config=self.test_algo_config,
@@ -101,6 +140,14 @@ class SequenceRewardManagerTest(parameterized.TestCase):
     self.assertLen(rewards_info["log_metrics"], 7)
 
   def test_multiple_reward_fns(self):
+    # [FUNCTION DOC]
+    # Verifies rewards are the per-sample sum of two fns (prompt_len_reward
+    # receiving custom_param 2.0 from config); every "rewards/" metric holds
+    # 2 per-sample values; sum and per-fn metrics match; and min/max are the
+    # per-sample min/max across fns.
+    # KNOWN ISSUE: the min/max loop iterates over the number of reward fns
+    # (matrix rows) but uses it as a sample (column) index; it only works
+    # because both counts are 2 here.
     manager = reward_manager.SequenceRewardManager(
         reward_fns=[len_reward, prompt_len_reward],
         algo_config=self.test_algo_config,
@@ -150,6 +197,12 @@ class SequenceRewardManagerTest(parameterized.TestCase):
       )
 
   def test_algo_config_param_passing(self):
+    # [FUNCTION DOC]
+    # Wraps prompt_len_reward in a spying Mock carrying its name and
+    # signature, and verifies the manager calls it once with custom_param
+    # 2.0 taken from the config, without unrelated parameters.
+    # KNOWN ISSUE: the "another_param" absence check is vacuous because no
+    # such field exists on the config.
     # Mock the reward function to spy on its call arguments
     mock_fn = mock.Mock(wraps=prompt_len_reward)
     mock_fn.__name__ = prompt_len_reward.__name__
@@ -173,6 +226,9 @@ class SequenceRewardManagerTest(parameterized.TestCase):
     )  # Not in prompt_len_reward signature
 
   def test_nan_handling(self):
+    # [FUNCTION DOC]
+    # Verifies NaN rewards are ignored in the sum (nansum), while the
+    # per-fn metric for the NaN fn keeps the NaNs.
     manager = reward_manager.SequenceRewardManager(
         reward_fns=[len_reward, nan_reward],
         algo_config=self.test_algo_config,
@@ -214,6 +270,13 @@ class SequenceRewardManagerTest(parameterized.TestCase):
   def test_errors(
       self, expected_regex, error_type, kwargs=None, reward_fns=None
   ):
+    # [FUNCTION DOC]
+    # Verifies calling the manager raises RuntimeError "Failed to obtain
+    # result ... Result is None" when a fn returns None, and "Length
+    # mismatch" when a fn returns one value too many. Defaults reward_fns
+    # to len_reward and names unnamed fns test_fn_<i>.
+    # KNOWN ISSUE: lambdas always have a __name__ ("<lambda>"), so the
+    # naming fallback never triggers.
     if reward_fns is None:
       reward_fns = [len_reward]
     for i, fn in enumerate(reward_fns):
@@ -232,6 +295,8 @@ class SequenceRewardManagerTest(parameterized.TestCase):
       )
 
   def test_no_reward_fns_raises_error(self):
+    # [FUNCTION DOC]
+    # Verifies an empty reward_fns list raises ValueError at construction.
     with self.assertRaisesRegex(ValueError, "reward_fns cannot be empty"):
       reward_manager.SequenceRewardManager(
           reward_fns=[],
@@ -240,14 +305,22 @@ class SequenceRewardManagerTest(parameterized.TestCase):
 
 
 class AgenticSequenceRewardManagerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests that trajectory reward metrics and reward-fn metrics coexist in
+  # AgenticSequenceRewardManager output.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: creates the test config, two prompts and two completions.
     super().setUp()
     self.test_algo_config = TestAlgoConfig()
     self.prompts = ["p1", "p22"]
     self.completions = ["c1_long", "c2"]
 
   def test_log_metrics_non_interference_with_reward_fns(self):
+    # [FUNCTION DOC]
+    # Verifies both trajectory_rewards/sum and /mean and rewards/sum and
+    # rewards/len_reward metrics are present when reward fns are given.
     manager = reward_manager.AgenticSequenceRewardManager(
         reward_fns=[len_reward],
         algo_config=self.test_algo_config,
@@ -265,6 +338,9 @@ class AgenticSequenceRewardManagerTest(parameterized.TestCase):
     self.assertIn("rewards/len_reward", log_metrics)
 
   def test_log_metrics_non_interference_no_reward_fns(self):
+    # [FUNCTION DOC]
+    # Verifies with reward_fns None only trajectory_rewards metrics are
+    # logged and no rewards/sum appears.
     manager = reward_manager.AgenticSequenceRewardManager(
         reward_fns=None,
         algo_config=self.test_algo_config,

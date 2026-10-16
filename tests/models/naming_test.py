@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for tunix.models.naming: model-name parsing helpers (get_model_name_from_model_id,
+# get_model_family_and_version, split, get_model_config_id, get_model_config_category), the ModelNaming
+# dataclass's auto-population and consistency validation, and HF/config id type detection. Most test cases
+# are generated from registry.MODEL_CATALOG. One test performs HTTP HEAD requests to huggingface.co
+# (skipped in the internal environment) with retries.
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -22,6 +28,9 @@ from tunix.utils import env_utils
 
 
 def _get_test_cases_for_get_model_config_id() -> list[dict[str, str]]:
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry with testcase_name and expected_config_id set to
+  # the entry's model_config_id and model_name set to its model_name.
   test_cases = []
   for model_info in registry.MODEL_CATALOG:
     test_cases.append({
@@ -33,6 +42,9 @@ def _get_test_cases_for_get_model_config_id() -> list[dict[str, str]]:
 
 
 def _get_test_cases_for_get_model_family_and_version() -> list[dict[str, str]]:
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry with model_name, expected_family and
+  # expected_version, named by config id.
   test_cases = []
   for model_info in registry.MODEL_CATALOG:
     test_cases.append({
@@ -45,6 +57,9 @@ def _get_test_cases_for_get_model_family_and_version() -> list[dict[str, str]]:
 
 
 def _get_test_cases_for_get_model_config_category() -> list[dict[str, str]]:
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per distinct model family (first catalog entry wins), containing
+  # model_name and expected_category, named by the family.
   test_cases_dict = {}
   for model_info in registry.MODEL_CATALOG:
     if model_info.model_family not in test_cases_dict:
@@ -57,6 +72,8 @@ def _get_test_cases_for_get_model_config_category() -> list[dict[str, str]]:
 
 
 def _get_test_cases_for_get_model_name_from_model_id() -> list[dict[str, str]]:
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry with model_id and expected_name.
   test_cases = []
   for model_info in registry.MODEL_CATALOG:
     test_cases.append({
@@ -68,6 +85,8 @@ def _get_test_cases_for_get_model_name_from_model_id() -> list[dict[str, str]]:
 
 
 def _get_test_cases_for_model_id_exists() -> list[dict[str, str]]:
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry containing its HF model_id.
   return [
       {
           'testcase_name': model_info.model_config_id,
@@ -80,6 +99,9 @@ def _get_test_cases_for_model_id_exists() -> list[dict[str, str]]:
 def _get_test_cases_for_auto_population_with_HF_model_id() -> (
     list[dict[str, str]]
 ):
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry with the HF model_id and all expected naming
+  # fields (name, family, version, category, config id).
   test_cases = []
   for model_info in registry.MODEL_CATALOG:
     test_cases.append({
@@ -97,6 +119,9 @@ def _get_test_cases_for_auto_population_with_HF_model_id() -> (
 def _get_test_cases_for_auto_population_with_config_id() -> (
     list[dict[str, str]]
 ):
+  # [FUNCTION DOC]
+  # HELPER: returns one parameter dict per catalog entry using the config id as model_id, with expected
+  # family, version, category and config id.
   test_cases = []
   for model_info in registry.MODEL_CATALOG:
     test_cases.append({
@@ -111,6 +136,8 @@ def _get_test_cases_for_auto_population_with_config_id() -> (
 
 
 class TestNaming(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test suite for model naming utilities and the ModelNaming dataclass.
 
   @parameterized.named_parameters(
       _get_test_cases_for_get_model_name_from_model_id()
@@ -118,28 +145,38 @@ class TestNaming(parameterized.TestCase):
   def test_get_model_name_from_model_id(
       self, model_id: str, expected_name: str
   ):
+    # [FUNCTION DOC]
+    # Verifies get_model_name_from_model_id maps each catalog HF id to its catalog model name.
     self.assertEqual(
         naming.get_model_name_from_model_id(model_id),
         expected_name,
     )
 
   def test_get_model_name_from_model_id_no_slash_succeeds(self):
+    # [FUNCTION DOC]
+    # Verifies an id without a slash is accepted and lowercased ("Llama-3.1-8B" to "llama-3.1-8b").
     self.assertEqual(
         naming.get_model_name_from_model_id('Llama-3.1-8B'), 'llama-3.1-8b'
     )
 
   def test_get_model_name_from_model_id_config_id(self):
+    # [FUNCTION DOC]
+    # Verifies a config id is returned unchanged.
     self.assertEqual(
         naming.get_model_name_from_model_id('llama3p1_8b'), 'llama3p1_8b'
     )
 
   def test_get_model_name_from_model_id_nested_path(self):
+    # [FUNCTION DOC]
+    # Verifies nested paths return the last path segment.
     self.assertEqual(
         naming.get_model_name_from_model_id('google/gemma-2/flax/gemma-2-2b-it'),
         'gemma-2-2b-it',
     )
 
   def test_get_model_name_from_model_id_empty_model_name(self):
+    # [FUNCTION DOC]
+    # Verifies an id with an empty final segment ("google/") raises ValueError about an empty model name.
     with self.assertRaisesRegex(
         ValueError, 'Invalid model ID format: .*. Model name cannot be empty.'
     ):
@@ -160,6 +197,10 @@ class TestNaming(parameterized.TestCase):
       reraise=True,
   )
   def _head_huggingface_model(self, model_id: str) -> requests.Response:
+    # [FUNCTION DOC]
+    # HELPER: sends an HTTP HEAD to https://huggingface.co/<model_id> following redirects with a 10 s
+    # timeout and returns the response. Retried up to 3 attempts with exponential wait (2 to 10 s) on
+    # connection errors, timeouts or 5xx status; the last exception is re-raised.
     return requests.head(
         f'https://huggingface.co/{model_id}',
         allow_redirects=True,
@@ -168,6 +209,9 @@ class TestNaming(parameterized.TestCase):
 
   @parameterized.named_parameters(_get_test_cases_for_model_id_exists())
   def test_model_id_exists_on_huggingface(self, model_id: str):
+    # [FUNCTION DOC]
+    # Verifies each catalog model id resolves with HTTP 200 on HuggingFace; skipped in internal environment.
+    # Side effect: network requests.
     if env_utils.is_internal_env():
       self.skipTest('Skipping Hugging Face check in internal environment')
 
@@ -186,24 +230,32 @@ class TestNaming(parameterized.TestCase):
   def test_get_model_family_and_version(
       self, model_name: str, expected_family: str, expected_version: str
   ):
+    # [FUNCTION DOC]
+    # Verifies get_model_family_and_version returns the catalog (family, version) pair for each model name.
     self.assertEqual(
         naming.get_model_family_and_version(model_name),
         (expected_family, expected_version),
     )
 
   def test_get_model_family_and_version_format_agnostic(self):
+    # [FUNCTION DOC]
+    # Verifies dash/dot style and underscore config-id style names give the same family and version.
     self.assertEqual(
         naming.get_model_family_and_version('gemma-2-2b-it'),
         naming.get_model_family_and_version('gemma2_2b_it'),
     )
 
   def test_get_model_family_and_version_invalid_fails(self):
+    # [FUNCTION DOC]
+    # Verifies an unknown family raises ValueError "Could not determine model family for: foo-bar.".
     with self.assertRaisesRegex(
         ValueError, 'Could not determine model family for: foo-bar.'
     ):
       naming.get_model_family_and_version('foo-bar')
 
   def test_get_model_family_and_version_invalid_format_fails(self):
+    # [FUNCTION DOC]
+    # Verifies a name without a version separator raises ValueError about invalid model ID format.
     with self.assertRaisesRegex(
         ValueError,
         'Invalid model ID format: .* Expected a Huggingface model ID or a'
@@ -212,10 +264,14 @@ class TestNaming(parameterized.TestCase):
       naming.get_model_family_and_version('foobar')
 
   def test_get_model_family_and_version_invalid_version_fails(self):
+    # [FUNCTION DOC]
+    # Verifies an invalid version string raises ValueError about invalid model version format.
     with self.assertRaisesRegex(ValueError, 'Invalid model version format'):
       naming.get_model_family_and_version('gemma-@b')
 
   def test_split(self):
+    # [FUNCTION DOC]
+    # Verifies split separates the family prefix (including trailing separator) from the version suffix.
     self.assertEqual(naming.split('gemma-7b'), ('gemma-', '7b'))
     self.assertEqual(naming.split('gemma-1.1-7b'), ('gemma-1.1-', '7b'))
     self.assertEqual(naming.split('gemma_7b'), ('gemma_', '7b'))
@@ -223,6 +279,8 @@ class TestNaming(parameterized.TestCase):
 
   @parameterized.named_parameters(_get_test_cases_for_get_model_config_id())
   def test_get_model_config_id(self, model_name: str, expected_config_id: str):
+    # [FUNCTION DOC]
+    # Verifies get_model_config_id maps each catalog model name to its config id.
     self.assertEqual(naming.get_model_config_id(model_name), expected_config_id)
 
   @parameterized.named_parameters(
@@ -231,6 +289,8 @@ class TestNaming(parameterized.TestCase):
   def test_get_model_config_category(
       self, model_name: str, expected_category: str
   ):
+    # [FUNCTION DOC]
+    # Verifies get_model_config_category returns the expected category for one model per family.
     self.assertEqual(
         naming.get_model_config_category(model_name), expected_category
     )
@@ -248,6 +308,9 @@ class TestNaming(parameterized.TestCase):
       expected_category: str,
       expected_config_id: str,
   ):
+    # [FUNCTION DOC]
+    # Verifies ModelNaming built from an HFModelId populates name, family, version, category and config id
+    # from the catalog, and that both the id and name are detected as HF id type and not config id type.
     with self.subTest(name='Test Model naming creation with HFModelId'):
       naming_info = naming.ModelNaming(model_id=naming.HFModelId(model_id))
       self.assertEqual(naming_info.model_id, model_id)
@@ -275,6 +338,9 @@ class TestNaming(parameterized.TestCase):
       expected_category: str,
       expected_config_id: str,
   ):
+    # [FUNCTION DOC]
+    # Verifies ModelNaming built from a ConfigId uses the config id as both model_id and model_name,
+    # populates the remaining fields, and that both are detected as config id type and not HF id type.
     with self.subTest(name='Test Model naming creation with ConfigId'):
       naming_info = naming.ModelNaming(model_id=naming.ConfigId(model_id))
       self.assertEqual(naming_info.model_id, model_id)
@@ -291,6 +357,9 @@ class TestNaming(parameterized.TestCase):
       self.assertTrue(naming._is_config_id_type(naming_info.model_name))
 
   def test_model_naming_no_model_id(self):
+    # [FUNCTION DOC]
+    # Verifies ModelNaming from only model_name "gemma-2b" leaves model_id None and infers family "gemma",
+    # version "2b", category "gemma" and config id "gemma_2b".
     model_name = 'gemma-2b'
     naming_info = naming.ModelNaming(model_name=model_name)
     self.assertIsNone(naming_info.model_id)
@@ -301,18 +370,24 @@ class TestNaming(parameterized.TestCase):
     self.assertEqual(naming_info.model_config_id, 'gemma_2b')
 
   def test_model_naming_missing_args(self):
+    # [FUNCTION DOC]
+    # Verifies ModelNaming with no arguments raises ValueError requiring model_name or model_id.
     with self.assertRaisesRegex(
         ValueError, 'Either model_name or model_id must be provided'
     ):
       naming.ModelNaming()
 
   def test_model_naming_invalid_model_name(self):
+    # [FUNCTION DOC]
+    # Verifies an unrecognized model_name raises ValueError about the model family.
     with self.assertRaisesRegex(
         ValueError, 'Could not determine model family for: invalid-model'
     ):
       naming.ModelNaming(model_name='invalid-model')
 
   def test_model_naming_mismatch(self):
+    # [FUNCTION DOC]
+    # Verifies a model_name that differs from the one inferred from model_id raises ValueError.
     with self.assertRaisesRegex(
         ValueError,
         'model_name set in ModelNaming and one inferred from model_id do not'
@@ -323,6 +398,8 @@ class TestNaming(parameterized.TestCase):
       )
 
   def test_model_naming_family_mismatch(self):
+    # [FUNCTION DOC]
+    # Verifies an explicit model_family inconsistent with the name raises "model_family mismatch:".
     with self.assertRaisesRegex(
         ValueError,
         'model_family mismatch:',
@@ -330,6 +407,8 @@ class TestNaming(parameterized.TestCase):
       naming.ModelNaming(model_name='gemma-2b', model_family='llama3')
 
   def test_model_naming_version_mismatch(self):
+    # [FUNCTION DOC]
+    # Verifies an explicit model_version inconsistent with the name raises "model_version mismatch:".
     with self.assertRaisesRegex(
         ValueError,
         'model_version mismatch:',
@@ -337,6 +416,8 @@ class TestNaming(parameterized.TestCase):
       naming.ModelNaming(model_name='gemma-2b', model_version='7b')
 
   def test_model_naming_category_mismatch(self):
+    # [FUNCTION DOC]
+    # Verifies an inconsistent model_config_category raises "model_config_category mismatch:".
     with self.assertRaisesRegex(
         ValueError,
         'model_config_category mismatch:',
@@ -344,6 +425,8 @@ class TestNaming(parameterized.TestCase):
       naming.ModelNaming(model_name='gemma-2b', model_config_category='llama3')
 
   def test_model_naming_config_id_mismatch(self):
+    # [FUNCTION DOC]
+    # Verifies an inconsistent model_config_id raises "model_config_id mismatch:".
     with self.assertRaisesRegex(
         ValueError,
         'model_config_id mismatch:',

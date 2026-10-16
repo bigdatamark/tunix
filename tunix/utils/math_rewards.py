@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Math reward function for RL training (DeepScaleR-style), registered in the
+# agentic reward registry under the name "deepscaler_math".
+# Module constants: THOUGHT_DELIMITER_END is the closing reasoning tag
+# "</think>"; RewardOutput aliases the agentic reward output type (imported but
+# currently unused by the active code path).
+# Depends on math_utils for answer extraction and grading.
 from typing import Any, Callable, Dict, List
 
 from tunix.utils import math_utils
@@ -25,6 +32,32 @@ RewardOutput = reward_types.RewardOutput
 
 @reward.register("deepscaler_math")
 def math_reward(prompts: List[str], completions: List[str], answer: List[str], **kwargs):
+  # [FUNCTION DOC]
+  # Computes a binary correctness reward per completion.
+  # Inputs: prompts (unused), completions - list of model response strings,
+  #   answer - list (parallel to completions) of ground truths; each entry may
+  #   be None, a scalar (str/float/int) or a list of acceptable answers;
+  #   extra keyword arguments are ignored.
+  # Behavior per completion i:
+  #   - None or empty response -> 0.0.
+  #   - If the response contains "</think>", take the text after the FIRST
+  #     occurrence (the segment between first and second delimiter if several);
+  #     else the whole response.
+  #   - Extract the final answer (last boxed expression) via
+  #     math_utils.extract_answer; None -> 0.0.
+  #   - Ground truth None -> 0.0; scalar wrapped into a one-element list.
+  #   - Each truth is string-converted; if it contains a boxed marker, its boxed
+  #     content is extracted (dropped if extraction fails), otherwise kept as is.
+  #     No usable truths -> 0.0.
+  #   - Correct if any truth satisfies grade_answer_mathd OR grade_answer_sympy
+  #     OR grade_answer_special_handling (evaluated in that order, short-circuit);
+  #     reward 1.0 on the first match, else 0.0.
+  # Output: list of floats, one per completion.
+  # Exceptions: IndexError if answer is shorter than completions. Side effects:
+  #   none (grading may run sympy with timeouts inside math_utils).
+  # KNOWN ISSUE: the docstring describes task/action arguments and a single
+  #   float return, but the function takes prompts/completions/answer lists and
+  #   returns a list of floats.
   """
   A reward function for math tasks that implements the RewardFunction protocol.
   Args:

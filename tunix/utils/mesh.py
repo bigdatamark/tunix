@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Topology-aware device allocation for JAX meshes. Given a pool of devices
+# (default: all JAX devices), it carves out disjoint device subsets for one or
+# more named meshes, preferring physically contiguous, legal TPU sub-slices
+# (using device "coords", "core_on_chip", "slice_index" and host metadata), and
+# builds jax.sharding.Mesh objects from them.
+# Key concepts: devices are mapped to normalized integer coords (optionally
+# with a trailing core-on-chip axis); free space is tracked per slice as a set
+# of disjoint axis-aligned CoordRegions; each allocation extracts a box from a
+# region and splits the leftover into new regions. Allocation state is an
+# immutable DeviceAllocationState threaded through sequential allocations.
+# Policies: "COMPACT" (default; smallest fitting region, pack tightly) and
+# "PERFORMANCE" (prefer more cubical extracted shapes). When coords are
+# unavailable or no legal box can be built, allocation fails with ValueError
+# (there is no flat-list fallback); a request larger than any single slice may
+# only be satisfied by consuming whole, untouched slices in order.
+# Module constants: MeshRequirement is the (mesh name, device count) pair type;
+# policy name constants and the set of supported policies.
 """Shared mesh device allocation helpers.
 
 Typical usage:
@@ -53,6 +71,16 @@ def create_mesh(
     axis_names: tuple[str, ...],
     devices: Sequence[Any] | None = None,
 ):
+  # [FUNCTION DOC]
+  # Builds a JAX Mesh. Inputs: axis_shapes (sizes), axis_names, optional
+  # explicit devices. Behavior: ValueError if shapes and names differ in
+  # length; device count is len(devices) or the global JAX device count;
+  # ValueError if the product of shapes exceeds it; with explicit devices the
+  # product must equal the count exactly (ValueError otherwise) and the mesh is
+  # the device list reshaped to axis_shapes in given order; without devices it
+  # uses jax.make_mesh (JAX picks device order, may use a subset when product
+  # is smaller). All axes use the Auto axis type.
+  # Output: jax.sharding.Mesh. Side effects: none.
   """Builds a JAX mesh from parsed axis metadata.
 
   Args:
@@ -111,6 +139,14 @@ def create_mesh(
 
 @dataclasses.dataclass(frozen=True)
 class CoordTopology:
+  # [CLASS DOC]
+  # Frozen dataclass of normalized coordinate metadata for a device pool:
+  # coord_to_device (normalized coord tuple -> device), all_coords (all
+  # normalized coords), num_dims (coord rank), min_coords (per-axis minimum
+  # raw coord used for normalization), max_shape (bounding box extent),
+  # chip_coord_to_coords (physical chip coord -> the logical device coords on
+  # that chip), has_core_on_chip_dimension (whether the last axis is a core
+  # index). Pure data, no methods.
   """Normalized coord metadata for a device pool.
 
   Attributes:
@@ -135,6 +171,9 @@ class CoordTopology:
 
 @dataclasses.dataclass(frozen=True)
 class CoordRegion:
+  # [CLASS DOC]
+  # Frozen dataclass for a free axis-aligned box of coords: start (per-axis
+  # start coord) and shape (per-axis extent). Pure data.
   """Axis-aligned coord region tracked across sequential allocations."""
 
   start: tuple[int, ...]
@@ -143,6 +182,15 @@ class CoordRegion:
 
 @dataclasses.dataclass(frozen=True)
 class DeviceAllocationState:
+  # [CLASS DOC]
+  # Frozen dataclass capturing the allocator's remaining pool between
+  # sequential allocations: remaining_devices (tuple of unassigned devices),
+  # total_device_count (original pool size), allocation_policy (default
+  # "COMPACT"), remaining_coord_regions_by_slice (slice id or None -> tuple of
+  # free CoordRegions; None when coord tracking unavailable),
+  # full_devices_per_slice (slice id -> original device count of that slice),
+  # used_device_count (number already handed out). New states are produced by
+  # replacement, never mutated.
   """Tracks the remaining device pool across sequential mesh allocations.
 
   This state object exists so `allocate_devices()` can be the lowest-level
@@ -174,6 +222,10 @@ class DeviceAllocationState:
 
 
 def _normalize_allocation_policy(allocation_policy: str | None) -> str:
+  # [FUNCTION DOC]
+  # HELPER: None -> "COMPACT"; otherwise upper-cases the string and validates
+  # it against the supported policies; ValueError listing allowed values
+  # otherwise. Output: normalized policy name.
   """Validates and normalizes the requested allocation policy."""
   normalized_policy = (
       _COMPACT_ALLOCATION_POLICY
@@ -189,6 +241,9 @@ def _normalize_allocation_policy(allocation_policy: str | None) -> str:
 
 
 def normalize_allocation_policy(allocation_policy: str | None) -> str:
+  # [FUNCTION DOC]
+  # Public wrapper around _normalize_allocation_policy (same inputs, output and
+  # ValueError).
   """Validates and normalizes a user-facing mesh allocation policy.
 
   Args:
@@ -205,6 +260,9 @@ def normalize_allocation_policy(allocation_policy: str | None) -> str:
 
 
 def device_attr(device: Any, attr_name: str) -> Any:
+  # [FUNCTION DOC]
+  # Returns device attribute attr_name (None if missing), calling it when
+  # callable; delegates to the topology module helper.
   """Returns a raw device attribute, calling it first if JAX exposes it lazily.
 
   Args:
@@ -218,6 +276,9 @@ def device_attr(device: Any, attr_name: str) -> Any:
 
 
 def device_host_key(device: Any) -> tuple[Any, ...] | None:
+  # [FUNCTION DOC]
+  # Returns (slice id, task id) host key or None; delegates to the topology
+  # module's per-host key helper (Pathways aware).
   """Returns a stable host grouping key for topology-aware allocation.
 
   Args:
@@ -233,6 +294,8 @@ def device_host_key(device: Any) -> tuple[Any, ...] | None:
 
 
 def device_slice_id(device: Any) -> Any:
+  # [FUNCTION DOC]
+  # Returns the device's slice_index attribute (or None).
   """Returns the slice identifier when the runtime exposes one.
 
   This is intentionally narrower than `device_host_key()`: it captures only the
@@ -250,6 +313,10 @@ def device_slice_id(device: Any) -> Any:
 
 
 def device_mesh_coords(device: Any) -> tuple[int, ...] | None:
+  # [FUNCTION DOC]
+  # Returns normalized physical coords: None if the device has no coords or
+  # they are empty; otherwise the coords converted to ints, with the int
+  # core_on_chip value appended when that attribute exists.
   """Returns physical mesh coordinates for topology-aware allocation.
 
   Args:
@@ -275,6 +342,10 @@ def device_mesh_coords(device: Any) -> tuple[int, ...] | None:
 
 
 def infer_core_on_chip_count(devices: Sequence[Any]) -> int | None:
+  # [FUNCTION DOC]
+  # Returns cores per chip as (max - min + 1) of core_on_chip values over
+  # devices that expose it (int-converted); None if none expose it. Assumes a
+  # homogeneous pool with contiguous core indices.
   """Returns the number of logical cores per physical chip, or None.
 
   TPUs may pack several logical devices (cores) onto one physical chip. The pool
@@ -308,6 +379,11 @@ def summarize_devices_for_logging(
     debug: bool = False,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
+  # [FUNCTION DOC]
+  # Builds per-device summary dicts for logging, optionally limited to the
+  # first `limit` devices. Non-debug: keys id, coords (normalized via
+  # device_mesh_coords), host (device_host_key). Debug: id, raw coords,
+  # core_on_chip, host. Output: list of dicts. No side effects.
   """Builds compact, log-friendly summaries for a device list.
 
   Args:
@@ -346,6 +422,9 @@ def summarize_devices_for_logging(
 def summarize_host_groups_for_logging(
     devices: Sequence[Any],
 ) -> dict[tuple[Any, ...] | None, int]:
+  # [FUNCTION DOC]
+  # Counts devices per device_host_key and returns a dict ordered by the string
+  # form of the key.
   """Summarizes device counts per derived host key for debug logging.
 
   Args:
@@ -365,6 +444,10 @@ def summarize_host_groups_for_logging(
 def summarize_coord_regions_for_logging(
     coord_regions_by_slice: dict[Any, tuple[CoordRegion, ...]] | None,
 ) -> dict[Any, list[dict[str, tuple[int, ...]]]] | None:
+  # [FUNCTION DOC]
+  # Converts the per-slice region mapping to {slice id: list of
+  # {"start", "shape"} dicts}, slices ordered by string form of their id;
+  # returns None if the input is None.
   """Builds a compact log-friendly summary of remaining coord regions.
 
   Args:
@@ -388,6 +471,9 @@ def summarize_coord_regions_for_logging(
 
 
 def _optional_int_sort_key(value: Any) -> tuple[int, int]:
+  # [FUNCTION DOC]
+  # HELPER: Sort-key component for optional integers: None -> (1, 0) (sorts
+  # last), otherwise (0, int value). TypeError/ValueError if not int-like.
   """Builds a deterministic sort key component for optional integer metadata.
 
   Args:
@@ -404,6 +490,9 @@ def _optional_int_sort_key(value: Any) -> tuple[int, int]:
 def _host_sort_key(
     host_key: tuple[Any, ...] | None,
 ) -> tuple[tuple[int, Any], ...]:
+  # [FUNCTION DOC]
+  # HELPER: Sort key for a host key: None -> a single "missing" component;
+  # otherwise a tuple of _optional_int_sort_key for each element.
   """Builds a stable sort key for derived host identifiers.
 
   Args:
@@ -420,6 +509,10 @@ def _host_sort_key(
 
 
 def allocation_device_sort_key(device: Any) -> tuple[Any, ...]:
+  # [FUNCTION DOC]
+  # Deterministic allocation sort key: (slice id key, host task id key using
+  # the second element of the host key if present, normalized coords or empty
+  # tuple, device id key); missing integers sort last.
   """Sort key for deterministic allocation order: slice, host, coords, id.
 
   Args:
@@ -440,6 +533,12 @@ def allocation_device_sort_key(device: Any) -> tuple[Any, ...]:
 
 
 def group_devices_by_slice(devices: Sequence[Any]) -> list[list[Any]] | None:
+  # [FUNCTION DOC]
+  # Groups devices by slice_index (None for no metadata) preserving the order
+  # in which each slice is first seen and device order within groups.
+  # Output: list of device lists.
+  # KNOWN ISSUE: docstring says None is returned for an empty list, but the
+  # code returns an empty list (the return type also admits None).
   """Groups devices by slice while preserving first-seen slice order.
 
   Devices without slice metadata are treated as belonging to one shared slice.
@@ -464,6 +563,10 @@ def group_devices_by_slice(devices: Sequence[Any]) -> list[list[Any]] | None:
 def _partition_devices_by_host(
     devices: Sequence[Any],
 ) -> list[list[Any]] | None:
+  # [FUNCTION DOC]
+  # HELPER: Groups devices by device_host_key. Returns None as soon as any
+  # device lacks a host key. Groups are ordered by _host_sort_key and devices
+  # in each group sorted by allocation_device_sort_key.
   """Partitions devices by host/task when that metadata is available.
 
   Args:
@@ -488,6 +591,16 @@ def _partition_devices_by_host(
 
 
 def get_coord_topology(devices: Sequence[Any]) -> CoordTopology | None:
+  # [FUNCTION DOC]
+  # Builds a CoordTopology. Returns None for an empty pool or (logging the
+  # reason at info level with debug device summaries) when any device lacks
+  # coords, coord ranks differ, or two devices share coords. The core-on-chip
+  # flag is set if any device exposes core_on_chip. Coords (from
+  # device_mesh_coords, raw int values, not shifted) map to devices; min_coords
+  # is the per-axis minimum, max_shape is per-axis (max - min + 1); chip
+  # coords are coords without the last axis when the core flag is set (else
+  # the full coords), each mapped to its sorted list of member coords.
+  # Side effects: info logging.
   """Builds normalized coord metadata for a device pool.
 
   Args:
@@ -564,6 +677,10 @@ def candidate_uses_whole_chips(
     coord_topology: CoordTopology,
     candidate_coords: Sequence[tuple[int, ...]],
 ) -> bool:
+  # [FUNCTION DOC]
+  # Returns True if no core-on-chip axis exists; otherwise True only if for
+  # every chip touched by the candidate coords, all of that chip's logical
+  # coords are in the candidate (no chip is split between meshes).
   """Returns whether a candidate includes all logical devices for each chip.
 
   When multiple logical devices share the same physical chip coordinates, a
@@ -592,6 +709,9 @@ def candidate_uses_whole_chips(
 
 
 def _divisors(value: int) -> list[int]:
+  # [FUNCTION DOC]
+  # HELPER: Positive divisors of value in ascending order, found by trial
+  # division up to the integer square root (adding both factor partners).
   """Returns the positive divisors of `value` in ascending order.
 
   Args:
@@ -612,6 +732,10 @@ def _enumerate_box_shapes(
     required_devices: int,
     max_shape: tuple[int, ...],
 ) -> list[tuple[int, ...]]:
+  # [FUNCTION DOC]
+  # HELPER: Enumerates every tuple (one size per axis of max_shape) whose
+  # product equals required_devices and whose sizes do not exceed max_shape,
+  # in lexicographic divisor order of earlier axes. Output: list of shapes.
   """Enumerates box shapes whose volume matches the requested device count.
 
   Args:
@@ -626,6 +750,11 @@ def _enumerate_box_shapes(
   num_dims = len(max_shape)
 
   def build(dim_index: int, remaining: int, prefix: tuple[int, ...]):
+    # [FUNCTION DOC]
+    # HELPER: Recursive builder. On the last axis, appends prefix plus the
+    # remaining volume if it fits that axis; otherwise tries each divisor of
+    # the remaining volume that fits the current axis and recurses with the
+    # quotient. Side effect: appends to the enclosing shapes list.
     """Recursively assigns each axis a divisor of the remaining volume.
 
     Args:
@@ -656,6 +785,18 @@ def _supported_coord_box_shapes(
     required_devices: int,
     available_coord_shape: Sequence[int] | None = None,
 ) -> list[tuple[int, ...]] | None:
+  # [FUNCTION DOC]
+  # HELPER: Topology-legal box shapes for the pool. Returns None if the TPU
+  # family is unknown (caller then enumerates generic boxes). Cores per chip =
+  # infer_core_on_chip_count or 1; if required_devices is not a multiple ->
+  # []. Chip rank = coord rank minus 1 if a core axis exists (non-positive ->
+  # []). Available shape = given region shape or topology max_shape; its first
+  # chip_rank axes bound the chip shape. Asks
+  # topology.best_topology_shapes_for_chip_count for required_devices / cores
+  # chips; none -> []. When a core axis exists, appends the core count to each
+  # chip shape. Output: list of device-space box shapes.
+  # Exceptions: ValueError from the topology module for invalid large fish
+  # counts.
   """Returns topology-valid physical box shapes for the current device pool.
 
   When the accelerator family is known, this narrows box search to the exact
@@ -711,6 +852,9 @@ def _supported_coord_box_shapes(
 
 
 def _full_coord_region(coord_topology: CoordTopology) -> CoordRegion:
+  # [FUNCTION DOC]
+  # HELPER: CoordRegion spanning the whole topology bounding box (start =
+  # min_coords, shape = max_shape).
   """Returns the one bounding coord region for a concrete device pool.
 
   Args:
@@ -728,6 +872,9 @@ def _full_coord_region(coord_topology: CoordTopology) -> CoordRegion:
 def _create_coord_regions(
     devices: Sequence[Any],
 ) -> tuple[CoordRegion, ...] | None:
+  # [FUNCTION DOC]
+  # HELPER: One-element tuple with the full bounding region of the devices,
+  # or None if get_coord_topology fails.
   """Builds the initial coord-region partition for one device pool.
 
   Args:
@@ -746,6 +893,15 @@ def _create_coord_regions(
 def _create_coord_regions_by_slice(
     devices: Sequence[Any],
 ) -> dict[Any, tuple[CoordRegion, ...]] | None:
+  # [FUNCTION DOC]
+  # HELPER: Initial free regions keyed by slice id. Empty pool -> regions of
+  # the whole pool under key None (None if unavailable). For each slice group:
+  # if every device has a host key, one bounding region per host (hosts whose
+  # topology fails contribute nothing); if no host regions result, fall back to
+  # one bounding region for the whole slice; slices without any region are
+  # skipped. Returns the mapping, or None if empty.
+  # KNOWN ISSUE: per-host bounding boxes are assumed to be disjoint and fully
+  # populated; no overlap check is done.
   """Builds initial coord-region partitions keyed by slice id when present.
 
   Args:
@@ -791,6 +947,14 @@ def _split_coord_region(
     allocated_start: tuple[int, ...],
     allocated_shape: tuple[int, ...],
 ) -> tuple[CoordRegion, ...]:
+  # [FUNCTION DOC]
+  # HELPER: Guillotine split of a region after allocating a box inside it.
+  # Validates equal ranks of region, start and shape and that the box lies
+  # within the region (ValueError otherwise). For each axis d in order, emits
+  # up to two slabs: the part before the box and the part after the box along
+  # d; for both, axes earlier than d are clamped to the box's start/extent
+  # while later axes keep the full region extent. Zero-size slabs are omitted.
+  # Output: tuple of non-overlapping remaining CoordRegions.
   """Splits a consumed region into remaining x/y/z-style guillotine regions.
 
   Args:
@@ -880,6 +1044,9 @@ def _region_contains_box(
     start: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: True if for every axis the box [start, start+shape) lies within
+  # [region.start, region.start + region.shape).
   """Returns whether a candidate box lies fully within a coord region.
 
   Args:
@@ -902,6 +1069,9 @@ def _build_candidate_coords(
     start: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> list[tuple[int, ...]] | None:
+  # [FUNCTION DOC]
+  # HELPER: Lists all coords in the box (row-major order over shape offsets
+  # added to start); returns None if any of them has no device.
   """Builds the coord list for one candidate box if the full box exists.
 
   Args:
@@ -928,6 +1098,10 @@ def _coord_box_score(
     start: tuple[int, ...],
     shape: tuple[int, ...],
 ) -> tuple[Any, ...]:
+  # [FUNCTION DOC]
+  # HELPER: Box ranking key (lower is better): (largest dimension, dimensions
+  # sorted descending, negated dimensions so larger earlier axes win, start
+  # coords reversed so lower z then y then x wins).
   """Builds a lexicographic sort key for candidate coord boxes.
 
   The returned tuple is ordered so Python tuple comparison implements the
@@ -964,6 +1138,11 @@ def _order_candidate_regions(
     candidate_regions: Sequence[tuple[CoordRegion, Sequence[tuple[int, ...]]]],
     allocation_policy: str,
 ) -> list[tuple[CoordRegion, Sequence[tuple[int, ...]]]]:
+  # [FUNCTION DOC]
+  # HELPER: Sorts (region, supported shapes) pairs. COMPACT: primary key is
+  # _coord_box_score of the region's own start/shape, secondary the score of
+  # the region start with its first supported shape. Any other policy
+  # (PERFORMANCE): the two keys swapped. Output: new sorted list.
   """Orders candidate regions according to the requested allocation policy.
 
   Args:
@@ -1002,6 +1181,13 @@ def _find_best_candidate_box(
     *,
     region: CoordRegion | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...], list[tuple[int, ...]]] | None:
+  # [FUNCTION DOC]
+  # HELPER: Exhaustive scan for the best box. For each candidate shape and each
+  # existing device coord (sorted) used as box start: skip if a region is
+  # given and the box is not inside it, if any coord in the box has no device,
+  # or if the box splits a chip's cores. Keeps the minimum _coord_box_score.
+  # Output: (start, shape, coord list) or None.
+  # Complexity: shapes x devices x box volume.
   """Finds the best valid candidate box, optionally constrained to a region.
 
   This is the shared internal scan used by both region-aware allocation and
@@ -1044,6 +1230,13 @@ def find_best_candidate_coords(
     required_devices: int,
     candidate_shapes: Sequence[tuple[int, ...]] | None = None,
 ) -> list[tuple[int, ...]] | None:
+  # [FUNCTION DOC]
+  # Returns the coord list of the best box over the whole topology. Shapes:
+  # candidate_shapes if non-empty, otherwise all factorizations of
+  # required_devices within max_shape. None if no box fits.
+  # KNOWN ISSUE: an empty list of topology-legal shapes is treated like "not
+  # provided" and falls back to generic enumeration, so a topology-illegal box
+  # may be returned.
   """Returns only the coord list for the best candidate box.
 
   Args:
@@ -1081,6 +1274,25 @@ def _allocate_devices_by_coords(
     coord_regions: Sequence[CoordRegion] | None = None,
     allocation_policy: str = _COMPACT_ALLOCATION_POLICY,
 ) -> tuple[list[Any] | None, tuple[CoordRegion, ...] | None]:
+  # [FUNCTION DOC]
+  # HELPER: Coord-based allocation of one box.
+  # Inputs: devices pool, required_devices, optional current free regions,
+  #   allocation policy.
+  # Behavior: build topology (None -> return (None, None)); normalize policy
+  #   (ValueError if invalid); regions = given regions or the full bounding
+  #   region. For each region compute legal shapes bounded by the region shape
+  #   (regions with None or no shapes are skipped); order regions by policy;
+  #   in order, find the best box inside the region; on success, assigned
+  #   devices are pool devices whose coords are in the box (pool order) and the
+  #   new region list replaces that region with its guillotine split remainders.
+  #   If no region works, fall back to a whole-topology search with legal
+  #   shapes (or generic shapes, see find_best_candidate_coords); none ->
+  #   (None, original regions); found -> (devices in box, regions rebuilt as a
+  #   single bounding region of the remaining devices, or None).
+  # Output: (assigned devices or None, next regions or None).
+  # KNOWN ISSUE: for unknown TPU families the region search is skipped
+  # entirely (None shapes), so tracked regions are always rebuilt from the
+  # remaining devices' bounding box, which may contain holes.
   """Allocates a contiguous physical box of devices when coords exist.
 
   Args:
@@ -1191,6 +1403,14 @@ def _create_device_allocation_state(
     allocation_policy: str = _COMPACT_ALLOCATION_POLICY,
     log_summary: bool = True,
 ) -> DeviceAllocationState:
+  # [FUNCTION DOC]
+  # HELPER: Builds the initial DeviceAllocationState. Normalizes the policy
+  # (ValueError if invalid); pool = given devices or jax.devices(), sorted by
+  # allocation_device_sort_key. If log_summary, logs (info) a debug sample of
+  # up to 16 devices, host group counts and the initial regions. Initial
+  # regions come from _create_coord_regions_by_slice; full_devices_per_slice
+  # maps each slice id to its device count.
+  # Output: state with all devices remaining and used count 0.
   """Builds reusable allocator state for one or more mesh allocations.
 
   This is intentionally private because callers should not need to understand
@@ -1255,6 +1475,12 @@ def _allocate_devices_from_pool(
     coord_regions: Sequence[CoordRegion] | None = None,
     allocation_policy: str = _COMPACT_ALLOCATION_POLICY,
 ) -> tuple[list[Any], list[Any], tuple[CoordRegion, ...] | None]:
+  # [FUNCTION DOC]
+  # HELPER: Allocates one coord box from a concrete pool (no slice logic).
+  # ValueError if more devices are requested than remain, or if
+  # _allocate_devices_by_coords returns no devices. Otherwise removes the
+  # assigned devices (by object identity) from the pool.
+  # Output: (assigned devices, remaining pool list, next regions or None).
   """Allocates one mesh from a concrete device pool without slice policy.
 
   This helper contains the pool-local allocation strategy used after any
@@ -1311,6 +1537,8 @@ def allocate_devices(
     allocation_policy: str | None = None,
     return_state: Literal[False] = False,
 ) -> list[Any]:
+  # [FUNCTION DOC]
+  # Typing overload only (return_state False -> device list); no behavior.
   ...
 
 
@@ -1324,6 +1552,8 @@ def allocate_devices(
     allocation_policy: str | None = None,
     return_state: Literal[True],
 ) -> tuple[list[Any], DeviceAllocationState]:
+  # [FUNCTION DOC]
+  # Typing overload only (return_state True -> (devices, next state)).
   ...
 
 
@@ -1337,6 +1567,8 @@ def allocate_devices(
     allocation_policy: str | None = None,
     return_state: bool = False,
 ) -> list[Any] | tuple[list[Any], DeviceAllocationState]:
+  # [FUNCTION DOC]
+  # Typing overload only (generic bool return_state -> either form).
   ...
 
 
@@ -1349,6 +1581,34 @@ def allocate_devices(
     allocation_policy: str | None = None,
     return_state: bool = False,
 ) -> Any:
+  # [FUNCTION DOC]
+  # Allocates devices for one mesh.
+  # Inputs: required_devices; devices (one-shot pool, default all JAX
+  #   devices); keyword mesh_name (diagnostics), allocation_state (incremental
+  #   mode), allocation_policy (optional), return_state.
+  # Behavior: ValueError if both devices and allocation_state are given.
+  #   Without state, create one (with initial logging) using the normalized
+  #   policy; with state, a given policy must equal the state's policy
+  #   (ValueError otherwise). Copy remaining devices and the region mapping.
+  #   Group remaining devices by slice; pick the FIRST slice group with at
+  #   least required_devices devices, re-sort it via a fresh non-logging state,
+  #   and allocate a coord box from it using that slice's tracked regions;
+  #   remove assigned devices and store the slice's new regions (empty tuple if
+  #   None). If no slice is big enough, there are multiple slices and enough
+  #   total devices: take whole slices in order, skipping slices that were
+  #   partially consumed (size differs from original), until the count is
+  #   reached; the total must equal required_devices exactly (else ValueError
+  #   "only supports whole slices"); remove those devices and drop their
+  #   regions. If still nothing assigned -> ValueError. Build the next state
+  #   (remaining devices, regions, used count increased). Logs assigned device
+  #   summaries and remaining regions. In one-shot mode without return_state,
+  #   warns if devices are left unused.
+  # Output: assigned device list, or (list, next state) if return_state.
+  # Exceptions: ValueError as described, plus those from coord allocation.
+  # Side effects: logging only; input state is not mutated.
+  # KNOWN ISSUE: if the first large-enough slice cannot form a valid box, the
+  #   ValueError propagates immediately; later slices and the cross-slice path
+  #   are never tried, contrary to the "try single slices first" description.
   """Allocates devices for a single mesh request.
 
   This is the lowest-level public allocation API. It handles exactly one mesh
@@ -1552,6 +1812,9 @@ def _remove_devices_by_identity(
     devices: Sequence[Any],
     assigned_devices: Sequence[Any],
 ) -> list[Any]:
+  # [FUNCTION DOC]
+  # HELPER: Returns the devices list without any object that is (by identity,
+  # not equality) in assigned_devices, preserving order.
   """Removes assigned devices from a pool using object identity.
 
   Identity-based removal avoids ambiguity when test doubles or device objects
@@ -1574,6 +1837,19 @@ def allocate_named_mesh_device_slices(
     *,
     allocation_policy: str = _COMPACT_ALLOCATION_POLICY,
 ) -> dict[str, list[Any]]:
+  # [FUNCTION DOC]
+  # Allocates devices for several named meshes from one shared pool.
+  # Inputs: mesh_requirements - sequence of (name, device count); devices -
+  #   optional pool (default jax.devices()); allocation_policy (keyword,
+  #   default "COMPACT").
+  # Behavior: create one allocation state (ValueError on invalid policy), then
+  #   call allocate_devices once per requirement in order threading the state,
+  #   storing results by name. Afterwards warns about unused devices and logs
+  #   the per-mesh device counts.
+  # Output: dict name -> device list. Exceptions: ValueError from allocation.
+  # KNOWN ISSUE: duplicate mesh names silently overwrite earlier entries in the
+  #   result (their devices are still consumed); the docstring mentions a
+  #   host-splitting error that the code never raises.
   """Allocates device subsets for named meshes.
 
   This is a convenience wrapper over `allocate_devices()` for callers that want

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Async unit tests for RolloutOrchestrator streaming: producers consume a
+# stream of (agent, env) pairs, collect trajectories concurrently (bounded by
+# max_concurrency), group them via group_key_fn into groups of group_size,
+# and yield_batches emits lists of TrajectoryItems of at most batch_size.
+# The private trajectory collector is patched with an AsyncMock for all
+# tests. Also checks that exceptions from collection and from the pair
+# generator propagate to the consumer. Uses mock agent and environment
+# classes defined here.
 """Tests for rollout_orchestrator."""
 
 import asyncio
@@ -17,28 +26,45 @@ from tunix.rl.agentic.pipeline import rollout_orchestrator
 
 # Mock classes for dependencies
 class MockAgent(base_agent.ConversationAgentBase):
+  # [CLASS DOC]
+  # HELPER: conversation agent with empty system prompt whose model update
+  # always returns an empty Action.
   """A mock agent."""
 
   def __init__(self):
+    # [FUNCTION DOC]
+    # HELPER: initializes the base agent with an empty system prompt.
     super().__init__('')
 
   def update_from_model(self, response: str, **kwargs) -> agent_types.Action:
+    # [FUNCTION DOC]
+    # HELPER: ignores the response and returns a default Action.
     return agent_types.Action()
 
 
 class MockEnv(base_environment.BaseTaskEnv):
+  # [CLASS DOC]
+  # HELPER: task environment tagged with env_id; extra kwargs (group_id,
+  # pair_index) go to the base environment.
   """A mock environment."""
 
   def __init__(
       self, task: Mapping[str, Any] | None = None, env_id: int = 0, **kwargs
   ):
+    # [FUNCTION DOC]
+    # HELPER: forwards task and kwargs to the base init and stores env_id.
     super().__init__(task=task, **kwargs)
     self.env_id = env_id
 
   def _initial_observation(self):
+    # [FUNCTION DOC]
+    # HELPER: returns a dict with obs "initial_obs_<env_id>".
     return {'obs': f'initial_obs_{self.env_id}'}
 
   def _step_impl(self, action):
+    # [FUNCTION DOC]
+    # HELPER: returns a step result with obs "next_obs_<env_id>", reward
+    # 1.0, done False and empty info, regardless of action.
     return base_environment.EnvStepResult(
         observation={'obs': f'next_obs_{self.env_id}'},
         reward=1.0,
@@ -48,8 +74,13 @@ class MockEnv(base_environment.BaseTaskEnv):
 
 
 class RolloutOrchestratorTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for RolloutOrchestrator streaming production and batching.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: patches RolloutOrchestrator._collect_trajectory with an
+    # AsyncMock (self.mock_collect) and registers cleanup to stop the patch.
     super().setUp()
     self.collect_patcher = mock.patch.object(
         rollout_orchestrator.RolloutOrchestrator,
@@ -92,6 +123,8 @@ class RolloutOrchestratorTest(parameterized.TestCase):
       ),
   )
   def test_streaming_successful_run(self, num_pairs, group_size, batch_size):
+    # [FUNCTION DOC]
+    # Runs the async successful-run scenario for the given parameters.
     asyncio.run(
         self._test_streaming_successful_run(num_pairs, group_size, batch_size)
     )
@@ -99,16 +132,31 @@ class RolloutOrchestratorTest(parameterized.TestCase):
   async def _test_streaming_successful_run(
       self, num_pairs, group_size, batch_size
   ):
+    # [FUNCTION DOC]
+    # HELPER: streams num_pairs mock pairs into an orchestrator (max
+    # concurrency 2) with group key pair_index integer-divided by group_size,
+    # consumes all batches, then verifies: number of batches is ceil of
+    # num_pairs / batch_size; each batch is at most batch_size; when
+    # batch_size does not exceed a group size above 1, each batch holds one
+    # group; every pair index appears exactly once; each item's traj is the
+    # mocked trajectory for its env; group ids equal pair_index divided by
+    # group_size; and each group contains exactly its contiguous indices.
     orchestrator = rollout_orchestrator.RolloutOrchestrator(
         max_concurrency=2,
         rollout_sync_lock=utils.RolloutSyncLock(),
     )
 
     def pair_generator():
+      # [FUNCTION DOC]
+      # HELPER: yields num_pairs (MockAgent, MockEnv) pairs with env_id and
+      # pair_index equal to the loop index.
       for i in range(num_pairs):
         yield MockAgent(), MockEnv(env_id=i, group_id=0, pair_index=i)
 
     async def side_effect_fn(*args, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: fake collector; reads the env from the second positional
+      # argument and returns a trajectory dict naming its env_id.
       env = args[1]
       return {'trajectory': [f'traj_for_env_{env.env_id}']}
 
@@ -172,9 +220,17 @@ class RolloutOrchestratorTest(parameterized.TestCase):
       self.assertEqual(pair_indices_in_group, expected_pair_indices)
 
   def test_streaming_producer_runner_exception(self):
+    # [FUNCTION DOC]
+    # Runs the async collector-failure scenario.
     asyncio.run(self._test_streaming_producer_runner_exception())
 
   async def _test_streaming_producer_runner_exception(self):
+    # [FUNCTION DOC]
+    # HELPER: with 5 pairs where collecting env 2 raises ValueError, verifies
+    # the error "Collection failed!" surfaces through yield_batches or the
+    # awaited producer task.
+    # KNOWN ISSUE: if the consumer loop raises, the producer task is never
+    # awaited inside the test, which may leave it pending.
     orchestrator = rollout_orchestrator.RolloutOrchestrator(
         max_concurrency=2,
         rollout_sync_lock=utils.RolloutSyncLock(),
@@ -183,10 +239,15 @@ class RolloutOrchestratorTest(parameterized.TestCase):
     failing_pair_index = 2
 
     def pair_generator():
+      # [FUNCTION DOC]
+      # HELPER: yields num_pairs mock (agent, env) pairs.
       for i in range(num_pairs):
         yield MockAgent(), MockEnv(env_id=i, group_id=0, pair_index=i)
 
     async def failing_side_effect(*args, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: fake collector raising ValueError for the failing env id,
+      # otherwise returning a trajectory dict naming the env.
       env = args[1]
       if env.env_id == failing_pair_index:
         raise ValueError('Collection failed!')
@@ -210,9 +271,15 @@ class RolloutOrchestratorTest(parameterized.TestCase):
       await producer_task
 
   def test_streaming_generator_exception(self):
+    # [FUNCTION DOC]
+    # Runs the async pair-generator-failure scenario.
     asyncio.run(self._test_streaming_generator_exception())
 
   async def _test_streaming_generator_exception(self):
+    # [FUNCTION DOC]
+    # HELPER: with a pair generator that raises ValueError at index 2 and a
+    # collector returning a fixed trajectory, verifies "Generator failed!"
+    # propagates to the consumer or the awaited producer task.
     orchestrator = rollout_orchestrator.RolloutOrchestrator(
         max_concurrency=2,
         rollout_sync_lock=utils.RolloutSyncLock(),
@@ -220,6 +287,9 @@ class RolloutOrchestratorTest(parameterized.TestCase):
     failing_pair_index = 2
 
     def faulty_generator():
+      # [FUNCTION DOC]
+      # HELPER: yields mock pairs for indices 0 and 1, then raises
+      # ValueError when reaching the failing index.
       for i in range(5):
         if i == failing_pair_index:
           raise ValueError('Generator failed!')

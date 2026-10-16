@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: utility module building Gemma 3 attention masks: causal masks over
+# non-padding tokens, with optional bidirectional attention inside each
+# contiguous block of image placeholder tokens. Constant _PADDING_ID = 0 is
+# the token id treated as padding. Pure functions, no side effects.
 """Utility functions for Gemma 3."""
 
 from __future__ import annotations
@@ -28,6 +33,14 @@ def get_attention_mask(
     inputs_mask: jaxtyping.ArrayLike | None = None,  # (B, L, L')
     token_placeholder_id: int | None = None,
 ):
+  # [FUNCTION DOC]
+  # Builds the [B, L, L] boolean attention mask for tokens [B, L].
+  # Inputs: tokens; optional inputs_mask (if None, computed as
+  # tokens != _PADDING_ID); optional token_placeholder_id (if given, positions
+  # equal to it form the bidirectional mask for image tokens).
+  # Output: result of make_causal_bidirectional_attention_mask.
+  # KNOWN ISSUE: the inline comment annotates inputs_mask as (B, L, L') but it
+  # must be a 2D [B, L] mask (the causal helper raises ValueError otherwise).
   """Returns the attention mask for the transformer."""
   # Compute the mask
   if inputs_mask is None:
@@ -50,6 +63,12 @@ def make_causal_bidirectional_attention_mask(
     *,
     bidirectional_mask: jaxtyping.ArrayLike | None = None,  # (B, L)
 ) -> jaxtyping.ArrayLike:
+  # [FUNCTION DOC]
+  # Returns the causal mask from _make_causal_mask(causal_mask), OR-ed with
+  # _add_bidirectional_mask when bidirectional_mask is provided.
+  # Inputs: causal_mask [B, L] (True for non-padding tokens), optional
+  # bidirectional_mask [B, L]. Output: bool [B, L, L]. Raises ValueError (via
+  # the helper) for non-2D causal_mask.
   """Make the attention mask for the transformer.
 
   To compute the attention mask for Gemma 3, we need to:
@@ -98,6 +117,9 @@ def make_causal_bidirectional_attention_mask(
 def _make_causal_mask(
     input_mask: jaxtyping.ArrayLike,  # (B, L)
 ) -> jaxtyping.ArrayLike:
+  # [FUNCTION DOC]
+  # HELPER: from input_mask [B, L] builds [B, L, L] where [b, q, k] is true
+  # iff k <= q and input_mask[b, k]. Raises ValueError if input_mask is not 2D.
   """Makes causal attention mask.
   
   Every token attends to all preceding tokens (including itself) in the
@@ -124,6 +146,10 @@ def _make_causal_mask(
 def _make_block_mask_indices(
     bidirectional_mask: jaxtyping.ArrayLike,  # (B, L)
 ) -> jaxtyping.ArrayLike:
+  # [FUNCTION DOC]
+  # HELPER: numbers contiguous runs of true values: left-pads with 0, marks
+  # rising edges (0 -> 1), cumulative-sums them, and multiplies by the mask so
+  # positions outside any run get 0 and the i-th run gets id i. Output [B, L].
   """Creates block mask identifying segments based on a bidirectional mask.
 
   Args:
@@ -143,6 +169,10 @@ def _add_bidirectional_mask(
     attn_mask: jaxtyping.ArrayLike,  # (B, L, L)
     bidirectional_mask: jaxtyping.ArrayLike,  # (B, L)
 ) -> jaxtyping.ArrayLike:
+  # [FUNCTION DOC]
+  # HELPER: given attn_mask [B, L, L] and bidirectional_mask [B, L], returns
+  # attn_mask OR (query and key belong to the same non-zero block id), letting
+  # image tokens attend to each other in both directions within their block.
   """Adds bidirectional mask to the attention mask."""
   q_block_indices = _make_block_mask_indices(bidirectional_mask)
   kv_block_indices = q_block_indices

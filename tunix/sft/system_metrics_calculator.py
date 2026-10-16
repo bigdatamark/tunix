@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: small utility module computing throughput metrics for training:
+#   an exact static TFLOPs-per-step measurement from XLA cost analysis and
+#   a 6*params*batch heuristic TFLOPS rate. No side effects at import.
 """System metrics calculator for Tunix."""
 
 from typing import Any, Callable
@@ -26,6 +30,18 @@ def measure_tflops_per_step(
     optimizer: nnx.ModelAndOptimizer,
     train_example: Any,
 ) -> float | None:
+  # [FUNCTION DOC]
+  # Measures TFLOPs of one training step from the compiled XLA program.
+  # Inputs: train_step_fn (should be jitted, exposing .lower), model,
+  #   optimizer, train_example (the step's arguments, in that order).
+  # Steps: if train_step_fn lacks "lower", log a warning and return None;
+  #   else lower with (model, optimizer, train_example), compile, take
+  #   cost_analysis() and read its "flops" key; missing -> warning and None;
+  #   else return flops / 1e12. Any exception is caught, logged as error,
+  #   and None returned (never raises).
+  # Side effects: triggers a compilation; logging.
+  # KNOWN ISSUE: on some JAX versions cost_analysis() returns a list of
+  #   dicts, so calling get on it raises and the function returns None.
   """Performs a one-time static measurement of TFLOPs using JAX's cost analysis."""
   if not hasattr(train_step_fn, "lower"):
     logging.warning(
@@ -53,6 +69,14 @@ def approximate_tflops_per_second(
     global_batch_size: int,
     step_time_delta: float,
 ) -> float:
+  # [FUNCTION DOC]
+  # Approximates TFLOPS rate. Inputs: total_model_params, global_batch_size,
+  #   step_time_delta (seconds).
+  # Returns 0.0 with a warning if params <= 0 or step time <= 0; otherwise
+  #   (6 * global_batch_size * total_model_params) / step_time_delta / 1e12.
+  # No exceptions. Side effects: logging only.
+  # Note: global_batch_size counts examples, not tokens, so for sequence
+  #   models this underestimates FLOPs by the sequence length factor.
   """Approximates the TFLOPS (per second) rate using a 6*params heuristic."""
   if total_model_params <= 0:
     logging.warning(

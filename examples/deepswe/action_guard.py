@@ -15,6 +15,15 @@ Usage:
         guard.record_outcome(action_str, str(obs))
         agent.update_from_env(obs, rew, done, info)
 """
+# [MODULE DOC]
+# Failure-aware action guard for the DeepSWE agent: a policy layer between the agent's parsed action
+# (an XML tool-call string) and env.step(). It keeps per-episode state from executed actions'
+# observations and blocks actions that (1) exactly repeat the last failed action, (2) edit the same
+# file again right after a not-found / non-unique / missing-path failure without a recovery
+# (view/search/grep) in between, (3) edit after too many consecutive edit failures, or (4) finish /
+# submit while edited files are unverified (optional). Blocked actions yield a synthetic observation.
+# Defines GuardConfig, GuardVerdict, ActionRecord dataclasses and ActionGuard. Logs rule firings via a
+# module logger.
 
 import dataclasses
 import logging
@@ -30,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class GuardConfig:
+  # [CLASS DOC]
+  # Dataclass of guard settings: max_consecutive_edit_failures (3), require_view_after_not_found
+  # (True), require_view_after_non_unique (True), require_view_before_finish (False), enabled (True,
+  # master switch).
   """Configuration for the action guard."""
 
   max_consecutive_edit_failures: int = 3
@@ -50,6 +63,9 @@ class GuardConfig:
 
 @dataclasses.dataclass
 class GuardVerdict:
+  # [CLASS DOC]
+  # Dataclass result of ActionGuard.evaluate: blocked (bool; True means skip env.step), message
+  # (synthetic observation to return when blocked, default empty), reason (short reason code).
   """Result of evaluating an action through the guard."""
 
   blocked: bool
@@ -64,6 +80,9 @@ class GuardVerdict:
 
 @dataclasses.dataclass
 class ActionRecord:
+  # [CLASS DOC]
+  # Dataclass history entry: action_str, observation (first 500 chars), failure_type (classification
+  # string or None for success), step_index (guard step counter at record time).
   """A record of a past action and its outcome."""
 
   action_str: str
@@ -84,6 +103,10 @@ class ActionRecord:
 # ---------------------------------------------------------------------------
 
 class ActionGuard:
+  # [CLASS DOC]
+  # Stateful guard. State: config, _history (ActionRecord list), _last_failed_action,
+  # _consecutive_edit_failures, _last_failure_type, _last_failed_path, _files_edited_since_last_view
+  # (set of paths), _files_successfully_edited (set), _step_index.
   """Failure-aware action guard.
 
   Sits between agent.update_from_model() and env.step(). Evaluates each
@@ -92,6 +115,8 @@ class ActionGuard:
   """
 
   def __init__(self, config: Optional[GuardConfig] = None):
+    # [FUNCTION DOC]
+    # Stores config (default GuardConfig) and initializes all state to empty/None/0.
     self.config = config or GuardConfig()
     self._history: List[ActionRecord] = []
     self._last_failed_action: Optional[str] = None
@@ -105,6 +130,9 @@ class ActionGuard:
   # ---- lifecycle ----
 
   def reset(self) -> None:
+    # [FUNCTION DOC]
+    # Clears history and both file sets, sets last-failure fields to None and counters to 0.
+    # Call at the start of each episode. No output.
     """Reset all guard state. Call at the start of each episode."""
     self._history.clear()
     self._last_failed_action = None
@@ -118,6 +146,11 @@ class ActionGuard:
   # ---- public API ----
 
   def evaluate(self, action_str: str) -> GuardVerdict:
+    # [FUNCTION DOC]
+    # Returns an unblocked verdict if the guard is disabled or action_str is empty. Otherwise parses the
+    # action and applies rules in order, returning the first blocking verdict (and logging it):
+    # repeated failure, failure transition, consecutive edit failures, finish preconditions. If none fire,
+    # returns GuardVerdict(blocked=False). Does not mutate state.
     """Evaluate whether *action_str* should be executed or blocked.
 
     Args:
@@ -161,6 +194,15 @@ class ActionGuard:
     return GuardVerdict(blocked=False)
 
   def record_outcome(self, action_str: str, observation: str) -> None:
+    # [FUNCTION DOC]
+    # Updates state after an action has been executed. Parses the action, classifies the observation,
+    # takes path from params. Determines is_edit, is_view, is_search (function "search") and is_bash_grep
+    # (execute_bash whose "cmd" or else "command" param contains "grep"); recovery = view or search or grep.
+    # Appends an ActionRecord. On failure: stores the action, failure type and path as last failure and
+    # increments the consecutive edit failure count if it was an edit. On success: clears last-failure
+    # fields; for edits resets the counter and adds the path to both file sets. A view with a path removes
+    # it from the unverified set. Any recovery action clears last-failure fields and the consecutive edit
+    # failure count (even if it itself failed). Increments _step_index. No output.
     """Record the result of an executed action and update guard state.
 
     Must be called after every successful env.step().
@@ -226,6 +268,9 @@ class ActionGuard:
   # ---- rules ----
 
   def _check_repeated_failure(self, action_str: str) -> Optional[GuardVerdict]:
+    # [FUNCTION DOC]
+    # HELPER (rule 1): if action_str equals the last failed action string, returns a blocked verdict with
+    # reason "repeated_failure" and advice to try a different approach; otherwise None.
     """Rule 1: block if this is the exact same action that just failed."""
     if self._last_failed_action is not None and action_str == self._last_failed_action:
       return GuardVerdict(
@@ -247,6 +292,13 @@ class ActionGuard:
   def _check_failure_transition(
       self, func_name: str, params: Dict[str, str]
   ) -> Optional[GuardVerdict]:
+    # [FUNCTION DOC]
+    # HELPER (rule 2): returns None unless there is a last failure type and the action is an edit whose
+    # path equals the last failed path (any path matches when the last failed path is empty). Then blocks
+    # with reason "transition:non_unique_requires_view" (if configured), "transition:not_found_requires_view"
+    # (if configured), or "transition:path_not_found_requires_search" for path_not_found; else None.
+    # KNOWN ISSUE: the path_not_found transition has no config flag and always blocks; syntax_error,
+    # file_exists and generic_error failures never trigger a transition.
     """Rule 2: after certain failures, require recovery action first."""
     if self._last_failure_type is None:
       return None
@@ -316,6 +368,9 @@ class ActionGuard:
   def _check_consecutive_edit_failures(
       self, func_name: str, params: Dict[str, str]
   ) -> Optional[GuardVerdict]:
+    # [FUNCTION DOC]
+    # HELPER (rule 3): for edit actions, blocks with reason "consecutive_edit_failures:N" if the count is
+    # at least config.max_consecutive_edit_failures; else None.
     """Rule 3: block edits after too many consecutive edit failures."""
     is_edit = self._is_edit_action(func_name, params)
     if not is_edit:
@@ -343,6 +398,10 @@ class ActionGuard:
   def _check_finish_preconditions(
       self, func_name: str, params: Dict[str, str]
   ) -> Optional[GuardVerdict]:
+    # [FUNCTION DOC]
+    # HELPER (rule 4): for function names finish or submit when require_view_before_finish is on, blocks
+    # with reason "finish:unverified_edits" listing (sorted, comma-separated) edited files not viewed since
+    # their last edit; else None.
     """Rule 4: block finish/submit if edited files haven't been verified."""
     if func_name not in ("finish", "submit"):
       return None
@@ -369,6 +428,10 @@ class ActionGuard:
 
   @staticmethod
   def _parse_action(action_str: str) -> Tuple[str, Dict[str, str]]:
+    # [FUNCTION DOC]
+    # HELPER (static): extracts the function name from the first function=NAME tag (stripped; empty if
+    # absent) and a dict of all parameter=KEY ... closing-parameter pairs (dotall, keys and values
+    # stripped; later duplicates win). Empty input returns ("", {}). Output: (name, params).
     """Extract function_name and parameters from an XML action string."""
     if not action_str:
       return "", {}
@@ -384,6 +447,9 @@ class ActionGuard:
 
   @staticmethod
   def _is_edit_action(func_name: str, params: Dict[str, str]) -> bool:
+    # [FUNCTION DOC]
+    # HELPER (static): True if function is file_editor or str_replace_editor and the "command" param is
+    # str_replace, insert or create.
     """Check if this action is a file-editing action."""
     if func_name in ("file_editor", "str_replace_editor"):
       return params.get("command") in ("str_replace", "insert", "create")
@@ -391,6 +457,8 @@ class ActionGuard:
 
   @staticmethod
   def _is_view_action(func_name: str, params: Dict[str, str]) -> bool:
+    # [FUNCTION DOC]
+    # HELPER (static): True if function is file_editor or str_replace_editor and command is "view".
     """Check if this action is a file-viewing action."""
     if func_name in ("file_editor", "str_replace_editor"):
       return params.get("command") == "view"
@@ -398,6 +466,13 @@ class ActionGuard:
 
   @staticmethod
   def _classify_failure(observation: str) -> Optional[str]:
+    # [FUNCTION DOC]
+    # HELPER (static): classifies an observation. Empty gives None. Regex searches, in order: "Multiple
+    # occurrences of ... found in" gives non_unique; "No occurrences of ... found in ... for replacement"
+    # gives not_found; the syntax-error sentence gives syntax_error; "File already exists at: ... Cannot
+    # overwrite" gives file_exists; "The path '...' does not exist" gives path_not_found. Otherwise, if the
+    # stripped observation has at most 5 lines and any line starts with "ERROR:", returns generic_error;
+    # else None (success).
     """Classify an observation into a failure type, or None for success.
 
     Uses re.search (not re.match) because observations are prefixed with

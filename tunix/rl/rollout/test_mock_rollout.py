@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Unit tests (absltest + parameterized) for mock_rollout.MockRollout:
+# output shapes, prompt truncation/left padding, tokenizer integration and
+# fallbacks, seeding reproducibility, simulated sleep bounds, mock logps,
+# no-op parameter updates, pad/eos id resolution, length distributions
+# (bounds and statistics) and edge cases. time.sleep is patched in most tests
+# so no real delay occurs.
 import dataclasses
 from unittest import mock
 
@@ -24,6 +31,9 @@ from tunix.rl.rollout import mock_rollout
 
 
 class FakeTokenizer:
+  # [CLASS DOC]
+  # HELPER: Fake tokenizer with vocab_size, pad/eos ids exposed as methods and
+  # an option to make encode raise.
   """A fake tokenizer for testing purposes.
 
   This class simulates a tokenizer with configurable vocab size, pad/eos IDs,
@@ -31,37 +41,60 @@ class FakeTokenizer:
   """
 
   def __init__(self, vocab_size=100, pad_id=0, eos_id=1, fail_encode=False):
+    # [FUNCTION DOC]
+    # HELPER: Stores vocab size (default 100), pad id (0), eos id (1) and the
+    # fail_encode flag.
     self.vocab_size = vocab_size
     self._pad_id = pad_id
     self._eos_id = eos_id
     self._fail_encode = fail_encode
 
   def encode(self, text):
+    # [FUNCTION DOC]
+    # HELPER: Raises ValueError if fail_encode; otherwise returns one id per
+    # character: the character index capped at vocab_size minus 1.
     if self._fail_encode:
       raise ValueError("Encode failed")
     # Return dummy token IDs based on string length to simulate tokenization
     return [min(i, self.vocab_size - 1) for i in range(len(text))]
 
   def decode(self, tokens):
+    # [FUNCTION DOC]
+    # HELPER: Returns "decoded_" followed by the ids joined with underscores.
     return "decoded_" + "_".join(str(t) for t in tokens)
 
   def pad_id(self):
+    # [FUNCTION DOC]
+    # HELPER: Returns the configured pad id.
     return self._pad_id
 
   def eos_id(self):
+    # [FUNCTION DOC]
+    # HELPER: Returns the configured EOS id.
     return self._eos_id
 
 
 class FakeTokenizerProperties:
+  # [CLASS DOC]
+  # HELPER: Tokenizer stand-in exposing pad_id and eos_id as plain attributes
+  # instead of methods (and no encode/decode).
   # Some tokenizers have these as properties rather than functions
   def __init__(self, pad_id=0, eos_id=1):
+    # [FUNCTION DOC]
+    # HELPER: Stores pad_id (default 0) and eos_id (default 1) as attributes.
     self.pad_id = pad_id
     self.eos_id = eos_id
 
 
 class MockRolloutTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test case for MockRollout. setUp builds a base RolloutConfig with
+  # max_prompt_length 10, max_tokens_to_generate 15, return_logprobs True and
+  # seed 42.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: Calls the parent setUp and creates the base rollout config.
     super().setUp()
     self.base_rc = base_rollout.RolloutConfig(
         max_prompt_length=10,
@@ -71,6 +104,9 @@ class MockRolloutTest(parameterized.TestCase):
     )
 
   def _create_mock_rollout(self, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Builds a MockRollout with defaults vocab 100, pad 0, eos 1 and
+    # generation time between 0.01 and 0.02 seconds, overridable via kwargs.
     kwargs.setdefault("vocab_size", 100)
     kwargs.setdefault("pad_id", 0)
     kwargs.setdefault("eos_id", 1)
@@ -80,6 +116,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_basic(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies two prompts yield two texts, logits, tokens and logprobs, a 2 by 10
+    # prompt-token matrix, and that sleep was called.
     m = self._create_mock_rollout()
     out = m.generate(["prompt 1", "prompt 2"], rollout_config=self.base_rc)
 
@@ -92,6 +131,8 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_single_prompt(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies a bare string prompt is treated as a batch of one.
     m = self._create_mock_rollout()
     out = m.generate("single prompt", rollout_config=self.base_rc)
 
@@ -103,6 +144,8 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_no_logprobs(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies logprobs is None when return_logprobs is False.
     m = self._create_mock_rollout()
     rc = dataclasses.replace(self.base_rc, return_logprobs=False)
     out = m.generate(["prompt 1"], rollout_config=rc)
@@ -111,6 +154,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_with_tokenizer(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies that with a tokenizer, tokens are non-empty and text is the
+    # decoded form (starts with "decoded_").
     tokenizer = FakeTokenizer(vocab_size=100)
     m = self._create_mock_rollout(tokenizer=tokenizer)
     out = m.generate(["prompt"], rollout_config=self.base_rc)
@@ -121,6 +167,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_tokenizer_encode_exception(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies that when encode raises, random tokens are used with one token per
+    # generated dummy word.
     tokenizer = FakeTokenizer(vocab_size=100, fail_encode=True)
     m = self._create_mock_rollout(tokenizer=tokenizer)
     out = m.generate(["prompt"], rollout_config=self.base_rc)
@@ -129,6 +178,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_prompt_truncation(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies prompts longer than max_prompt_length (3) are truncated to their
+    # suffix so no pad ids remain in the prompt matrix.
     tokenizer = FakeTokenizer(vocab_size=100)
     m = self._create_mock_rollout(tokenizer=tokenizer)
     rc = dataclasses.replace(self.base_rc, max_prompt_length=3)
@@ -143,6 +195,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_reproducibility_with_seed(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies two instances seeded with integer 42 produce identical texts,
+    # tokens and logits.
     rollout_config = dataclasses.replace(self.base_rc, seed=42)
     m1 = self._create_mock_rollout(rollout_config=rollout_config)
     m2 = self._create_mock_rollout(rollout_config=rollout_config)
@@ -158,6 +213,8 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_reproducibility_with_jax_seed(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies reproducibility when the seed is a JAX scalar array.
     rollout_config = dataclasses.replace(self.base_rc, seed=jnp.array(42))
     m1 = self._create_mock_rollout(rollout_config=rollout_config)
     m2 = self._create_mock_rollout(rollout_config=rollout_config)
@@ -171,6 +228,8 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_sleep_time_bounds(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies sleep is called once with a duration within [0.01, 0.02].
     m = self._create_mock_rollout()
     m.generate(["prompt"], rollout_config=self.base_rc)
 
@@ -179,6 +238,9 @@ class MockRolloutTest(parameterized.TestCase):
     self.assertBetween(sleep_time, 0.01, 0.02)
 
   def test_get_per_token_logps(self):
+    # [FUNCTION DOC]
+    # Verifies get_per_token_logps returns a zero float32 array shaped like the
+    # completion tokens (2 by 10).
     m = self._create_mock_rollout()
     prompt_tokens = jnp.zeros((2, 5))
     completion_tokens = jnp.ones((2, 10))
@@ -189,6 +251,8 @@ class MockRolloutTest(parameterized.TestCase):
     np.testing.assert_array_equal(logps, np.zeros((2, 10), dtype=np.float32))
 
   def test_update_params(self):
+    # [FUNCTION DOC]
+    # Verifies update_params accepts an arbitrary pytree without raising.
     m = self._create_mock_rollout()
     # update_params is a no-op, just ensure it doesn't raise
     m.update_params({"dummy": "tree"})
@@ -214,6 +278,9 @@ class MockRolloutTest(parameterized.TestCase):
       },
   )
   def test_pad_id_eos_id(self, tokenizer, expected_pad_id, expected_eos_id):
+    # [FUNCTION DOC]
+    # Parameterized: verifies pad/eos ids come from constructor fallbacks without
+    # a tokenizer, from tokenizer methods, or from tokenizer attributes.
     if tokenizer is None:
       m = self._create_mock_rollout(
           pad_id=expected_pad_id, eos_id=expected_eos_id
@@ -224,6 +291,8 @@ class MockRolloutTest(parameterized.TestCase):
     self.assertEqual(m.eos_id(), expected_eos_id)
 
   def test_model_property(self):
+    # [FUNCTION DOC]
+    # Verifies model returns the rollout_actor object passed at construction.
     dummy_model = {"weights": [1, 2, 3]}
     m = self._create_mock_rollout(rollout_actor=dummy_model)
     self.assertEqual(m.model(), dummy_model)
@@ -274,6 +343,10 @@ class MockRolloutTest(parameterized.TestCase):
   def test_generate_distributions(
       self, mock_sleep, dist, mean, std, expected_min, expected_max
   ):
+    # [FUNCTION DOC]
+    # Parameterized over distributions (uniform default/custom, normal, skewed,
+    # fixed): verifies all five generated lengths fall within the expected
+    # bounds for max tokens 15.
     m = self._create_mock_rollout(
         length_distribution=dist,
         length_mean=mean,
@@ -328,6 +401,10 @@ class MockRolloutTest(parameterized.TestCase):
   def test_generate_distributions_statistical(
       self, mock_sleep, dist, mean, std, expected_mean, expected_std
   ):
+    # [FUNCTION DOC]
+    # Parameterized: with max tokens 500 and 1000 samples, verifies the empirical
+    # mean (within 10) and std (within 5) of lengths match the configured or
+    # default normal/skewed parameters.
     rc = dataclasses.replace(
         self.base_rc,
         max_tokens_to_generate=500,
@@ -354,6 +431,9 @@ class MockRolloutTest(parameterized.TestCase):
   def test_generate_unknown_distribution_fallback(
       self, mock_sleep, mock_warning
   ):
+    # [FUNCTION DOC]
+    # Verifies an unknown distribution logs the exact fallback warning once and
+    # still yields a length within [1, max tokens].
     m = self._create_mock_rollout(length_distribution="unknown_dist")
     out = m.generate(["prompt"], rollout_config=self.base_rc)
     self.assertLen(out.text, 1)
@@ -367,12 +447,22 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_tokenizer_returns_empty(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies that a tokenizer whose encode returns an empty list yields exactly
+    # one random token.
     class EmptyTokenizer:
+      # [CLASS DOC]
+      # HELPER: Local tokenizer whose encode returns an empty list and decode an
+      # empty string.
 
       def encode(self, text):
+        # [FUNCTION DOC]
+        # HELPER: Returns an empty list.
         return []
 
       def decode(self, tokens):
+        # [FUNCTION DOC]
+        # HELPER: Returns an empty string.
         return ""
 
     tokenizer = EmptyTokenizer()
@@ -384,6 +474,9 @@ class MockRolloutTest(parameterized.TestCase):
 
   @mock.patch.object(mock_rollout.time, "sleep", autospec=True)
   def test_generate_empty_prompts(self, mock_sleep):
+    # [FUNCTION DOC]
+    # Verifies an empty prompt list yields empty outputs, an empty logprobs list
+    # and a 0 by max_prompt_length prompt matrix.
     m = self._create_mock_rollout()
     out = m.generate([], rollout_config=self.base_rc)
 
@@ -396,6 +489,8 @@ class MockRolloutTest(parameterized.TestCase):
     self.assertEmpty(out.logprobs)
 
   def test_get_target_length_max_tokens_one(self):
+    # [FUNCTION DOC]
+    # Verifies _get_target_length returns max_tokens unchanged for 1 and 0.
     m = self._create_mock_rollout(length_distribution="skewed")
     length = m._get_target_length(max_tokens=1)
     self.assertEqual(length, 1)

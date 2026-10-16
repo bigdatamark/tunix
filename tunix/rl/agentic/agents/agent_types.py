@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Core data containers for the agentic RL system: Action (what an agent asks an
+# environment to do), Step (one agent/environment turn with tokens, masks,
+# logprobs, reward), TrajectoryStatus (episode termination reasons), Trajectory
+# (the full episode), and TrajectoryItem (a trajectory plus grouping metadata used
+# when batching trajectories for GRPO-style group training). All dataclasses are
+# keyword-only. Uses numpy arrays for token data. No import-time side effects.
 """Agent Data Types.
 
 This module defines the core data structures used throughout the agent system.
@@ -29,6 +36,10 @@ import numpy as np
 
 @dataclasses.dataclass(kw_only=True)
 class Action:
+  # [CLASS DOC]
+  # Keyword-only dataclass with a single field, action (any type, default None),
+  # holding an environment-specific action payload (e.g. a string answer or a list
+  # of tool calls).
   """Container for structured actions that can be executed by an environment.
 
   The action content is environment-specific and can be any type of data
@@ -44,6 +55,15 @@ class Action:
 
 @dataclasses.dataclass(kw_only=True)
 class Step:
+  # [CLASS DOC]
+  # Keyword-only dataclass describing one interaction turn. Fields and defaults:
+  # chat_completions (list of message dicts, default empty list), thought (str,
+  # ""), action (Action or None), observation (any, None), model_response (str, ""),
+  # info (dict, empty), reward (float, 0.0), done (bool, False), mc_return (float,
+  # 0.0, discounted return from this step), assistant_tokens / assistant_masks /
+  # env_tokens / env_masks / logprobs (numpy arrays or None) holding the token ids,
+  # loss masks and log-probabilities for the assistant output and environment
+  # feedback of this step.
   """Represents a single interaction step in an agent-environment conversation.
 
   Each Step captures the complete context of one turn: the input to the LLM,
@@ -86,6 +106,11 @@ class Step:
 
 
 class TrajectoryStatus(Enum):
+  # [CLASS DOC]
+  # Enum of trajectory states, values assigned with auto(): SUCCEEDED, RUNNING,
+  # MAX_STEPS_REACHED (step limit), MAX_CONTEXT_LIMIT_REACHED (response token budget
+  # exhausted), TIMEOUT (overall time limit), ENV_TIMEOUT (env step exceeded its
+  # asyncio timeout), FAILED (other errors).
   """Enum for trajectory status."""
 
   SUCCEEDED = auto()
@@ -105,6 +130,14 @@ class TrajectoryStatus(Enum):
 
 @dataclasses.dataclass(kw_only=True)
 class Trajectory:
+  # [CLASS DOC]
+  # Keyword-only dataclass for a full episode. Fields: task (any, None), steps
+  # (list of Step, empty), reward (float, 0.0), status (TrajectoryStatus, default
+  # RUNNING), env_time and reward_time (dicts of str to float timing measurements,
+  # empty by default).
+  # KNOWN ISSUE: the docstring describes status as strings like "success" and
+  # env_time as a total in seconds, but status is an enum and env_time is a dict;
+  # reward_time is undocumented in the docstring.
   """Represents a complete episode or task execution trace.
 
   A Trajectory contains the full sequence of Steps taken to complete a task,
@@ -127,6 +160,14 @@ class Trajectory:
   reward_time: dict[str, float] = dataclasses.field(default_factory=dict)
 
   def to_dict(self) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Serialize the trajectory to a plain dict.
+    # Outputs: dict with keys "task" (as is), "steps" (each Step converted with
+    # dataclasses.asdict, which deep-copies nested values; numpy arrays are kept as
+    # arrays), "reward" (cast to float), "status" (enum member name string),
+    # "env_time" and "reward_time" (the same dict objects, not copies).
+    # Exceptions: TypeError/ValueError if reward is not float-convertible.
+    # Side effects: none.
     """Convert trajectory to dictionary format for serialization.
 
     Useful for logging, storage, or transmission over APIs. All Step objects
@@ -147,6 +188,12 @@ class Trajectory:
 
 @dataclasses.dataclass(kw_only=True)
 class TrajectoryItem:
+  # [CLASS DOC]
+  # Keyword-only dataclass wrapping a trajectory with grouping metadata. Fields:
+  # pair_index (int, index within its group), group_id (hashable, default meaning
+  # is the dataset row index), start_step (int, starting step index within the full
+  # trajectory), traj (Trajectory or its dict form), metadata (dict, empty default).
+  # pair_index, group_id, start_step and traj are required.
   """Represents a Trajectory with additional metadata.
 
   Attributes:

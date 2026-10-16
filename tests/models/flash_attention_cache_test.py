@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# CPU-only regression tests (pytest marker cpu_only) for the flash-attention KV cache layout during
+# prefill followed by decode in qwen2, qwen3 and gemma4 models. TPU-only pieces (shard_map, NamedSharding,
+# splash attention kernel construction and block sizes) are patched with CPU-safe fakes so the flash
+# attention code path runs. Checks cache shapes stay [batch, cache_size, kv_heads, head_dim], end_index
+# advances, and prefill writes nonzero keys/values. No side effects beyond temporary mocks.
 
 """Regression tests for flash-attention KV cache layout during decode."""
 
@@ -35,17 +41,26 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _FakeSplashKernel:
+  # [CLASS DOC]
+  # HELPER: fake splash attention kernel that returns the query unchanged.
   """CPU-safe stand-in for the TPU splash attention kernel."""
 
   def manual_sharding_spec(self, unused_named_sharding):
+    # [FUNCTION DOC]
+    # HELPER: ignores the sharding argument and returns None.
     return None
 
   def __call__(self, q, k, v, segment_ids=None):
+    # [FUNCTION DOC]
+    # HELPER: returns q unchanged, ignoring k, v and segment_ids.
     del k, v, segment_ids
     return q
 
 
 def _identity_shard_map(fn=None, **unused_kwargs):
+  # [FUNCTION DOC]
+  # HELPER: identity replacement for shard_map. Called with a function, returns it unchanged; called
+  # with only keyword arguments (decorator-factory use), returns an identity decorator.
   if fn is None:
     return lambda inner_fn: inner_fn
   return fn
@@ -53,6 +68,11 @@ def _identity_shard_map(fn=None, **unused_kwargs):
 
 @contextlib.contextmanager
 def _patch_flash_attention(module):
+  # [FUNCTION DOC]
+  # HELPER: context manager that patches the given model module's shard_map with the identity version,
+  # its shd.NamedSharding with a function returning None, splash.make_splash_mha with a factory returning
+  # the fake kernel, and splash.BlockSizes with a function returning a plain object. Patches are undone on
+  # exit. Yields nothing.
   with contextlib.ExitStack() as stack:
     stack.enter_context(
         mock.patch.object(module, 'shard_map', _identity_shard_map)
@@ -87,6 +107,9 @@ def _build_causal_mask(
     query_len: int,
     cache_size: int,
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: returns a boolean mask of shape [batch, query_len, cache_size] where key position k is visible
+  # to query at absolute position p iff k is at most p, with query positions starting at query_start.
   query_positions = jnp.arange(query_start, query_start + query_len)
   key_positions = jnp.arange(cache_size)
   mask = key_positions[None, :] <= query_positions[:, None]
@@ -94,12 +117,18 @@ def _build_causal_mask(
 
 
 def _build_positions(batch_size: int, start: int, seq_len: int) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: returns int32 positions start..start+seq_len-1 broadcast to [batch, seq_len].
   positions = jnp.arange(start, start + seq_len, dtype=jnp.int32)
   return jnp.broadcast_to(positions[None, :], (batch_size, seq_len))
 
 
 def _make_cache(num_layers: int, batch_size: int, cache_size: int, num_kv_heads: int,
                 head_dim: int, dtype: jnp.dtype):
+  # [FUNCTION DOC]
+  # HELPER: builds a KV cache dict keyed "layer_i" for each layer, each holding zero "k" and "v" arrays of
+  # shape [batch, cache_size, kv_heads, head_dim] in the given dtype and a zero int32 "end_index" of shape
+  # [batch].
   shape = (batch_size, cache_size, num_kv_heads, head_dim)
   return {
       f'layer_{i}': {
@@ -112,6 +141,9 @@ def _make_cache(num_layers: int, batch_size: int, cache_size: int, num_kv_heads:
 
 
 def _tiny_qwen2_model():
+  # [FUNCTION DOC]
+  # HELPER: builds a tiny one-layer Qwen2 (from the 2.5 0.5B config; vocab 64, embed 64, hidden 128, 4
+  # heads of dim 16, 2 kv heads, flash attention on) with seed 0. Returns (model, config, model module).
   config = qwen2_model.ModelConfig.qwen2p5_0p5b()
   config.num_layers = 1
   config.vocab_size = 64
@@ -126,6 +158,8 @@ def _tiny_qwen2_model():
 
 
 def _tiny_qwen3_model():
+  # [FUNCTION DOC]
+  # HELPER: same tiny settings for Qwen3 (from the 0.6B config). Returns (model, config, model module).
   config = qwen3_model.ModelConfig.qwen3_0p6b()
   config.num_layers = 1
   config.vocab_size = 64
@@ -140,6 +174,10 @@ def _tiny_qwen3_model():
 
 
 def _tiny_gemma4_model():
+  # [FUNCTION DOC]
+  # HELPER: builds a tiny one-layer Gemma4 from the e2b config (num_embed 64, embed 64, hidden 128, 4
+  # heads of dim 16, 2 kv heads, no per-layer input, no shared layers, a single GLOBAL attention layer,
+  # flash attention on). Returns (model, config, model module).
   config = gemma4_model.ModelConfig.gemma4_e2b()
   config.num_layers = 1
   config.num_embed = 64
@@ -157,6 +195,9 @@ def _tiny_gemma4_model():
 
 
 def _make_model_cache(model, config, batch_size: int, cache_size: int):
+  # [FUNCTION DOC]
+  # HELPER: creates the KV cache for a model: Gemma4 uses its own init_cache(batch, cache_size, dtype);
+  # other models use the generic zero cache built from the config's layers, kv heads, head dim and dtype.
   if isinstance(model, gemma4_model.Gemma4):
     return model.init_cache(batch_size, cache_size, config.dtype)
 
@@ -171,6 +212,8 @@ def _make_model_cache(model, config, batch_size: int, cache_size: int):
 
 
 class FlashAttentionCacheTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Regression test for flash-attention cache handling across model families.
 
   @parameterized.named_parameters(
       dict(testcase_name='qwen2', model_builder=_tiny_qwen2_model),
@@ -178,6 +221,12 @@ class FlashAttentionCacheTest(parameterized.TestCase):
       dict(testcase_name='gemma4', model_builder=_tiny_gemma4_model),
   )
   def test_prefill_cache_layout_survives_decode(self, model_builder):
+    # [FUNCTION DOC]
+    # Verifies, for each tiny model, that a 4-token prefill (batch 2, cache 8) under patched flash attention
+    # returns a cache with unchanged k/v shapes, end_index equal to 4 and nonzero k/v in the first 4 slots,
+    # and that a subsequent 1-token decode (unpatched, with the prefill cache) returns logits with leading
+    # shape (2, 1), unchanged cache shapes and end_index equal to 5. Prefill tokens are 0..7 reshaped and
+    # taken modulo the vocabulary size (vocab_size or num_embed).
     model, config, model_module = model_builder()
     batch_size = 2
     prefill_len = 4

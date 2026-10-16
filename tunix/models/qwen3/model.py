@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Flax NNX implementation of the Qwen3 decoder-only transformer, both dense
+# and Mixture-of-Experts (e.g. Qwen3-30B-A3B). Structure matches the Qwen2
+# module (pre-norm decoder layers, GQA attention with RoPE, RMSNorm, gated
+# SiLU MLP, optional TPU splash attention, optional sequence parallelism)
+# with Qwen3 differences: no q/k/v biases, per-head RMSNorm on queries and
+# keys (q_norm/k_norm) before RoPE, and an optional sparse MoE feed-forward
+# with a top-k router, including an expert-parallel path using megablox
+# grouped matmul and ragged all-to-all communication.
+# Module-level definitions: K_MASK (attention-logit mask value), LayerCache
+# and Cache types (same as Qwen2), and helpers for MoE token routing. Side
+# effect at import: env_utils.setup_sharding_environment().
+# Shape letters: B batch, T query len, S key len, D embed, N query heads, K kv
+# heads, H head dim, F hidden dim, E experts, V vocab.
 """Qwen3 model."""
 
 import dataclasses
@@ -45,12 +59,24 @@ Cache = dict[str, LayerCache]
 
 
 def round_up_to_base(x: int, base: int, threshold: int | None = None) -> int:
+  # [FUNCTION DOC]
+  # HELPER: Rounds integer x up to the nearest multiple of base. If threshold is
+  # given and x is below it, returns threshold instead (without rounding). Returns
+  # an int (or traced int).
   if threshold is not None and x < threshold:
     return threshold
   return ((x + base - 1) // base) * base
 
 
 def get_global_input_output_offsets(global_send_sizes, num_ep):
+  # [FUNCTION DOC]
+  # HELPER: Computes buffer offsets for a ragged all-to-all among num_ep expert
+  # shards. Input global_send_sizes is a [num_ep, num_ep] int matrix where entry
+  # (i, j) is the number of rows shard i sends to shard j. Returns
+  # (input_offsets, output_offsets), both [num_ep, num_ep]: input_offsets[i, j]
+  # is the exclusive prefix sum over j of row i (start of the chunk for j in
+  # sender i's buffer); output_offsets[i, j] is the exclusive prefix sum over i
+  # of column j (where sender i's chunk lands in receiver j's buffer).
   """Calculates explicit buffer offsets for ragged_all_to_all."""
   global_input_offsets = jnp.concatenate(
       [jnp.zeros((num_ep, 1), dtype=jnp.int32), global_send_sizes[:, :-1]],
@@ -67,14 +93,27 @@ def get_global_input_output_offsets(global_send_sizes, num_ep):
 
 @jax.custom_vjp
 def _custom_permute(x, permute_indices):
+  # [FUNCTION DOC]
+  # HELPER: Gathers rows x[permute_indices]. Registered as a custom-VJP function
+  # whose backward pass scatters gradients back using the inverse permutation
+  # (argsort of indices) instead of a scatter-add, assuming permute_indices is a
+  # true permutation.
+  # KNOWN ISSUE: if permute_indices contains duplicates (not a permutation), the
+  # custom gradient is incorrect.
   return x[permute_indices]
 
 
 def _custom_permute_fwd(x, permute_indices):
+  # [FUNCTION DOC]
+  # HELPER: Forward rule for _custom_permute: returns the permuted rows and saves
+  # permute_indices as the residual.
   return _custom_permute(x, permute_indices), permute_indices
 
 
 def _custom_permute_bwd(res, g):
+  # [FUNCTION DOC]
+  # HELPER: Backward rule: un-permutes the cotangent g with argsort of the saved
+  # indices; returns (that gradient, None for the indices).
   permute_indices = res
   unpermute_indices = jnp.argsort(permute_indices)
   return g[unpermute_indices], None
@@ -84,6 +123,9 @@ _custom_permute.defvjp(_custom_permute_fwd, _custom_permute_bwd)
 
 
 class RematConfig(enum.Enum):
+  # [CLASS DOC]
+  # Enum of remat policies: NONE, BLOCK (remat attention and MLP blocks
+  # separately), DECODER (remat whole decoder layers).
   NONE = enum.auto()  # No remat, all activations will be stored in HBM.
   BLOCK = enum.auto()  # Remat the entire attn block.
   DECODER = enum.auto()  # Remat the entire decoder layer (attn + ffw).
@@ -91,6 +133,11 @@ class RematConfig(enum.Enum):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardingConfig:
+  # [CLASS DOC]
+  # Frozen dataclass of PartitionSpec tuples: the common weight/activation specs
+  # (emb_vd, emb_dv, q_weight_dnh, kv_weight_dnh, o_weight_nhd, ffw_weight_df,
+  # ffw_weight_fd, rms_norm_weight, act_btd, act_btf, act_btnh) and expert weight
+  # specs exp_weight_edf ([E,D,F]) and exp_weight_efd ([E,F,D]).
   """Sharding configuration for Qwen3 model."""
 
   emb_vd: Tuple[str | None, ...]
@@ -109,6 +156,12 @@ class ShardingConfig:
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False, enable_sp: bool = False):
+    # [FUNCTION DOC]
+    # Static factory for the default layout over mesh axes 'fsdp', 'tp' and
+    # optional 'sp'. is_sampling drops 'fsdp' from weight specs and the last-dim
+    # 'tp' sharding of act_btd; enable_sp (training only) makes the weight model-dim
+    # axis ('fsdp','sp') and shards activation sequence dims on 'sp'. Expert
+    # weights shard E on 'fsdp' and F on 'tp'. Returns a ShardingConfig.
     fsdp = 'fsdp' if not is_sampling else None
     sp = 'sp' if (not is_sampling and enable_sp) else None
     fsdp = (fsdp, sp) if fsdp and sp else fsdp
@@ -132,6 +185,14 @@ class ShardingConfig:
 
 @dataclasses.dataclass(slots=True)
 class ModelConfig:
+  # [CLASS DOC]
+  # Mutable slotted dataclass of Qwen3 hyperparameters: num_layers, vocab_size,
+  # embed_dim, hidden_dim (dense MLP hidden size, or per-expert hidden size for
+  # MoE), num_heads, head_dim, num_kv_heads, rope_theta, norm_eps,
+  # use_tied_embedding, num_experts and num_experts_per_tok (both None for dense
+  # models), shd_config, remat_config, dtype, param_dtype, use_flash_attention,
+  # flash_attention_block_size. Presets are classmethods named by config id; the
+  # '_base' names are class attributes aliasing the same classmethod.
   """Configuration for the Qwen3 model."""
 
   num_layers: int
@@ -155,6 +216,9 @@ class ModelConfig:
 
   @classmethod
   def qwen3_0p6b(cls):  # qwen3-0.6B
+    # [FUNCTION DOC]
+    # Preset Qwen3-0.6B: 28 layers, vocab 151936, embed 1024, MLP 3072, 16 heads of
+    # dim 128, 8 KV heads, eps 1e-6, rope theta 1e6, tied embeddings.
     return cls(
         num_layers=28,
         vocab_size=151936,
@@ -172,6 +236,9 @@ class ModelConfig:
 
   @classmethod
   def qwen3_1p7b(cls):  # qwen3-1.7B
+    # [FUNCTION DOC]
+    # Preset Qwen3-1.7B: 28 layers, embed 2048, MLP 6144, 16 heads x 128, 8 KV
+    # heads, vocab 151936, eps 1e-6, rope theta 1e6, tied.
     return cls(
         num_layers=28,
         vocab_size=151936,
@@ -189,6 +256,9 @@ class ModelConfig:
 
   @classmethod
   def qwen3_4b(cls):  # qwen3-4B
+    # [FUNCTION DOC]
+    # Preset Qwen3-4B: 36 layers, embed 2560, MLP 9728, 32 heads x 128, 8 KV
+    # heads, vocab 151936, eps 1e-6, rope theta 1e6, tied.
     return cls(
         num_layers=36,
         vocab_size=151936,
@@ -206,6 +276,9 @@ class ModelConfig:
 
   @classmethod
   def _qwen3_4b_2507(cls):  # Qwen3-4B-Instruct-2507 and Qwen3-4B-Thinking-2507
+    # [FUNCTION DOC]
+    # HELPER: Shared preset for Qwen3-4B 2507 releases: as qwen3_4b but rope theta
+    # 5e6.
     return cls(
         num_layers=36,
         vocab_size=151936,
@@ -221,14 +294,21 @@ class ModelConfig:
 
   @classmethod
   def qwen3_4b_instruct_2507(cls):  # Qwen3-4B-Instruct-2507
+    # [FUNCTION DOC]
+    # Preset alias for Qwen3-4B-Instruct-2507 (returns _qwen3_4b_2507()).
     return cls._qwen3_4b_2507()
 
   @classmethod
   def qwen3_4b_thinking_2507(cls):  # Qwen3-4B-Thinking-2507
+    # [FUNCTION DOC]
+    # Preset alias for Qwen3-4B-Thinking-2507 (returns _qwen3_4b_2507()).
     return cls._qwen3_4b_2507()
 
   @classmethod
   def qwen3_8b(cls):  # qwen3-8B
+    # [FUNCTION DOC]
+    # Preset Qwen3-8B: 36 layers, embed 4096, MLP 12288, 32 heads x 128, 8 KV
+    # heads, vocab 151936, eps 1e-6, rope theta 1e6, untied head.
     return cls(
         num_layers=36,
         vocab_size=151936,
@@ -245,6 +325,9 @@ class ModelConfig:
 
   @classmethod
   def qwen3_14b(cls):  # qwen3-14B
+    # [FUNCTION DOC]
+    # Preset Qwen3-14B: 40 layers, embed 5120, MLP 17408, 40 heads x 128, 8 KV
+    # heads, vocab 151936, eps 1e-6, rope theta 1e6, untied.
     return cls(
         num_layers=40,
         vocab_size=151936,
@@ -261,6 +344,10 @@ class ModelConfig:
 
   @classmethod
   def qwen3_30b_a3b(cls):  # qwen3-30B-a3b
+    # [FUNCTION DOC]
+    # Preset Qwen3-30B-A3B (MoE): 48 layers, embed 2048, per-expert hidden 768, 32
+    # heads x 128, 4 KV heads, vocab 151936, eps 1e-6, rope theta 1e6, 128 experts
+    # with 8 active per token, untied.
     return cls(
         num_layers=48,
         vocab_size=151936,
@@ -277,6 +364,9 @@ class ModelConfig:
 
   @classmethod
   def qwen3_32b(cls):  # qwen3-32B
+    # [FUNCTION DOC]
+    # Preset Qwen3-32B: 64 layers, embed 5120, MLP 25600, 64 heads x 128, 8 KV
+    # heads, vocab 151936, eps 1e-6, rope theta 1e6, untied.
     return cls(
         num_layers=64,
         vocab_size=151936,
@@ -291,6 +381,9 @@ class ModelConfig:
 
 
 def shard(x: jnp.ndarray, s: Tuple[str, ...]):
+  # [FUNCTION DOC]
+  # HELPER: Constrains x to PartitionSpec s on the current physical mesh;
+  # returns x unchanged if there is no mesh or devices are CPU.
   mesh = pxla.thread_resources.env.physical_mesh
   if mesh.empty or jax.devices()[0].platform == 'cpu':
     return x
@@ -300,6 +393,8 @@ def shard(x: jnp.ndarray, s: Tuple[str, ...]):
 
 
 class Einsum(nnx.Module):
+  # [CLASS DOC]
+  # Parameterized einsum with weight w, computing in the configured dtype.
   """Einsum is a convenience module for parameterized tensor multiplication."""
 
   def __init__(
@@ -312,6 +407,9 @@ class Einsum(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Stores einsum_str, shape and dtype and creates w with Glorot-uniform init in
+    # param_dtype (one RNG key) and the given sharding.
     self.einsum_str = einsum_str
     self.shape = shape
     self.dtype = dtype
@@ -324,12 +422,16 @@ class Einsum(nnx.Module):
 
   @jax.named_scope('einsum')
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x and w to dtype and returns their einsum.
     x = jnp.astype(x, self.dtype)
     w = jnp.astype(self.w.value, self.dtype)
     return jnp.einsum(self.einsum_str, x, w)
 
 
 class Embedder(nnx.Module):
+  # [CLASS DOC]
+  # Token embedding table [V, D] with encode (lookup) and decode (tied logits).
   """Embedder module."""
 
   def __init__(
@@ -342,6 +444,9 @@ class Embedder(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Creates input_embedding with normal init in param_dtype (one RNG key) and
+    # emb_vd sharding; stores shd_config and dtype.
     self.input_embedding = nnx.Param(
         nnx.initializers.normal(dtype=param_dtype)(
             rngs.params(), (vocab_size, embed_dim)
@@ -353,6 +458,8 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_encode')
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Looks up token ids [B,T], casts to dtype, shards as act_btd; returns [B,T,D].
     x = self.input_embedding[(x,)]
     x = jnp.astype(x, self.dtype)
     x = shard(x, self.shd_config.act_btd)
@@ -360,6 +467,8 @@ class Embedder(nnx.Module):
 
   @jax.named_scope('embedder_decode')
   def decode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x and table to dtype and returns x times the transposed table [..., V].
     x = jnp.astype(x, self.dtype)
     w = jnp.astype(self.input_embedding.value, self.dtype)
     return jnp.dot(x, w.T)
@@ -371,6 +480,16 @@ def apply_rope(
     head_dim: int,
     rope_theta: int = 1_000_000,
 ) -> jaxtyping.Array:
+  # [FUNCTION DOC]
+  # Rotate-half rotary embedding. Inputs: inputs [B,L,N,H] (the inline comment
+  # saying [B, L] is wrong), positions [B,L], head_dim, rope_theta. Inverse
+  # timescales theta^(2i/head_dim) for i < head_dim/2; angles = positions /
+  # timescale broadcast to [B,L,1,H/2]; sin/cos are cast to the input dtype;
+  # returns concat(x1*cos - x2*sin, x2*cos + x1*sin) in the input dtype.
+  # KNOWN ISSUE: Attention.block does not pass config.rope_theta, so the default
+  # 1,000,000 is always used; presets with a different theta (e.g. the 2507 4B
+  # models with 5,000,000) get wrong rotary frequencies. Computing angles in the
+  # input precision after casting sin/cos can lose accuracy in bf16.
   """Applies RoPE."""
   fraction = 2 * jnp.arange(0, head_dim // 2, dtype=jnp.float32) / head_dim
   timescale = rope_theta**fraction
@@ -390,6 +509,9 @@ def apply_rope(
 
 
 class RMSNorm(nnx.Module):
+  # [CLASS DOC]
+  # RMSNorm with learned scale w computed in float32, output cast to dtype. Also
+  # used per head (dim = head_dim) for q_norm/k_norm.
   """RMSNorm layer."""
 
   def __init__(
@@ -402,6 +524,11 @@ class RMSNorm(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Creates w = ones(dim) in param_dtype with rms_norm_weight sharding; stores
+    # norm_eps and dtype.
+    # KNOWN ISSUE: when used as q_norm/k_norm of size head_dim, the rms_norm_weight
+    # spec shards it on 'tp', which typically does not divide/align with head_dim.
     self.w = nnx.Param(
         nnx.initializers.ones_init()(rngs.params(), dim, param_dtype),
         sharding=shd_config.rms_norm_weight,
@@ -411,6 +538,9 @@ class RMSNorm(nnx.Module):
 
   @jax.named_scope('rms_norm')
   def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x to float32, divides by sqrt(mean(x^2, last axis) + eps), multiplies by
+    # w (float32) and casts to dtype.
     x = jnp.astype(x, jnp.float32)
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.norm_eps)
     return jnp.astype(
@@ -419,6 +549,11 @@ class RMSNorm(nnx.Module):
 
 
 class Attention(nnx.Module):
+  # [CLASS DOC]
+  # Grouped-query self-attention with per-head q/k RMSNorm, RoPE, optional KV
+  # cache, optional segment ids and optional TPU splash attention. Parameters:
+  # q_proj [D,N,H], k_proj/v_proj [D,K,H], o_proj [N,H,D], q_norm and k_norm
+  # (RMSNorm over H). No biases.
   """Attention module."""
 
   def __init__(
@@ -427,6 +562,9 @@ class Attention(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates projections and q/k norms from config (dtypes, shardings, eps);
+    # stores config, shd_config, n_rep (unused), scale = head_dim^-0.5.
     self.config = config
     self.shd_config = config.shd_config
     self.q_proj = Einsum(
@@ -488,6 +626,26 @@ class Attention(nnx.Module):
       attn_mask: jaxtyping.Array | None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Core attention. Inputs: x [B,T,D], segment_pos [B,T] positions, cache (dict
+    # 'k','v' [B,S,K,H], 'end_index' [B]) or None, attn_mask boolean [B,T,S] or
+    # None, segment_ids [B,T] or None.
+    # Steps: q = q_norm(q_proj(x)), k = k_norm(k_proj(x)), v = v_proj(x); shard
+    # with act_btnh; apply RoPE to q and k; with a cache, write k/v at offset
+    # end_index[0] mod cache length and use the full cache buffers.
+    # Flash path (use_flash_attention and T > 1): transpose to [B,heads,T,H],
+    # pre-scale q, causal multi-head splash mask (T,T), block sizes from config,
+    # head/sequence shards from the mesh axes in act_btnh, run the splash kernel
+    # vmapped over batch inside shard_map; if segment_ids are given they are passed
+    # as both q and kv splash SegmentIds (this is how padding is masked in this
+    # path); transpose back.
+    # Default path: GQA einsum logits times scale, mask with K_MASK where attn_mask
+    # is False, float32 softmax, weighted values, reshape to [B,T,N,H].
+    # Then o_proj and act_btd sharding. Returns (new_cache with updated 'k','v',
+    # end_index + T, or None; output [B,T,D]).
+    # KNOWN ISSUE: the flash path ignores attn_mask and assumes key length equals
+    # T (wrong with a cache when T > 1); the default path ignores segment_ids, so
+    # packed sequences are only separated if the caller encodes it in attn_mask.
     seq_len = x.shape[1]
 
     query_proj = self.q_norm(self.q_proj(x))
@@ -664,6 +822,9 @@ class Attention(nnx.Module):
       attn_mask: jaxtyping.Array | None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat (unbound function, self first) when
+    # remat_config is BLOCK.
     if (
         self.config.remat_config == RematConfig.BLOCK
         or self.config.remat_config == RematConfig.BLOCK.value
@@ -678,18 +839,31 @@ class Attention(nnx.Module):
 
   @property
   def head_dim(self):
+    # [FUNCTION DOC]
+    # Returns head dim from o_proj's shape (index 1).
     return self.o_proj.shape[1]
 
   @property
   def num_heads(self):
+    # [FUNCTION DOC]
+    # Returns number of query heads from q_proj's shape.
+    # KNOWN ISSUE: index 0 is embed_dim D for shape [D,N,H]; should be index 1.
     return self.q_proj.shape[0]
 
   @property
   def num_kv_heads(self):
+    # [FUNCTION DOC]
+    # Returns number of KV heads from k_proj's shape (index 1).
     return self.k_proj.shape[1]
 
 
 class MoELayer(nnx.Module):
+  # [CLASS DOC]
+  # Sparse Mixture-of-Experts feed-forward layer with a linear top-k router and
+  # E SiLU-gated experts stored as stacked weights: gate_proj and up_proj [E,D,F]
+  # (exp_weight_edf sharding), down_proj [E,F,D] (exp_weight_efd). Has a dense
+  # reference path (CPU / no mesh / use_megablox False) and a distributed path
+  # using megablox grouped matmuls with optional expert parallelism.
   """Sharded Megablox MoE layer."""
 
   def __init__(
@@ -698,6 +872,10 @@ class MoELayer(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Stores shd_config, experts_per_tok (k), num_experts and dtype; creates the
+    # router nnx.Linear D -> E without bias, and the three expert weight tensors
+    # with normal init in param_dtype. Consumes RNG keys.
     self.shd_config = config.shd_config
     self.experts_per_tok = config.num_experts_per_tok
     self.num_experts = config.num_experts
@@ -733,6 +911,37 @@ class MoELayer(nnx.Module):
     self.dtype = config.dtype
 
   def __call__(self, x, use_megablox=True):
+    # [FUNCTION DOC]
+    # Applies the MoE to x [B,T,D]; returns [B,T,D].
+    # Routing: router logits in float32, softmax over experts, top-k probabilities
+    # and indices, probabilities renormalized to sum to 1 and cast to dtype.
+    # Dense path (use_megablox False, empty mesh, or CPU): one-hot dispatch mask
+    # [B,T,E,k]; every expert processes every token's input (masked to zero for
+    # unselected tokens), computing down(silu(x gate_e) * (x up_e)); outputs
+    # stacked [B,T,E,D] and combined with the per-expert routing weights.
+    # Megablox path, inside shard_map over the mesh (activations act_btd, routing
+    # [B,T,k] with act_btd's leading specs, expert weights per their specs):
+    # all-gathers inputs over the tensor-parallel axis (act_btd's last axis) to
+    # full D; expert-parallel axis is exp_weight_edf[0] with num_ep shards and
+    # E/num_ep local experts. Each token is repeated k times, rows sorted by
+    # selected expert (custom permutation with permutation-aware gradient), and
+    # per-expert group sizes counted. With num_ep > 1: all-gather group sizes,
+    # derive a send-size matrix, compute ragged all-to-all offsets, send rows to
+    # the shard owning their expert into a buffer of size min(k, local experts) *
+    # B*T*num_ep, then re-sort received rows by local expert id. Runs grouped
+    # matmuls (megablox.gmm) for gate, up and down with tilings rounded to (8,128)
+    # multiples, applies silu gating; with num_ep > 1 un-sorts and sends results
+    # back with the reverse ragged all-to-all. Finally un-permutes to token order,
+    # reshapes to [B,T,D,k], weights by routing probabilities and sums over k, and
+    # reduce-scatters over the tensor-parallel axis back to the sharded D.
+    # Raises: shape/sharding errors from shard_map/megablox (e.g. E not divisible
+    # by num_ep).
+    # KNOWN ISSUE: no input mask is applied (padding tokens are routed too, per the
+    # TODO); the dense path is O(E) compute; the received-buffer padding rows in the
+    # EP path are sorted together with real rows by local expert index (padding
+    # rows get index 0 via total_repeat_length) which relies on group sizes to
+    # ignore them; the reverse all-to-all reads global_send_sizes/local_*_sizes
+    # defined only in the num_ep > 1 branch (guarded, but flagged by lint).
     scores = self.router(x).astype(jnp.float32)  # [B,T,E]
     routing_weights, routing_idx = jax.lax.top_k(
         jax.nn.softmax(scores, axis=-1), self.experts_per_tok
@@ -807,6 +1016,12 @@ class MoELayer(nnx.Module):
         check_rep=False,
     )
     def sharded_megablox_moe(inputs, weights, indices, gate_w, up_w, down_w):
+      # [FUNCTION DOC]
+      # HELPER: Per-shard body of the megablox MoE path described in the enclosing
+      # __call__ doc. Inputs are local blocks of activations, routing weights,
+      # routing indices and expert weights; returns the local output block with
+      # act_btd sharding. Uses collectives (all_gather, psum, ragged_all_to_all,
+      # psum_scatter) over the tp and expert axes.
       tp_axis = self.shd_config.act_btd[-1]
 
       if tp_axis is not None and tp_axis in mesh.axis_names:
@@ -981,6 +1196,8 @@ class MoELayer(nnx.Module):
 
 
 class MLP(nnx.Module):
+  # [CLASS DOC]
+  # Dense gated SiLU feed-forward network (used when num_experts is None).
   """MLP module."""
 
   def __init__(
@@ -989,6 +1206,9 @@ class MLP(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates gate_proj, up_proj (D -> F, ffw_weight_df) and down_proj (F -> D,
+    # ffw_weight_fd), bias-free with zero-initialized kernels, config dtypes.
     self.config = config
     self.shd_config = config.shd_config
     self.gate_proj = nnx.Linear(
@@ -1031,6 +1251,8 @@ class MLP(nnx.Module):
       self,
       x: jaxtyping.Array,
   ) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Returns down(shard(silu(gate(x)) * up(x), act_btf)).
     activations = nnx.silu(self.gate_proj(x)) * self.up_proj(x)
     activations = shard(activations, self.shd_config.act_btf)
     outputs = self.down_proj(activations)
@@ -1038,6 +1260,8 @@ class MLP(nnx.Module):
 
   @jax.named_scope('feed_forward')
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat when remat_config is BLOCK.
     if (
         self.config.remat_config == RematConfig.BLOCK
         or self.config.remat_config == RematConfig.BLOCK.value
@@ -1048,6 +1272,9 @@ class MLP(nnx.Module):
 
 
 class DecoderLayer(nnx.Module):
+  # [CLASS DOC]
+  # Pre-norm decoder layer: residual attention then residual feed-forward (MLP
+  # or MoELayer), each preceded by RMSNorm.
   """DecoderLayer."""
 
   def __init__(
@@ -1056,6 +1283,9 @@ class DecoderLayer(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates input_layernorm, attn, post_attention_layernorm and mlp, where mlp
+    # is a dense MLP if config.num_experts is None, else a MoELayer.
     self.config = config
     self.input_layernorm = RMSNorm(
         config.embed_dim,
@@ -1096,6 +1326,9 @@ class DecoderLayer(nnx.Module):
       attn_mask: jaxtyping.Array,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Computes h = x + attn(input_layernorm(x)) and out = h +
+    # mlp(post_attention_layernorm(h)). Returns (updated cache or None, out).
     inputs_normalized = self.input_layernorm(x)
     cache, attn_output = self.attn(
         inputs_normalized,
@@ -1119,6 +1352,8 @@ class DecoderLayer(nnx.Module):
       attn_mask: jaxtyping.Array,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    # [FUNCTION DOC]
+    # Runs block, under nnx.remat when remat_config is DECODER.
     if (
         self.config.remat_config == RematConfig.DECODER
         or self.config.remat_config == RematConfig.DECODER.value
@@ -1133,6 +1368,11 @@ class DecoderLayer(nnx.Module):
 
 
 class Qwen3(BackendMappingMixin, nnx.Module):
+  # [CLASS DOC]
+  # Top-level Qwen3 causal LM (dense or MoE). BackendMappingMixin uses
+  # BACKEND_PACKAGE_PATH to find the package's BACKEND_MAPPINGS for rollout
+  # weight sync. Submodules: embedder, layers, final_norm, lm_head (when not
+  # tied).
   """Qwen3 model."""
 
   BACKEND_PACKAGE_PATH = __name__
@@ -1143,6 +1383,9 @@ class Qwen3(BackendMappingMixin, nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Builds embedder, num_layers DecoderLayers, final RMSNorm and, unless
+    # use_tied_embedding, an lm_head Einsum [D,V] with emb_dv sharding.
     self.config = config
     self.embedder = Embedder(
         vocab_size=config.vocab_size,
@@ -1176,6 +1419,11 @@ class Qwen3(BackendMappingMixin, nnx.Module):
   def init_cache(
       self, batch_size: int, cache_size: int, dtype: jnp.dtype
   ) -> Cache:
+    # [FUNCTION DOC]
+    # Returns a fresh KV cache: for each layer 'layer_<i>' a dict with zero 'k'
+    # and 'v' of shape [batch_size, cache_size, num_kv_heads, head_dim] and int32
+    # zero 'end_index' of shape [batch_size].
+    # KNOWN ISSUE: the dtype argument is ignored; config.dtype is used instead.
     """Initializes the cache for the model."""
     config = self.config
     shape = (batch_size, cache_size, config.num_kv_heads, config.head_dim)
@@ -1198,6 +1446,14 @@ class Qwen3(BackendMappingMixin, nnx.Module):
       output_hidden_states: bool = False,
       segment_ids: jaxtyping.Array | None = None,  # [B, L]
   ) -> tuple[jaxtyping.Array, Cache | None]:
+    # [FUNCTION DOC]
+    # Forward pass. Inputs: input_tokens [B,L], positions [B,L], cache or None,
+    # attention_mask [B,L,L'], output_hidden_states (sows final-normed hidden
+    # states as nnx.Intermediate 'all_hidden_states'), segment_ids [B,L] or None
+    # (used by flash attention). Embeds, runs each layer with its 'layer_<i>' cache
+    # (when cache is truthy), collects new caches when a cache was given, applies
+    # final norm, computes logits via tied embedding or lm_head, and returns
+    # (float32 logits [B,L,V], new cache or None).
     """Qwen3 model.
 
     Args:
@@ -1245,6 +1501,9 @@ class Qwen3(BackendMappingMixin, nnx.Module):
     return jnp.astype(logits, jnp.float32), new_cache  # pytype: disable=bad-return-type
 
   def get_model_input(self):
+    # [FUNCTION DOC]
+    # Returns dummy forward kwargs: tokens and positions of ones [2,1] int32,
+    # cache None, attention_mask ones [2,1,1] bool (batch 2 for FSDP on 2 devices).
     """Returns a dummy model input for the transformer.
 
     This dummy input has a batch size compatible with FSDP sharding on a

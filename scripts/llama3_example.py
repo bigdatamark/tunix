@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Standalone script (no functions) that downloads Llama-3.2-1B-Instruct from Hugging Face into
+# <system tempdir>/models/<repo id>, builds a 1 x N_devices JAX mesh with axes ("fsdp","tp") (Auto axis
+# types), constructs the tunix Llama3 model from safetensors with the llama3p2_1b config, displays it,
+# loads the HF tokenizer (pad_token_id forced to 0), chat-templatizes three prompts, and runs the tunix
+# Sampler (KV cache size 256 with layer/head dims from config) for 128 generation steps with echo and
+# no top-p, printing each output text followed by a line of 30 asterisks.
+# Inputs: none (network access to HF required). Outputs: printed text. Side effects: network download,
+# disk writes to tempdir, device memory use. Raises: any download/model-loading errors propagate.
+# KNOWN ISSUE: the name sampler is rebound from the module to the Sampler instance; harmless here but
+# the module can no longer be referenced afterwards.
 """Example of using tunix to load and run Llama3 models."""
 
 import os

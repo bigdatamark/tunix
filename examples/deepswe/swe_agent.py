@@ -1,4 +1,12 @@
 """DeepSWE Agent."""
+# [MODULE DOC]
+# DeepSWE conversation agent. Contains its own copies of the prompt templates also found in
+# system_prompts.py (SWE_SYSTEM_PROMPT_FN_CALL, SWE_SYSTEM_PROMPT, SWEAGENT_SYSTEM_PROMPT and the three
+# user prompt templates with a {problem_statement} placeholder), response parsers for OpenAI-style
+# tool-call responses and XML function-call text, and SWEAgent. Importing requires r2egym: on
+# ImportError it logs an error and re-raises. TOKEN_WARNING_THRESHOLD (28000) is the token count at
+# which the agent tells the model to submit.
+# KNOWN ISSUE: prompt constants are duplicated from system_prompts.py and may drift.
 
 import json
 import re
@@ -334,6 +342,11 @@ TOKEN_WARNING_THRESHOLD = 28000
 
 
 def parse_oai_response(response: Any):
+  # [FUNCTION DOC]
+  # Parses an OpenAI chat-completions response object: thought is choices[0].message.content (empty
+  # string if falsy); the action is an r2egym Action built from the first tool call's function name and
+  # JSON-decoded arguments. Any exception (no tool calls, bad JSON) yields an Action with empty name and
+  # parameters. Output: (thought, action).
   thought = response.choices[0].message.content
   if not thought:
     thought = ""
@@ -349,6 +362,11 @@ def parse_oai_response(response: Any):
 
 
 def parse_xml_response(response_text: str) -> tuple[str, Any]:
+  # [FUNCTION DOC]
+  # Finds the first non-greedy dotall match of a function=... through closing function tag block in the
+  # text. If found, action text is that block and thought is everything before it; else thought is the
+  # whole text and action is empty. Both are stripped; the action text is converted with
+  # Action.from_string (r2egym). Output: (thought, Action). Text after the block is discarded.
   """Extracts:
 
   - thought: everything before the first <function=...> block
@@ -380,6 +398,10 @@ def parse_xml_response(response_text: str) -> tuple[str, Any]:
 
 
 class SWEAgent(ConversationAgentBase):
+  # [CLASS DOC]
+  # ConversationAgentBase subclass for SWE tasks. Attributes: use_fn_calling, format_model_response,
+  # user_prompt_template (applied to the first observation), plus base-class messages, trajectory,
+  # cur_step and step counter.
 
   def __init__(
       self,
@@ -388,6 +410,12 @@ class SWEAgent(ConversationAgentBase):
       format_model_response: bool = False,
       scaffold: str = "r2egym",
   ):
+    # [FUNCTION DOC]
+    # Asserts scaffold is "r2egym" or "sweagent" (AssertionError otherwise). Selects the system prompt:
+    # SWEAGENT_SYSTEM_PROMPT for sweagent, else the function-calling or XML r2egym prompt by
+    # use_fn_calling; the user template likewise (SWEAGENT_USER_PROMPT, SWE_USER_PROMPT_FN_CALL or
+    # SWE_USER_PROMPT). Stores flags and calls the base constructor with the system prompt.
+    # KNOWN ISSUE: the system_prompt argument is ignored.
     self.use_fn_calling = use_fn_calling
     self.format_model_response = format_model_response
     assert scaffold in [
@@ -415,6 +443,13 @@ class SWEAgent(ConversationAgentBase):
       info: Optional[dict[str, Any]] = None,
       **kwargs,
   ) -> None:
+    # [FUNCTION DOC]
+    # Converts observation to a string; on the first step (empty trajectory) formats it into
+    # user_prompt_template as problem_statement. If info has a truthy max_steps, appends
+    # "Steps Remaining: N" where N = max_steps - step - 1, or a submit-now notice when N is not positive.
+    # If info cur_tokens is at least TOKEN_WARNING_THRESHOLD, appends a running-out-of-tokens notice.
+    # Calls the base update_from_env (which appends the user message) and sets cur_step to a new Step
+    # with the final observation. Returns None.
     observation = str(observation)
     if info is None:
       info = {}
@@ -446,10 +481,21 @@ class SWEAgent(ConversationAgentBase):
   def _observation_to_messages(
       self, observation: Any, reward: float, done: bool, info: dict[str, Any]
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: appends {"role": "user", "content": str(observation)} to the message history.
 
     self._messages.append({"role": "user", "content": str(observation)})
 
   def update_from_model(self, response: str, **kwargs):
+    # [FUNCTION DOC]
+    # Handles a model response: appends cur_step to the trajectory, parses the response (OpenAI tool
+    # call parser if use_fn_calling, else XML parser), converts the action to its XML string, fills the
+    # step's thought, action and model_response, appends the assistant message (either
+    # "thought, blank line, action XML" when format_model_response, else the raw response), increments
+    # step and returns a tunix Action wrapping the XML string.
+    # KNOWN ISSUE: docstring says it is called after an environment step and returns None; it actually
+    # processes a model response and returns an Action. In fn-calling mode response is expected to be a
+    # response object, not a str as typed.
     """Updates the agent's internal state after an environment step.
 
     This function is called during environment interaction to incorporate the

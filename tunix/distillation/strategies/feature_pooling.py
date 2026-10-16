@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Feature pooling distillation strategy.
+# Defines FeaturePoolingStrategy: wraps every submodule of a given type in
+#   both models with SowedModule so their outputs are captured; per step,
+#   stacks captured outputs (one entry per captured layer) into one array,
+#   average-pools the teacher stack down to the student stack's shape, and
+#   combines feature loss (default mean cosine distance) with the student's
+#   softmax cross-entropy task loss. No side effects at import.
 """Implements Feature Pooling Distillation Strategy."""
 
 from typing import Callable
@@ -28,6 +36,15 @@ ModelForwardCallable = base_strategy.ModelForwardCallable
 
 
 class FeaturePoolingStrategy(base_strategy.BaseStrategy):
+  # [CLASS DOC]
+  # Feature pooling distillation. Attributes: alpha (weight of feature loss,
+  # in [0, 1]), feature_loss_fn ((student_features, teacher_features) ->
+  # scalar), feature_layer (nnx module class to capture).
+  # Requirements: student forward fn returns logits; labels_fn returns labels
+  # compatible with optax.softmax_cross_entropy; all captured layer outputs
+  # within one model must have identical shapes (they are stacked), and each
+  # teacher stack dimension must be >= the student's (for pooling).
+  # Losses return a bare scalar (no metrics dict).
   """Implements Feature Pooling distillation.
 
   This strategy captures the feature maps and computes loss (typically cosine
@@ -48,6 +65,15 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       ) = None,
       cosine_distance_axis: int | tuple[int, ...] = -1,
   ):
+    # [FUNCTION DOC]
+    # Inputs: student/teacher forward fns, labels_fn (see BaseStrategy),
+    #   feature_layer (module class), alpha (default 0.75), feature_loss_fn
+    #   (optional), cosine_distance_axis (int or tuple; default -1).
+    # Behavior: init BaseStrategy (jits fns); validate alpha; store alpha;
+    #   if feature_loss_fn is None use mean over all elements of
+    #   optax.cosine_distance(student, teacher, axis=cosine_distance_axis);
+    #   store feature_layer.
+    # Exceptions: ValueError if alpha not in [0.0, 1.0]. No side effects.
     """Initializes the FeaturePooling strategy.
 
     Args:
@@ -85,6 +111,12 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       teacher_model: nnx.Module,
   ) -> tuple[nnx.Module, nnx.Module]:
+    # [FUNCTION DOC]
+    # Inputs: student and teacher models. Wraps (in place) every submodule
+    #   of type feature_layer in each model with SowedModule via
+    #   wrap_model_with_sowed_modules, then returns (student, teacher) (same
+    #   objects). Exceptions: from the wrap helper (e.g. ValueError if a root
+    #   model itself is of feature_layer type). Side effect: mutates models.
     """Pre-processes the models for distillation."""
     feature_extraction.wrap_model_with_sowed_modules(
         student_model, [self.feature_layer]
@@ -100,6 +132,11 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       teacher_model: nnx.Module,
   ) -> tuple[nnx.Module, nnx.Module]:
+    # [FUNCTION DOC]
+    # Inputs: student and teacher models. Removes SowedModule wrappers in
+    #   place via unwrap_sowed_modules for both and returns (student,
+    #   teacher). Exceptions: from the unwrap helper. Side effect: mutates
+    #   models.
     """Post-processes the models after distillation."""
     feature_extraction.unwrap_sowed_modules(student_model)
     feature_extraction.unwrap_sowed_modules(teacher_model)
@@ -111,6 +148,15 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       teacher_model: nnx.Module,
       inputs: dict[str, jax.Array],
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Inputs: teacher_model, inputs dict. Runs the jitted teacher forward fn
+    #   (output discarded), pops all nnx.Intermediate state from the teacher
+    #   (the sown layer outputs), and returns jnp.stack of the state's leaves
+    #   (new leading axis = captured layer, ordered by pytree flattening).
+    # Exceptions: stack fails if leaves differ in shape or none were sown.
+    # Side effect: clears the teacher's intermediates.
+    # KNOWN ISSUE: unlike BaseStrategy.get_teacher_outputs, no stop_gradient
+    #   is applied (teacher is not differentiated anyway, so harmless).
     """Computes the teacher model outputs."""
     _ = self._teacher_forward_fn(teacher_model, **inputs)
     teacher_features = feature_extraction.pop_sowed_intermediate_outputs(
@@ -124,6 +170,12 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       student_model: nnx.Module,
       inputs: dict[str, jax.Array],
   ) -> dict[str, jax.Array]:
+    # [FUNCTION DOC]
+    # Inputs: student_model, inputs dict. Runs the jitted student forward fn
+    #   to get logits, pops the student's sown intermediates, stacks their
+    #   leaves into one array, and returns {"logits": logits, "features":
+    #   stacked features}. Exceptions: stacking errors as above.
+    # Side effect: clears the student's intermediates.
     """Computes the student model outputs."""
     student_logits = self._student_forward_fn(student_model, **inputs)
     student_features = feature_extraction.pop_sowed_intermediate_outputs(
@@ -137,6 +189,10 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       student_output: dict[str, jax.Array],
       labels: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Eval loss. Inputs: student_output dict (needs "logits"), labels.
+    #   Returns mean softmax cross-entropy of student logits vs labels (bare
+    #   scalar). Exceptions: KeyError if "logits" missing. No side effects.
     """Computes the task loss.
 
     Args:
@@ -160,6 +216,16 @@ class FeaturePoolingStrategy(base_strategy.BaseStrategy):
       teacher_output: jax.Array,
       labels: jax.Array,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Training loss. Inputs: student_output dict with "logits" and
+    #   "features", teacher_output (stacked teacher features), labels.
+    # Steps: raise TypeError if either key is missing; pool teacher features
+    #   to the student features' shape with avg_pool_array_to_target_shape
+    #   (VALID padding); feature_loss = feature_loss_fn(student, pooled
+    #   teacher); task_loss = mean softmax CE(student logits, labels);
+    #   return alpha*feature_loss + (1-alpha)*task_loss as a bare scalar.
+    # Exceptions: TypeError (missing keys), ValueError/RuntimeError from
+    #   pooling if shapes are incompatible. No side effects.
     """Computes the combined feature pooling and task loss.
 
     Args:

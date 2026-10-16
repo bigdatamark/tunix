@@ -12,14 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.metrics.PerfMetricsOptions: default values
+# (perf v1 on, v2 off, empty export paths, trace writer on, empty trace_dir)
+# and construction-time validation raising ValueError when an export path is
+# set for a disabled perf version or the trace writer is enabled while both
+# perf versions are disabled.
 from absl.testing import absltest
 from absl.testing import parameterized
 from tunix.perf import metrics
 
 
 class MetricsTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for PerfMetricsOptions.
 
   def test_perf_metrics_options_defaults(self):
+    # [FUNCTION DOC]
+    # Verifies the default field values listed in the module doc.
     options = metrics.PerfMetricsOptions()
     self.assertTrue(options.enable_perf_v1)
     self.assertFalse(options.enable_perf_v2)
@@ -69,6 +79,10 @@ class MetricsTest(parameterized.TestCase):
       custom_export_fn_path_v2,
       expected_regex,
   ):
+    # [FUNCTION DOC]
+    # Verifies ValueError with the expected message for each inconsistent
+    # combination (trace writer left at its default True).
+    # Inputs: enable flags, export paths and expected_regex.
     with self.assertRaisesRegex(ValueError, expected_regex):
       metrics.PerfMetricsOptions(
           enable_perf_v1=enable_perf_v1,
@@ -78,6 +92,8 @@ class MetricsTest(parameterized.TestCase):
       )
 
   def test_perf_metrics_options_validation_success(self):
+    # [FUNCTION DOC]
+    # Verifies a fully consistent configuration constructs without raising.
     # Should not raise exception
     metrics.PerfMetricsOptions(
         enable_perf_v1=True,

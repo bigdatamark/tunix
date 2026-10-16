@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for tunix.models.safetensors_loader.load_and_create_model using a toy transformer
+# (test_common.ToyTransformer with 4 layers, 4 kv heads, head dim 16). The test saves the toy model's
+# weights as a safetensors file and checks that loading reproduces identical state, for absolute,
+# relative and "./"-relative paths, for the optimized and original loader modes, and for a gs:// path
+# (with the GCS download mocked). Side effects: writes temp files and changes the working directory
+# (restored via cleanup).
 """Tests for safetensors_loader."""
 
 import os
@@ -17,6 +24,11 @@ from tunix.utils import env_utils
 
 
 def key_mapping(config):
+  # [FUNCTION DOC]
+  # HELPER: key mapping function passed to the loader. Ignores its config argument and returns a dict
+  # from regex patterns on checkpoint tensor names to a pair of (target model parameter path template
+  # with backreferences, transform None). Covers the embedding, per-layer attention query/key/value/out
+  # kernels, MLP w1/w2 kernels and biases, and lm_head kernel/bias; all names map to themselves.
   del config
   return {
       r'^emb\.embedding$': ('emb.embedding', None),
@@ -46,9 +58,15 @@ def key_mapping(config):
 
 
 class SafetensorsLoaderTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests safetensors loading round-trips for the toy transformer.
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: class fixture. Builds the toy model with seed 0, captures its nnx state, and builds a
+    # dict of name to numpy array for every parameter covered by the key mapping. The w2 bias of each
+    # layer is stored wrapped in an nnx.Param to exercise handling of Param-wrapped values.
     super().setUpClass()
     config = test_common.ModelConfig(num_layers=4, num_kv_heads=4, head_dim=16)
     cls.model = test_common.ToyTransformer(config=config, rngs=nnx.Rngs(0))
@@ -99,6 +117,16 @@ class SafetensorsLoaderTest(parameterized.TestCase):
   def test_load_and_create_model(
       self, path_type='abs', mode='auto'
   ):
+    # [FUNCTION DOC]
+    # Verifies load_and_create_model reproduces the original state. Inputs: path_type ("abs", "rel" or
+    # "rel_dot"; default "abs") and mode ("auto", "optimized" or "original"; default "auto"). The
+    # "optimized" case is only generated outside the internal environment. Creates a temp dir (falling back
+    # to a tempfile directory), optionally chdirs to its parent to use a relative path, writes the tensors
+    # to model.safetensors, loads with float32 dtype and asserts every leaf of the loaded state equals the
+    # original. Raises ValueError for an unknown path_type.
+    # KNOWN ISSUE: the fallback uses the name of an unreferenced TemporaryDirectory object, which may be
+    # deleted when the object is garbage-collected; the directory is then recreated with makedirs and
+    # never cleaned up.
     try:
       st_dir_abs = self.create_tempdir().full_path
     except Exception:  # pylint: disable=broad-except
@@ -137,6 +165,10 @@ class SafetensorsLoaderTest(parameterized.TestCase):
     )
 
   def test_load_and_create_model_from_gcs(self):
+    # [FUNCTION DOC]
+    # Verifies loading from a "gs://bucket/model" path calls load_file_from_gcs exactly once with that
+    # path (mocked to return a local dir containing the saved tensors) and reproduces the original state.
+    # Skipped in the internal environment.
     if env_utils.is_internal_env():
       self.skipTest('GCS is not supported in GOOGLE_INTERNAL_PACKAGE_PATH')
     try:

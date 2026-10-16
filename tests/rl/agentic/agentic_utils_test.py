@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.agentic.utils message helpers:
+# get_recent_assistant_user_messages (returns the last assistant message, or
+# None, plus the list of messages after it), convert_messages_to_string
+# (normalizes content: single-element NumPy string arrays to str, None to
+# empty string, raises ValueError for non-string results), and
+# tokenize_and_generate_masks (parses each message individually through a
+# chat parser, optionally preprocessing the list first, strips a leading
+# assistant token, encodes text without special tokens when the tokenizer
+# accepts that argument, and returns flat token and mask lists where
+# assistant tokens get mask 1 and all others 0). Uses mock tokenizers and
+# parsers that render text deterministically. No side effects.
+
 """Tests for agentic utility functions."""
 
 import unittest
@@ -24,6 +37,8 @@ from tunix.rl.agentic import utils
 
 
 class RecentMessagesTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for get_recent_assistant_user_messages.
 
   @parameterized.named_parameters(
       (
@@ -91,24 +106,39 @@ class RecentMessagesTest(parameterized.TestCase):
       ),
   )
   def test_get_recent_assistant_user_messages(self, messages, expected_output):
+    # [FUNCTION DOC]
+    # Verifies the (last assistant message or None, following messages)
+    # pair for empty, no-assistant, assistant-only, multi-turn and
+    # trailing-environment-message cases; with no assistant all messages
+    # are returned as the trailing list.
     self.assertEqual(
         utils.get_recent_assistant_user_messages(messages), expected_output
     )
 
 
 class ConvertMessagesToStringTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for convert_messages_to_string content normalization.
 
   def test_convert_messages_to_string_with_numpy_array_string(self):
+    # [FUNCTION DOC]
+    # Verifies a one-element NumPy string array content becomes that string.
     message = {'role': 'user', 'content': np.array(['hello'])}
     expected_output = {'role': 'user', 'content': 'hello'}
     self.assertEqual(utils.convert_messages_to_string(message), expected_output)
 
   def test_convert_messages_to_string_with_none_content(self):
+    # [FUNCTION DOC]
+    # Verifies None content becomes an empty string.
     message = {'role': 'system', 'content': None}
     expected_output = {'role': 'system', 'content': ''}
     self.assertEqual(utils.convert_messages_to_string(message), expected_output)
 
   def test_convert_messages_to_string_with_numpy_array_int_fails(self):
+    # [FUNCTION DOC]
+    # Verifies a one-element integer array unwraps to int and raises
+    # ValueError "Message field content must be a string after
+    # preprocessing, got <class 'int'>.".
     message = {'role': 'user', 'content': np.array([1])}
     with self.assertRaisesRegex(
         ValueError,
@@ -119,8 +149,16 @@ class ConvertMessagesToStringTest(parameterized.TestCase):
 
 
 class MessagesToTokensTest(unittest.TestCase):
+  # [CLASS DOC]
+  # Tests for tokenize_and_generate_masks with mocked tokenizer and parser.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: builds a mock tokenizer (encode maps each character to its
+    # code point; dedup_bos_ids is identity) and a mock parser (empty
+    # assistant token; parse renders "role:<r> content:<c>", prefixed
+    # "first:" when is_first_msg and suffixed ":gen" when
+    # add_generation_prompt).
     super().setUp()
     self.mock_tokenizer = mock.Mock(spec=['encode', 'dedup_bos_ids'])
     self.mock_parser = mock.Mock(spec=['parse', 'assistant_token'])
@@ -134,6 +172,8 @@ class MessagesToTokensTest(unittest.TestCase):
 
     # Simple parser mock: returns a formatted string
     def parse_side_effect(messages, add_generation_prompt, is_first_msg):
+      # [FUNCTION DOC]
+      # HELPER: renders the first message as described in setUp.
       msg = messages[0]
       text = f'role:{msg["role"]} content:{msg["content"]}'
       if is_first_msg:
@@ -145,6 +185,8 @@ class MessagesToTokensTest(unittest.TestCase):
     self.mock_parser.parse.side_effect = parse_side_effect
 
   def test_empty_messages(self):
+    # [FUNCTION DOC]
+    # Verifies no messages yields empty token and mask lists.
     tokens, masks = utils.tokenize_and_generate_masks(
         messages=[],
         tokenizer=self.mock_tokenizer,
@@ -154,6 +196,9 @@ class MessagesToTokensTest(unittest.TestCase):
     self.assertEqual(masks, [])
 
   def test_single_user_message(self):
+    # [FUNCTION DOC]
+    # Verifies a user message is encoded with mask 0 everywhere and parsed
+    # once with add_generation_prompt False and is_first_msg False.
     messages = [{'role': 'user', 'content': 'hi'}]
     expected_text = 'role:user content:hi'
     expected_tokens = [ord(c) for c in expected_text]

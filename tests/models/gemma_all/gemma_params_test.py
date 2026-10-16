@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for Gemma 2/3 parameter handling: gemma3 params.map_from_upstream_checkpoint (converting an upstream
+# semi-flat Gemma checkpoint, optionally with SigLIP vision encoder weights, to the Tunix parameter tree)
+# and Gemma3 LoRA merged-model saving/loading via the shared lora_params_test_base.LoraParamsTestBase.
+# Side effects: writes temporary safetensors/config files in the base class's directories. When run
+# directly in Colab only Gemma3LoraParamsTest runs via unittest's runner; otherwise absltest.main.
+# KNOWN ISSUE: the internal header comment below describes Llama3 safetensors loading tests, which does
+# not match this module's contents.
 
 # BEGIN-GOOGLE-INTERNAL
 # Tests for Llama3 model parameter loading from safetensors files.
@@ -46,6 +54,8 @@ from tunix.models.gemma3 import params_safetensors as gemma3_params_safetensors
 from tunix.tests import test_common
 
 class GemmaParamsTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests mapping of upstream Gemma checkpoints into the Tunix layout.
 
   @parameterized.named_parameters(
       dict(
@@ -65,6 +75,19 @@ class GemmaParamsTest(parameterized.TestCase):
       ),
   )
   def test_map_from_upstream_checkpoint(self, model_type, text_only):
+    # [FUNCTION DOC]
+    # Verifies map_from_upstream_checkpoint(upstream, model_type, text_only) for gemma3 text-only, gemma2
+    # text-only and gemma3 with vision. Builds a one-layer tiny checkpoint (vocab 5, embed 3, 4 heads of dim 2,
+    # 1 kv head, ffw 6) and, for vision, mm_input_projection, mm_soft_embedding_norm and a one-block SigLIP
+    # encoder (width 7, 2 heads of dim 4, MLP 11). Checks: all expected keys exist with expected shapes
+    # (layer_N becomes layers/N; gemma2 renames post_attention_norm to post_attn_norm; gating_einsum is split
+    # into transposed gate_proj/up_proj; linear becomes down_proj); values pass through unchanged for
+    # attention einsums, norms, embedder and final norm; SigLIP keys are renamed (LayerNorm_0/1 to ln1/ln2,
+    # MlpBlock Dense_0/1 to mlp fc1/fc2, attention key/query/value kernels reshaped from (7,2,4) to (7,8) and
+    # biases flattened to (8,), out kernel reshaped from (2,4,7) to (8,7)); and in text-only mode no
+    # vision_encoder key is present.
+    # KNOWN ISSUE: key/shape checks use bare assert statements, which are skipped when Python runs with
+    # optimizations enabled.
     # Tiny shapes to demonstrate logic only
     embed = np.arange(5*3, dtype=np.float32).reshape(5, 3)  # (vocab=5, dim=3)
     final_scale = np.arange(3, dtype=np.float32)  # (3,)
@@ -362,9 +385,16 @@ class GemmaParamsTest(parameterized.TestCase):
 
 
 class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
+  # [CLASS DOC]
+  # Gemma3 specialization of the shared LoRA params test base; supplies config, model class, LoRA target
+  # regex, HF projection key names, save/load functions, forward-pass helpers, a checkpoint writer that
+  # decomposes kv_einsum, and an extra kv decomposition test.
   """Tests for Gemma3 LoRA merged model saving and loading."""
 
   def create_config(self):
+    # [FUNCTION DOC]
+    # HELPER: returns a tiny Gemma3 ModelConfig (2 layers, 256 embeddings, embed 64, hidden 128, 4 heads of dim
+    # 16, 1 kv head, sliding window 128).
     """Create Gemma3 model config for testing."""
     return gemma3_model.ModelConfig(
         num_layers=2,
@@ -378,14 +408,22 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def get_model_class(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the Gemma3 model class.
     """Get Gemma3 model class."""
     return gemma3_model.Gemma3
 
   def get_lora_module_path(self) -> str:
+    # [FUNCTION DOC]
+    # HELPER: returns a regex alternation of q_einsum, kv_einsum, attn_vec_einsum, gate_proj, up_proj and
+    # down_proj as LoRA targets.
     """Get LoRA target modules for Gemma3."""
     return '.*q_einsum|.*kv_einsum|.*attn_vec_einsum|.*gate_proj|.*up_proj|.*down_proj'
 
   def get_projection_keys(self, layer_idx: int) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: returns the seven HF projection weight names (q/k/v/o self-attention, gate/up/down MLP) for the
+    # given layer index.
     """Get projection keys for Gemma3."""
     prefix = f'model.layers.{layer_idx}'
     return [
@@ -399,6 +437,9 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     ]
 
   def save_merged_model(self, lora_model):
+    # [FUNCTION DOC]
+    # HELPER: calls gemma3 params save_lora_merged_model_as_safetensors with the base checkpoint dir, merged
+    # output dir, LoRA model, rank and alpha. Side effect: writes files.
     """Save Gemma3 LoRA merged model."""
     gemma3_params.save_lora_merged_model_as_safetensors(
         local_model_path=self.base_checkpoint_dir,
@@ -409,6 +450,9 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def create_model_from_checkpoint(self, checkpoint_dir: str):
+    # [FUNCTION DOC]
+    # HELPER: loads a Gemma3 model via params_safetensors.create_model_from_safe_tensors with self.config, no
+    # mesh and float32.
     """Load Gemma3 model from checkpoint."""
     return gemma3_params_safetensors.create_model_from_safe_tensors(
         file_dir=checkpoint_dir,
@@ -418,6 +462,9 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def _create_test_inputs(self):
+    # [FUNCTION DOC]
+    # HELPER: returns (all-ones int32 tokens of shape (2, 10), positions 0..9 per row, lower-triangular causal
+    # mask of shape (2, 10, 10)).
     """Create test inputs for Gemma3 forward pass."""
     batch_size = 2
     seq_len = 10
@@ -430,6 +477,9 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     return input_tokens, positions, attention_mask
 
   def _run_forward_pass(self, model, input_tokens, positions, attention_mask):
+    # [FUNCTION DOC]
+    # HELPER: calls the Gemma3 model with keyword last_tokens, positions, no cache and attention_mask and
+    # returns its output.
     """Run forward pass through Gemma3 model."""
     # Gemma3 uses `last_tokens` parameter name
     return model(
@@ -440,6 +490,14 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     )
 
   def create_checkpoint(self, model) -> str:
+    # [FUNCTION DOC]
+    # HELPER: writes the model as an HF-format Gemma3 safetensors checkpoint and returns the directory. Saves
+    # embedder and final norm unchanged; per layer saves the four layer norms (as input, post-attention,
+    # pre-feedforward, post-feedforward layernorms) and q/k norms unchanged; q_einsum (heads, embed, head_dim)
+    # is permuted to (heads, head_dim, embed) and flattened to (heads*head_dim, embed); kv_einsum is split
+    # into k and v, each transformed the same way; attn_vec_einsum (heads, head_dim, embed) is flattened to
+    # (heads*head_dim, embed) and transposed; MLP kernels are transposed. Projections are written only if
+    # present. Also writes config.json with model_type "gemma3".
     """Extract model weights and save in safetensors format.
 
     Uses the model's actual weights and applies inverse transformations
@@ -570,6 +628,10 @@ class Gemma3LoraParamsTest(lora_params_test_base.LoraParamsTestBase):
     return self.base_checkpoint_dir
 
   def test_kv_einsum_decomposition(self):
+    # [FUNCTION DOC]
+    # Verifies that after creating a checkpoint, applying LoRA and saving the merged model, the merged
+    # safetensors contain separate k_proj and v_proj weights for every layer with shape
+    # (num_kv_heads*head_dim, embed_dim).
     """Test that kv_einsum is properly decomposed into k_proj and v_proj."""
     # Create base model and checkpoint
     base_model = self._create_base_model()
