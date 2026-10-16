@@ -175,6 +175,12 @@ class MetricsBuffer:
 
 
 def _calculate_global_batch_size(train_example: Any) -> int:
+  # [FUNCTION DOC]
+  # HELPER: Input: train_example (dataclass, dict, or object with __dict__).
+  #   Collects its fields (dataclasses.asdict / the dict / vars()), and
+  #   returns shape[0] of the first value that is a jax or numpy array.
+  # Exceptions: TypeError if no array field exists (vars() raises TypeError
+  #   for objects without __dict__). Not used within this module.
   """Calculates the global batch size from a training example.
 
   Args:
@@ -187,12 +193,6 @@ def _calculate_global_batch_size(train_example: Any) -> int:
   Raises:
     TypeError: If the batch size cannot be determined from the training example.
   """
-  # [FUNCTION DOC]
-  # HELPER: Input: train_example (dataclass, dict, or object with __dict__).
-  #   Collects its fields (dataclasses.asdict / the dict / vars()), and
-  #   returns shape[0] of the first value that is a jax or numpy array.
-  # Exceptions: TypeError if no array field exists (vars() raises TypeError
-  #   for objects without __dict__). Not used within this module.
   if dataclasses.is_dataclass(train_example):
     attributes = dataclasses.asdict(train_example)
   elif isinstance(train_example, dict):
@@ -212,7 +212,6 @@ def _calculate_global_batch_size(train_example: Any) -> int:
 
 
 class PeftTrainer:
-  """PEFT trainer for LoRA. Only LoRA parameters are updated.
   # [CLASS DOC]
   # Generic trainer. Class attribute supports_sequence_packing = False.
   # Key state: model, config, optimizer (nnx.Optimizer, wrt LoRAParam or
@@ -227,6 +226,7 @@ class PeftTrainer:
   # _post_process_eval_step and custom_checkpoint_metadata.
   # KNOWN ISSUE: docstring says only LoRA params are updated; without LoRA
   #   params all nnx.Param are trained.
+  """PEFT trainer for LoRA. Only LoRA parameters are updated.
 
   Attributes:
     model: The model to train.
@@ -492,6 +492,12 @@ class PeftTrainer:
     return self._eval_step
 
   def _shard_optimizer(self, mesh: shd.Mesh) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Input: mesh. No-op if the mesh is empty. Otherwise reads the
+    #   optimizer OptState, gets its partition specs from nnx metadata,
+    #   applies jax.lax.with_sharding_constraint with those specs and writes
+    #   the result back so the jitted step is not compiled twice.
+    # Side effects: mutates optimizer state placement.
     """Optimizer states should be sharded before calling the jit function.
 
     If not, the _train_step will be compiled 2 times.
@@ -499,12 +505,6 @@ class PeftTrainer:
     Args:
       mesh: The mesh used for sharding.
     """
-    # [FUNCTION DOC]
-    # HELPER: Input: mesh. No-op if the mesh is empty. Otherwise reads the
-    #   optimizer OptState, gets its partition specs from nnx metadata,
-    #   applies jax.lax.with_sharding_constraint with those specs and writes
-    #   the result back so the jitted step is not compiled twice.
-    # Side effects: mutates optimizer state placement.
     if mesh.empty:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
@@ -518,6 +518,16 @@ class PeftTrainer:
   def jit_train_and_eval_step(
       self, skip_jit: bool = False, cache_nnx_graph: bool = False
   ):
+    # [FUNCTION DOC]
+    # Inputs: skip_jit, cache_nnx_graph. If skip_jit, return the raw
+    #   (train_step, eval_step) fns (which expect model/optimizer args).
+    #   Otherwise, if not cached: shard optimizer on the active mesh; jit the
+    #   train step (donating the optimizer argument) and eval step with
+    #   nnx.jit; bind model and optimizer (train) / model (eval) as leading
+    #   arguments via functools.partial, using nnx.cached_partial first when
+    #   cache_nnx_graph. Cache and return (train_fn(batch), eval_fn(batch)).
+    # KNOWN ISSUE: with skip_jit the returned fns are not bound to
+    #   model/optimizer, yet train() calls them with only the batch.
     """Creates and returns the train and eval step functions.
 
     This function will return the cached ones if available.
@@ -529,16 +539,6 @@ class PeftTrainer:
     Returns:
       A tuple of train and eval step functions.
     """
-    # [FUNCTION DOC]
-    # Inputs: skip_jit, cache_nnx_graph. If skip_jit, return the raw
-    #   (train_step, eval_step) fns (which expect model/optimizer args).
-    #   Otherwise, if not cached: shard optimizer on the active mesh; jit the
-    #   train step (donating the optimizer argument) and eval step with
-    #   nnx.jit; bind model and optimizer (train) / model (eval) as leading
-    #   arguments via functools.partial, using nnx.cached_partial first when
-    #   cache_nnx_graph. Cache and return (train_fn(batch), eval_fn(batch)).
-    # KNOWN ISSUE: with skip_jit the returned fns are not bound to
-    #   model/optimizer, yet train() calls them with only the batch.
     train_step = self.create_train_step_fn()
     eval_step = self.create_eval_step_fn()
     if skip_jit:
@@ -984,31 +984,26 @@ class PeftTrainer:
 
   @property
   def train_steps(self) -> int:
-    """Returns the number of train steps taken."""
     # [FUNCTION DOC]
     # Property: number of optimizer updates performed (_train_steps).
+    """Returns the number of train steps taken."""
     return self._train_steps
 
   @property
   def iter_steps(self) -> int:
-    """Returns the number of iterator steps taken."""
     # [FUNCTION DOC]
     # Property: number of micro steps (batches) processed (_iter_steps).
+    """Returns the number of iterator steps taken."""
     return self._iter_steps
 
   def custom_checkpoint_metadata(self) -> dict[str, Any]:
-    """Override this function to return the custom metadata for the checkpoint manager."""
     # [FUNCTION DOC]
     # Override hook returning a dict saved as checkpoint custom metadata and
     # used for perf tags ("global_step", "role"). Default: empty dict.
+    """Override this function to return the custom metadata for the checkpoint manager."""
     return {}
 
   def close(self):
-    """Closes the trainer and its associated resources.
-
-    This includes writing any buffered metrics, saving the last checkpoint,
-    and closing the checkpoint manager and metrics logger.
-    """
     # [FUNCTION DOC]
     # Finalizes: writes pending delayed train metrics, saves a last
     #   checkpoint if needed, closes checkpoint manager (waits for async
@@ -1016,6 +1011,11 @@ class PeftTrainer:
     #   listeners), and closes the progress bar.
     # KNOWN ISSUE: metrics of a partially accumulated final step move to
     #   the "previous" buffer and are never written.
+    """Closes the trainer and its associated resources.
+
+    This includes writing any buffered metrics, saving the last checkpoint,
+    and closing the checkpoint manager and metrics logger.
+    """
     self._write_train_metrics()
     self._save_last_checkpoint()
     self.checkpoint_manager.close()

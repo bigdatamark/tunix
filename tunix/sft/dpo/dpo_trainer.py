@@ -196,7 +196,6 @@ def compute_logps(
 
 
 class DPOTrainer(peft_trainer.PeftTrainer):
-  """Direct Preference Optimization (DPO) and ORPO trainer.
   # [CLASS DOC]
   # Preference trainer supporting DPO and ORPO selected by
   # training_config.algorithm. State beyond PeftTrainer: ref_model (frozen
@@ -207,6 +206,7 @@ class DPOTrainer(peft_trainer.PeftTrainer):
   # log_probs/rejected, plus odds_ratio for ORPO). Loss is dpo_loss_fn with
   # aux output; the model-input fn passes the TrainExample and algorithm
   # hyperparameters as keyword arguments to the loss.
+  """Direct Preference Optimization (DPO) and ORPO trainer.
 
   DPO is a preference tuning method for aligning large language models with
   human or AI preferences. It is a more efficient, performant alternative
@@ -673,13 +673,13 @@ def _tokenize(input_string: str, tokenizer: Any) -> jax.Array:
 def _preprocess_dict(
     training_input: dict[str, Any],
 ) -> DataInput | TrainingInput:
-  """Wraps input dict with either DataInput or TrainingInput."""
   # [FUNCTION DOC]
   # HELPER: Input: training_input dict. If it contains every TrainingInput
   #   field except images, returns TrainingInput built from those fields
   #   (missing images -> None). Else if it contains every DataInput field
   #   except images, returns DataInput similarly. Otherwise raises
   #   ValueError listing both field sets and the received keys.
+  """Wraps input dict with either DataInput or TrainingInput."""
 
   data_input_fields = [field.name for field in dataclasses.fields(DataInput)]
   tokenized_input_fields = [

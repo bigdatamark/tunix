@@ -13,11 +13,11 @@ from tunix.sft import metrics_logger as ml
 
 
 def _is_in_ipython() -> bool:
-  """Returns True if running in an IPython environment."""
   # [FUNCTION DOC]
   # HELPER: returns True iff the IPython module is already imported, has
   #   get_ipython, and get_ipython() returns non-None (i.e. running inside
   #   an IPython kernel/shell). Does not import IPython. No exceptions.
+  """Returns True if running in an IPython environment."""
   ipython = sys.modules.get("IPython")
   if ipython is not None and hasattr(ipython, "get_ipython"):
     return ipython.get_ipython() is not None

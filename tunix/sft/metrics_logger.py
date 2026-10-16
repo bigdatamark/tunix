@@ -141,15 +141,14 @@ class Mode(str, enum.Enum):
 
 
 def _calculate_geometric_mean(x: np.ndarray) -> np.ndarray:
-  """Calculates geometric mean of a batch of values."""
   # [FUNCTION DOC]
   # HELPER: returns exp(mean(log(x))) over all elements of x (geometric
   #   mean). Non-positive values give nan/-inf per numpy semantics.
+  """Calculates geometric mean of a batch of values."""
   return np.exp(np.mean(np.log(x)))
 
 
 class MetricsLogger:
-  """Simple Metrics logger.
   # [CLASS DOC]
   # Metrics logger. State: _metrics nested dict prefix -> mode ->
   # defaultdict(list) of metric name -> list of logged values; _backends.
@@ -157,6 +156,7 @@ class MetricsLogger:
   # except "perplexity" which uses the geometric mean.
   # KNOWN ISSUE: docstring says it logs to default backends when none are
   #   specified, but with no options no backends are created at all.
+  """Simple Metrics logger.
 
   Log metrics to multiple backends. If no backends are specified, it will log to
   the default backends.

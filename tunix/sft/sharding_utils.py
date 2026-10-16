@@ -94,7 +94,6 @@ def shard_input(
 
 
 def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
-  """Get a sharding for an tensor given a mesh and partition spec."""
   # [FUNCTION DOC]
   # HELPER: chooses a NamedSharding for one leaf. Inputs: x, mesh, pspec.
   # Returns fully replicated sharding if x is not a numpy/jax array, is a
@@ -107,6 +106,7 @@ def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
   #   against the product of the axis sizes, so a dimension divisible by
   #   each but not by their product is still sharded and may fail later.
   # Only shard arrays with rank > 0.
+  """Get a sharding for an tensor given a mesh and partition spec."""
   if not isinstance(x, (np.ndarray, jax.Array)) or x.ndim == 0:
     return shd.NamedSharding(mesh, shd.PartitionSpec())  # Replicated
 
