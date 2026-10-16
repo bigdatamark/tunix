@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# AutoModel entry point for tunix: resolves a model identifier (via
+# tunix.models.naming) to the right model package under 'tunix.models'
+# (_BASE_MODULE_PATH), obtains the ModelConfig preset, downloads/locates the
+# checkpoint from a source (Hugging Face, Kaggle, GCS, internal, MaxText) and
+# builds the NNX model, with special paths for Gemma (Kaggle NNX conversion,
+# internal params, Orbax checkpoints for Gemma3/4) and MaxText; the common path
+# loads safetensors through the package's params module.
 """AutoModel class for Tunix."""
 
 import dataclasses
@@ -32,6 +40,10 @@ _BASE_MODULE_PATH = 'tunix.models'  # pylint: disable=invalid-name
 
 
 class ModelModule(enum.Enum):
+  # [CLASS DOC]
+  # Enum naming which submodule of a model package to import: MODEL ('model',
+  # defines ModelConfig and the network), PARAMS ('params', checkpoint loaders),
+  # PARAMS_SAFETENSORS ('params_safetensors', Gemma safetensors loaders).
   """Specifies the type of model module to import."""
 
   MODEL = 'model'
@@ -40,6 +52,9 @@ class ModelModule(enum.Enum):
 
 
 class ModelSource(enum.Enum):
+  # [CLASS DOC]
+  # Enum of checkpoint sources: KAGGLE, GCS, HUGGINGFACE, INTERNAL, MAXTEXT
+  # (values are lowercase strings).
   """Specifies the source of the model."""
 
   KAGGLE = 'kaggle'  # Download model from Kaggle requires NNX conversion.
@@ -50,6 +65,11 @@ class ModelSource(enum.Enum):
 
 
 def get_model_module(model_name: str, module_type: ModelModule) -> Any:
+  # [FUNCTION DOC]
+  # Imports and returns 'tunix.models.<config_category>.<module_type.value>',
+  # where the category is derived from model_name via naming.ModelNaming.
+  # Raises ValueError from naming for unknown names, and ImportError (chained)
+  # if the module cannot be imported. Side effect: logs and imports a module.
   """Dynamically imports a model module (e.g., 'model' or 'params')."""
   model_config_category = naming.ModelNaming(
       model_name=model_name
@@ -70,6 +90,15 @@ def get_model_module(model_name: str, module_type: ModelModule) -> Any:
 
 
 def call_model_config(model_name: str) -> Any:
+  # [FUNCTION DOC]
+  # Returns the ModelConfig preset for model_name: derives the config id via
+  # naming.ModelNaming, imports the package's model module, looks up a
+  # classmethod with that name on its ModelConfig and calls it with no args.
+  # Raises ValueError (naming), ImportError, AttributeError if no such
+  # attribute, TypeError if it is not callable. Logs the call.
+  # KNOWN ISSUE: the docstring mentions a CONFIG_MAP and converting hyphens and
+  # dots to underscores; the code instead relies on naming's config id
+  # (dots become 'p').
   """Dynamically calls a configuration function based on the model_name.
 
   The routing to the correct module/class instance is based on the longest
@@ -122,6 +151,14 @@ def _get_gemma_base_model(
     rng_seed: int,
     mesh: jax.sharding.Mesh,
 ) -> tuple[nnx.Module, Any]:
+  # [FUNCTION DOC]
+  # HELPER: Restores a Gemma model from an NNX Orbax checkpoint at
+  # <intermediate_ckpt_dir>/state. Builds the config, shape-evaluates the
+  # package's Gemma class with nnx.Rngs(rng_seed), converts the abstract state
+  # to ShapeDtypeStructs in bfloat16 with named shardings from mesh, restores
+  # with a StandardCheckpointer and merges into the graph definition.
+  # Returns (model, config). Raises Orbax/IO errors when the checkpoint is
+  # missing or incompatible. Note: all params are restored as bfloat16.
   """Get the base model from the intermediate checkpoint."""
   model_params = call_model_config(model_name)
   model_lib_module = get_model_module(model_name, ModelModule.MODEL)
@@ -153,6 +190,17 @@ def create_gemma_model_with_nnx_conversion(
     mesh: jax.sharding.Mesh,
     model_path: str | None = None,
 ) -> tuple[nnx.Module, Any]:
+  # [FUNCTION DOC]
+  # Returns (model, config) for a Gemma 1/1.1/2 model from a Kaggle checkpoint,
+  # using a cached NNX conversion when possible. If intermediate_ckpt_dir exists,
+  # tries to restore from it (_get_gemma_base_model); on any exception logs a
+  # warning, deletes the directory and falls back. The fallback (nested
+  # _nnx_convert_and_reload) loads the raw params, saves the NNX state to
+  # <intermediate_ckpt_dir>/state, frees memory and restores from it.
+  # Side effects: filesystem writes/deletes, heavy memory use, logging.
+  # KNOWN ISSUE: kwargs default intermediate_ckpt_dir to None and the caller
+  # comment says conversion then happens without saving, but os.path.exists(None)
+  # raises TypeError and the save path join would also fail.
   """Creates a Gemma model with NNX conversion, using a cached checkpoint if available.
 
   Args:
@@ -172,6 +220,14 @@ def create_gemma_model_with_nnx_conversion(
   """
 
   def _nnx_convert_and_reload() -> tuple[nnx.Module, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Determines the checkpoint subdirectory name (basename of model_path
+    # if given; otherwise inferred from the naming info: 'gemma-2-<ver>' for
+    # gemma2, 'gemma-1.1-<ver>' for gemma1p1, '<ver>' for gemma, where ver has '_'
+    # replaced by '-' and a warning is logged), loads the model from
+    # <ckpt_path>/<dir>, saves its NNX state with Orbax to the intermediate dir
+    # (force overwrite), waits, deletes the in-memory model and garbage-collects,
+    # then reloads via _get_gemma_base_model. Returns (model, config).
     """Converts the model to an NNX checkpoint and reloads it.
 
     This is a workaround, as the checkpoints on Kaggle don't work with NNX. This
@@ -239,6 +295,12 @@ def create_gemma_model_with_nnx_conversion(
 def create_gemma_model_from_params(
     params_path: str, model_name: str
 ) -> tuple[nnx.Module, Any]:
+  # [FUNCTION DOC]
+  # Loads raw Gemma params from params_path via the package's
+  # params.load_and_format_params and builds the model with
+  # model.Gemma.from_params, passing a version string: the naming version,
+  # prefixed with '1.1-' for gemma1p1 or '2-' for gemma2.
+  # Returns (model, raw params). Raises import/loading errors.
   """Loads Gemma params and creates a model."""
   params_lib = get_model_module(model_name, ModelModule.PARAMS)
   model_params = params_lib.load_and_format_params(params_path)
@@ -260,6 +322,13 @@ def create_gemma_model_from_params(
 def create_gemma3_model_from_checkpoint(
     ckpt_path: str, model_name: str, mesh: jax.sharding.Mesh, **kwargs
 ) -> tuple[nnx.Module, Any]:
+  # [FUNCTION DOC]
+  # Builds a Gemma3 or Gemma4 model from an Orbax checkpoint: gets the config
+  # preset, overrides any config fields named in kwargs whose value is not None
+  # (dataclasses.replace), and calls the package's
+  # params.create_model_from_checkpoint(ckpt_path, config, mesh).
+  # Returns (model, config).
+  # KNOWN ISSUE: the docstring's example model names are Qwen/Llama, not Gemma.
   """Creates a Gemma3/Gemma4 model from a checkpoint.
 
   Args:
@@ -290,6 +359,12 @@ def download_model(
     model_download_path: str | None,
     model_source: ModelSource,
 ) -> str:
+  # [FUNCTION DOC]
+  # Resolves the checkpoint location for a source: KAGGLE runs
+  # tunix.oss.utils.kaggle_pipeline and HUGGINGFACE runs hf_pipeline (both
+  # download into model_download_path and return the local path); GCS and
+  # MAXTEXT return the input unchanged; INTERNAL raises ValueError (unsupported
+  # in OSS); anything else raises ValueError. Side effects: network/disk I/O.
   """Downloads a model to a new model path based on the specified source.
 
   Args:
@@ -334,6 +409,13 @@ def create_model_from_safe_tensors(
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ) -> Any:
+  # [FUNCTION DOC]
+  # Loads a model from safetensors in file_dir by delegating to the package's
+  # create_model_from_safe_tensors(file_dir=, config=, mesh=, dtype=, mode=).
+  # Gemma-family names (gemma, gemma1p1, gemma2, gemma3, gemma4) use the
+  # 'params_safetensors' module, others the 'params' module. Returns the model.
+  # Raises ValueError (naming), ImportError, AttributeError if the function is
+  # missing. Logs the call.
   """Dynamically imports the correct module and calls `create_model_from_safe_tensors` based on the model_name.
 
   Args:
@@ -382,6 +464,9 @@ def create_model_from_safe_tensors(
 
 
 class AutoModel:
+  # [CLASS DOC]
+  # Factory with a single classmethod from_pretrained, mirroring the Hugging
+  # Face AutoModel API. Holds no state.
   """Factory class for instantiating Tunix models from pretrained checkpoints.
 
   Similar to the Hugging Face AutoModel API.
@@ -398,6 +483,35 @@ class AutoModel:
       model_download_path: str | None = None,
       **kwargs,
   ) -> tuple[nnx.Module, str | None]:
+    # [FUNCTION DOC]
+    # Loads a pretrained model. Inputs: model_id (HF-style id; required even for
+    # path-based sources because naming is derived from it), mesh, model_source
+    # (default HUGGINGFACE), model_path (required for INTERNAL, GCS and KAGGLE,
+    # else ValueError), model_download_path, and kwargs (config overrides, Gemma
+    # Kaggle options intermediate_ckpt_dir and rng_seed, MaxText config keys).
+    # Flow: build ModelNaming from model_id; choose model_path or model_id and
+    # resolve it with download_model.
+    # MAXTEXT: import MaxText (OSS path, else internal), build argv ['', 'base.yml',
+    # 'model_name=<name>', plus 'load_parameters_path=<path>' when model_path was
+    # given], default skip_jax_distributed_system True and hf_access_token from the
+    # HF_TOKEN env var, append every non-None kwarg that is a MaxTextConfig field
+    # (bools lowercased), initialize the config and return MaxText's
+    # from_pretrained model wrapped with the tunix adapter, plus the path.
+    # gemma3: GCS/INTERNAL -> create_gemma3_model_from_checkpoint, else
+    # NotImplementedError. gemma4: GCS/INTERNAL -> same Orbax loader, else falls
+    # through to safetensors. gemma/gemma1p1/gemma2: KAGGLE -> NNX conversion
+    # (intermediate_ckpt_dir, rng_seed default 0), INTERNAL -> raw params, else
+    # NotImplementedError. Other families from KAGGLE or GCS -> NotImplementedError.
+    # Common path: get the config preset if none yet, apply kwargs overrides for
+    # matching dataclass fields, and inside the mesh context load safetensors
+    # from the resolved path.
+    # Returns (model, resolved_model_path). Side effects: downloads, env reads,
+    # logging, device allocation.
+    # KNOWN ISSUE: the common safetensors step runs unconditionally, so after a
+    # Gemma/Gemma3/Gemma4 model was already built by a special path, it is
+    # rebuilt (or fails) from safetensors at the same path, discarding the first
+    # model; dtype and mode cannot be passed through to the safetensors loader;
+    # the docstring's Returns section implies a single model value.
     """Loads a pretrained model from a given identifier.
 
     This method mimics the Hugging Face `from_pretrained` interface,
