@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Image preprocessing for vision-language models (VLMs). Defines a processor class that turns
+# single images, image paths, or (possibly ragged) batches of them into per-example lists of
+# float32 arrays of shape (height, width, channels), resized bilinearly, normalized with a
+# per-channel mean/std, clipped to [-1, 1], and zero-padded so every example has the same number
+# of images; plus a helper computing the maximum images per example. Depends on numpy and PIL.
+# No side effects at import.
+
 """Image processing for VLMs."""
 
 from typing import Any
@@ -20,6 +28,11 @@ from PIL import Image
 
 
 class ImageProcessor:
+  # [CLASS DOC]
+  # Image preprocessor configured from a config object. State: private copies of the config's
+  # image_height, image_width, image_channels, image_mean and image_std, plus the config itself as
+  # a public attribute. Calling the instance processes a batch; a method processes one image; a
+  # private method normalizes. Not thread-unsafe beyond the in-place normalization of arrays it creates.
   """Vision-language processor.
 
   This class takes in a batch of images (or image paths) and processes them for
@@ -31,6 +44,10 @@ class ImageProcessor:
   """
 
   def __init__(self, config: Any):
+    # [FUNCTION DOC]
+    # Constructor. Input: config object exposing image_height, image_width, image_channels,
+    # image_mean and image_std attributes (AttributeError if missing). Stores them in private fields
+    # and keeps config. Output: none. No other side effects.
     self._height = config.image_height
     self._width = config.image_width
     self._channels = config.image_channels
@@ -47,6 +64,16 @@ class ImageProcessor:
           | list[str | np.ndarray | list[str | np.ndarray] | None]
       ),
   ) -> list[list[np.ndarray]]:
+    # [FUNCTION DOC]
+    # Processes a batch of images. Input: a single string/array (treated as a batch of one example
+    # with one image), or a list whose elements are a string/array (one image), a list of
+    # strings/arrays (several images), or None (no images).
+    # Logic: non-list input is wrapped as a list containing a one-element list. Computes the maximum
+    # number of images per example with the module helper. For each example: None yields a list of
+    # max-count zero arrays (height, width, channels, float32); otherwise a single item is wrapped in
+    # a list, each image is preprocessed, and the list is padded with zero arrays up to the max count.
+    # Output: list (per example) of lists of float32 arrays. Exceptions: those from image loading or
+    # preprocessing (e.g. file not found). Side effects: reads image files from disk.
     """Pre-process images.
 
     Takes in a list (or list of lists of) images (or image paths), resizes
@@ -106,6 +133,17 @@ class ImageProcessor:
       self,
       image: np.ndarray | str | None,
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # Preprocesses one image. Input: None, a file path string, a numpy array (converted to a PIL
+    # image, so it must be a valid PIL array shape/dtype), or presumably an already-open PIL image.
+    # Logic: None returns a zero float32 array of (height, width, channels). Strings are opened with
+    # PIL; arrays converted with PIL fromarray. The image is resized to width x height (PIL takes
+    # width first) with bilinear resampling, converted to a float32 array, normalized by the private
+    # normalizer, and clipped to [-1, 1].
+    # Output: float32 array of shape (height, width, channels as in the image).
+    # Exceptions: PIL file/format errors. Side effects: file reads.
+    # KNOWN ISSUE: the channel count of the result follows the image mode (e.g. RGBA or grayscale
+    # images are not converted to the configured channel count), so shapes may mismatch the zero padding.
     """Pre-process image.
 
     Performs a bi-linear resize and normalizes the image.
@@ -142,6 +180,10 @@ class ImageProcessor:
       self,
       image: np.ndarray,
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: normalizes in place: subtracts the configured mean then divides by the configured std
+    # (both broadcast as arrays over the last axis). Input/output: the same float array (mutated and
+    # returned). Broadcast errors propagate if mean/std lengths mismatch the channel count.
     """Normalize the image: `(x - mu) / sigma`.
 
     Args:
@@ -156,6 +198,10 @@ class ImageProcessor:
 
 
 def _compute_max_num_images(lst):
+  # [FUNCTION DOC]
+  # HELPER: computes the maximum number of images per example. Input: list of examples where each
+  # is None (counts 0, skipped), a non-list item (counts 1) or a list (counts its length). Output:
+  # the maximum count, 0 for an empty list or all-None. No side effects.
   """Compute the maximum number of images in the batch."""
   max_num_images = 0
   for batch in lst:

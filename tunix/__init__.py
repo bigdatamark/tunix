@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [PACKAGE DOC]
+# Top-level Tunix package: the public API surface of the Tunix post-training library.
+# Behavior: on import, resolves the package version string from installed distribution
+# metadata for the distribution named "google-tunix"; if that distribution is not
+# installed (for example an editable/source checkout), the version falls back to "0.0.0.dev0".
+# It then re-exports the main user-facing classes from subpackages so users can access them
+# directly from the top-level package:
+# - Distillation: DistillationTrainer and its TrainingConfig (re-exported as DistillationTrainingConfig).
+# - Generation: CacheConfig, Sampler, TokenizerAdapter, Tokenizer.
+# - Performance metrics: PerfMetricsExport, PerfMetricsConfig, PerfSpanQuery.
+# - RL: agentic GRPO config/learner (re-exported as AgenticGRPOConfig / AgenticGRPOLearner),
+#   GRPOConfig/GrpoConfig, GRPOLearner/GrpoLearner, RewardFn, PPOConfig/PpoConfig,
+#   PPOLearner/PpoLearner, ClusterConfig, MetricsBuffer, RLCluster, RLTrainingConfig, Role,
+#   RolloutConfig (both capitalizations are aliases of the same objects).
+# - SFT: CheckpointManager, DPO/ORPO trainers and their training configs (both capitalizations),
+#   MetricsLogger, MetricsLoggerOptions, PeftTrainer, TrainingConfig.
+# Inputs: none. Outputs: module attribute holding the version string plus the re-exported names.
+# Exceptions: any ImportError from the subpackages propagates at import time (heavy deps such
+# as JAX/Flax are pulled in eagerly). Side effects: importing this package imports all of the
+# listed subpackages.
+
 """Tunix API."""
 
 from importlib.metadata import PackageNotFoundError

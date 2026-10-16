@@ -11,12 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
+
+# [MODULE DOC]
+# GSM8K reward scoring compatible with the verl framework's GSM8K scorer.
+# Provides answer extraction from a model output (strict mode looks for the "#### <number>"
+# convention; flexible mode takes the last number) and a scoring function comparing the
+# extracted answer string to the ground truth. Module constant: the number of trailing
+# characters (300) that extraction considers, to keep regex matching fast. No side effects.
+
 import re
 
 _SOLUTION_CLIP_CHARS = 300
 
 
 def extract_solution(solution_str, method="strict"):
+  # [FUNCTION DOC]
+  # Extracts the final numeric answer string from a solution text.
+  # Inputs: solution_str - model output; method - "strict" or "flexible" (default "strict").
+  # Logic: asserts method is one of the two values (AssertionError otherwise). Truncates the text
+  # to its last 300 characters if longer. Strict: finds all occurrences of four hashes, a space,
+  # then an optional minus followed by digits/dots/commas; if none returns None, else takes the
+  # last occurrence and removes commas and dollar signs. Flexible: finds all runs of optional minus
+  # followed by digits/dots/commas; if none returns None; otherwise iterates from the last match
+  # backwards and returns the first one that is not empty and not a lone dot.
+  # Output: extracted answer string or None. No side effects.
+  # KNOWN ISSUE: in flexible mode, if every match is invalid (e.g. only "."), the loop finishes
+  # and the last-iterated (invalid) value is returned instead of None; flexible mode also does not
+  # strip commas, unlike strict mode.
   assert method in ["strict", "flexible"]
 
   # Optimization: Regular expression matching on very long strings can be slow.
@@ -51,6 +72,14 @@ def extract_solution(solution_str, method="strict"):
 def compute_score(
     solution_str, ground_truth, method="strict", format_score=0.0, score=1.0
 ):
+  # [FUNCTION DOC]
+  # Scores a solution against the ground truth for GSM8K.
+  # Inputs: solution_str - model output; ground_truth - expected answer string; method - extraction
+  # mode passed to the extractor; format_score - reward when an answer is extracted but wrong
+  # (default 0.0); score - reward for a correct answer (default 1.0).
+  # Logic: extracts the answer; returns integer 0 if nothing was extracted, score if the extracted
+  # string equals ground_truth exactly (string equality, no numeric normalization), else format_score.
+  # Output: a number. Exceptions: AssertionError for an invalid method. No side effects.
   """The scoring function for GSM8k.
 
   Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning."

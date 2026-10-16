@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [PACKAGE DOC]
+# HELPER: package marker for CLI "recipes" (recipe-specific dataset loaders such as the
+# DeepScaleR loader). Contains no code; importing it has no side effects. Inputs/outputs: none.
+

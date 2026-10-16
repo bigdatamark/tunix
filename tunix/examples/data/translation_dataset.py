@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# English-to-French translation dataset pipeline for SFT/PEFT examples. Loads either the TFDS
+# "mtnt/en-fr" dataset or the HuggingFace "Helsinki-NLP/opus-100" dataset (en-fr config), and
+# builds grain DataLoaders that tokenize source/target text using a prompt template, concatenate
+# them into a fixed-length TrainingInput with a loss mask covering only target tokens, filter
+# overlength examples, and batch with drop_remainder.
+# Module constants: a plain prompt template (prefix asks to translate into French followed by a
+# newline; suffix newline) and an instruction-tuned Gemma chat-turn template (user turn prefix
+# and an end-of-turn plus model-turn suffix).
+
 """Data loading and preprocessing."""
 
 from collections.abc import Iterable
@@ -46,6 +56,20 @@ def create_datasets(
     tfds_download: bool = True,
     input_template: dict[str, str] | None = None,
 ) -> tuple[Iterable[TrainingInput], Iterable[TrainingInput]]:
+  # [FUNCTION DOC]
+  # Creates train and eval data loaders.
+  # Inputs: dataset_name ("mtnt/en-fr" or "Helsinki-NLP/opus-100"); global_batch_size;
+  # max_target_length; num_train_epochs (None means repeat indefinitely); tokenizer;
+  # instruct_tuned (choose the chat template); tfds_download; input_template (ignored, see issue).
+  # Logic: for MTNT imports the TFDS MTNT builder module (registration side effect) and opens the
+  # "train" and "valid" splits as TFDS data sources; for OPUS-100 loads "train" and "validation"
+  # with data_dir "en-fr"; otherwise ValueError. Chooses the template, then builds a training loader
+  # with num_train_epochs and an eval loader with one epoch, both with the same batch size, length
+  # and tokenizer.
+  # Output: tuple (train_loader, eval_loader). Exceptions: ValueError for unsupported datasets;
+  # download errors. Side effects: dataset download/reads.
+  # KNOWN ISSUE: the input_template argument is always overwritten by the instruct_tuned choice,
+  # so a caller-supplied template is ignored.
   """Creates train and eval data iterator.
 
   Args:
@@ -105,6 +129,11 @@ def _build_data_loader(
     tokenizer: tokenizer_lib.Tokenizer,
     input_template: dict[str, str],
 ) -> grain.DataLoader:
+  # [FUNCTION DOC]
+  # HELPER: builds a grain DataLoader over a random-access source. Uses an index sampler over all
+  # records with the given epoch count and no sharding (not shuffled), and operations: tokenize,
+  # build fixed-length training input padded with the tokenizer's pad id, filter overlength,
+  # then batch with drop_remainder True. Keyword-only inputs. Output: the DataLoader.
   """Builds a data loader for the given data source."""
   return grain.DataLoader(
       data_source=data_source,
@@ -123,15 +152,25 @@ def _build_data_loader(
 
 
 class _Tokenize(grain.MapTransform):
+  # [CLASS DOC]
+  # HELPER: grain map transform tokenizing a raw translation record into (source tokens, target
+  # tokens). Holds the tokenizer and the prompt template.
   """Tokenize the input."""
 
   def __init__(
       self, tokenizer: tokenizer_lib.Tokenizer, input_template: dict[str, str]
   ):
+    # [FUNCTION DOC]
+    # HELPER: stores the tokenizer and template dict (keys "prefix" and "suffix").
     self._tokenizer = tokenizer
     self._input_template = input_template
 
   def map(self, element: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    # [FUNCTION DOC]
+    # HELPER: tokenizes one record. MTNT records (have key "src") hold bytes in "src" and "dst",
+    # which are UTF-8 decoded; OPUS-100 records hold a "translation" dict with "en" and "fr".
+    # Source is tokenized with the template prefix/suffix and no EOS; target is tokenized with EOS.
+    # Output: tuple of two token arrays. KeyError on unexpected schemas.
     """Tokenize the input."""
     if "src" in element.keys():  ## MTNT dataset
       src_tokens = self._tokenizer.tokenize(
@@ -157,13 +196,23 @@ class _Tokenize(grain.MapTransform):
 
 
 class _BuildTrainInput(grain.MapTransform):
+  # [CLASS DOC]
+  # HELPER: grain map transform turning (source, target) token arrays into a TrainingInput with
+  # input_tokens and input_mask, right-padded to the max sequence length.
   """Build a TrainingInput from a tuple of source and destination tokens."""
 
   def __init__(self, max_seq_len: int, pad_value: int | bool):
+    # [FUNCTION DOC]
+    # HELPER: stores the max sequence length and the token pad value.
     self._max_seq_len = max_seq_len
     self._pad_value = pad_value
 
   def map(self, tokens: tuple[np.ndarray, np.ndarray]) -> TrainingInput:
+    # [FUNCTION DOC]
+    # HELPER: concatenates source and target tokens; builds a boolean mask that is False for source
+    # positions and True for target positions; right-pads tokens with the pad value and the mask with
+    # 0 (False) up to max length (no truncation if longer). Output: TrainingInput(input_tokens,
+    # input_mask).
     src_tokens, dst_tokens = tokens
 
     # The input sequence fed to the model is simply the concatenation of the
@@ -188,6 +237,9 @@ class _BuildTrainInput(grain.MapTransform):
   def _pad_up_to_max_len(
       self, input_tensor: np.ndarray, pad_value: int
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: right-pads a 1-D array with a constant up to the max sequence length; arrays already
+    # at or above the length are returned unpadded (pad amount clamped at 0).
     """Pad the given tensor up to sequence length of a batch."""
     seq_len = input_tensor.shape[0]
     to_pad = np.maximum(self._max_seq_len - seq_len, 0)
@@ -200,10 +252,16 @@ class _BuildTrainInput(grain.MapTransform):
 
 
 class _FilterOverlength(grain.FilterTransform):
+  # [CLASS DOC]
+  # HELPER: grain filter transform dropping examples longer than the max sequence length.
   """Filter out overlength examples."""
 
   def __init__(self, max_seq_len: int):
+    # [FUNCTION DOC]
+    # HELPER: stores the max sequence length.
     self._max_seq_len = max_seq_len
 
   def filter(self, element: TrainingInput) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: returns True when the example's input_tokens length is at most the max length.
     return element.input_tokens.shape[0] <= self._max_seq_len

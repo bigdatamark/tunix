@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: shared test utilities for Tunix tests. Provides pytree assertion helpers (equal,
+# not-equal, close) that convert JAX arrays to numpy, toy nnx models (a small decoder block, a
+# toy transformer with optional fake vision embeddings, and a wrapper adding a scalar score
+# head), frozen dataclass configs for those models, LoRA application for the toy model, a mock
+# SentencePiece vocabulary with a fixed word-to-id mapping, retrying HuggingFace download helpers,
+# chat-template batching, LLM output keyword validation, directory deletion, JAX array cleanup and
+# Colab detection.
+# Side effects at import: calls the env utility that sets up the sharding environment (e.g.
+# forcing multiple virtual CPU devices) so tests can build meshes.
+
 """Common test utilities."""
 
 from collections.abc import Iterable
@@ -40,6 +51,9 @@ env_utils.setup_sharding_environment()
 
 
 def _convert_leaf_to_nparray(leaf):
+  # [FUNCTION DOC]
+  # HELPER: if the leaf is a JAX array, blocks until it is computed and returns a numpy copy;
+  # otherwise returns the leaf unchanged.
   if isinstance(leaf, jax.Array):
     jax.block_until_ready(leaf)
     return np.asarray(leaf)
@@ -47,10 +61,15 @@ def _convert_leaf_to_nparray(leaf):
 
 
 def _convert_to_nparray(tree):
+  # [FUNCTION DOC]
+  # HELPER: maps the leaf converter over a pytree, returning a tree of numpy arrays/other leaves.
   return jax.tree.map(_convert_leaf_to_nparray, tree)
 
 
 def assert_equal(path, x, y):
+  # [FUNCTION DOC]
+  # HELPER: asserts two pytrees are exactly equal (numpy array-equal after conversion); the error
+  # message names the given path. Raises AssertionError on mismatch.
   np.testing.assert_array_equal(
       _convert_to_nparray(x),
       _convert_to_nparray(y),
@@ -59,6 +78,9 @@ def assert_equal(path, x, y):
 
 
 def assert_not_equal(path, x, y):
+  # [FUNCTION DOC]
+  # HELPER: asserts that at least one element differs between the two converted values
+  # (elementwise not-equal, any); AssertionError naming the path otherwise. Shapes must broadcast.
   np.testing.assert_(
       np.any(np.not_equal(_convert_to_nparray(x), _convert_to_nparray(y))),
       msg=f'Unexpected match at path: {path}',
@@ -66,6 +88,11 @@ def assert_not_equal(path, x, y):
 
 
 def assert_close(path, x, y, atol=1e-5, rtol=1e-5):
+  # [FUNCTION DOC]
+  # HELPER: asserts the converted values are close with given absolute and relative tolerances
+  # (default 1e-5 each); AssertionError naming the path otherwise.
+  # KNOWN ISSUE: atol and rtol are passed positionally, and numpy's allclose assertion takes rtol
+  # before atol, so the tolerances are swapped (harmless with equal defaults).
   np.testing.assert_allclose(
       _convert_to_nparray(x),
       _convert_to_nparray(y),
@@ -76,9 +103,16 @@ def assert_close(path, x, y, atol=1e-5, rtol=1e-5):
 
 
 class Decoder(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: toy decoder block: 4-head self-attention over 16 features (no bias, no decode cache)
+  # with residual, then a 16-to-32 linear with ReLU and a 32-to-16 linear with residual. Linear
+  # kernels/biases carry sharding annotations over "fsdp" and "tp" mesh axes.
   """Toy decoder for testing."""
 
   def __init__(self, rngs: nnx.Rngs):
+    # [FUNCTION DOC]
+    # HELPER: builds the attention layer and the two linear layers (LeCun-normal kernels with
+    # partitioning ("fsdp","tp") and ("tp","fsdp"); zero biases partitioned "tp" and "fsdp") using rngs.
     self.attn = nnx.MultiHeadAttention(
         num_heads=4,
         in_features=16,
@@ -106,6 +140,9 @@ class Decoder(nnx.Module):
     )
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # HELPER: forward pass. Input: array of shape (..., 16). Output: attention residual, then MLP
+    # output plus the attention residual, same shape.
     x = self.attn(x) + x
     h = nnx.relu(self.w1(x))
     h = self.w2(h) + x
@@ -114,6 +151,10 @@ class Decoder(nnx.Module):
 
 @dataclasses.dataclass(kw_only=True, frozen=True)
 class VisionConfig:
+  # [CLASS DOC]
+  # HELPER: frozen keyword-only dataclass with toy vision token settings: number of multimodal
+  # tokens per image (4) and token ids for the soft placeholder (22), start of image (23), end of
+  # image (24) and double newline (25).
   """Vision config for testing."""
 
   num_mm_tokens_per_image: int = 4
@@ -125,6 +166,9 @@ class VisionConfig:
 
 @dataclasses.dataclass(kw_only=True, frozen=True)
 class ModelConfig:
+  # [CLASS DOC]
+  # HELPER: frozen keyword-only dataclass for the toy transformer: num_layers 4, num_kv_heads 4,
+  # head_dim 16, vocab_size 256, optional vision_config (default None).
   """Model config for testing."""
 
   num_layers: int = 4
@@ -135,6 +179,10 @@ class ModelConfig:
 
 
 class ToyTransformer(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: toy decoder-only transformer: embedding (vocab x 16), a list of toy decoder blocks,
+  # and a 16-to-vocab LM head; head_dim attribute fixed to 16. Mimics the Tunix model interface
+  # (call signature, num_embed, attention-mask builder, example model input).
   """Toy transformer for testing."""
 
   def __init__(
@@ -143,6 +191,8 @@ class ToyTransformer(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # HELPER: stores config and builds embedding, num_layers decoder blocks and the LM head with rngs.
     self.config = config
     self.emb = nnx.Embed(config.vocab_size, 16, rngs=rngs)
     self.layers = nnx.List(
@@ -164,6 +214,14 @@ class ToyTransformer(nnx.Module):
       images=None,
       segment_ids: jax.Array | None = None,
   ):
+    # [FUNCTION DOC]
+    # HELPER: forward pass. Inputs: token ids, positions (ignored), cache (passed through), attention
+    # mask (ignored), output_hidden_states flag, optional images (batch, num_images, ...), segment ids
+    # (ignored). Embeds tokens; if images are given, generates deterministic random vision embeddings
+    # (fixed key 2) of shape (batch, num_images, tokens per image, 16) and merges them into the
+    # positions where the token equals the soft placeholder id. Runs all decoder blocks; if requested,
+    # sows the final hidden state as an intermediate named "all_hidden_states". Output: tuple
+    # (logits, cache). Raises AttributeError if images are given without a vision config.
     tokens = x
     x = self.emb(tokens)
     if images is not None:
@@ -197,9 +255,14 @@ class ToyTransformer(nnx.Module):
 
   @property
   def num_embed(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: property returning the embedding table size (vocab size).
     return self.emb.num_embeddings
 
   def get_attention_mask(self, tokens, inputs_mask=None):
+    # [FUNCTION DOC]
+    # HELPER: builds the attention mask via the Gemma3 utility from tokens and an optional input mask,
+    # passing the soft-token placeholder id when a vision config exists (else None).
     token_placeholder_id = (
         None
         if self.config.vision_config is None
@@ -212,10 +275,15 @@ class ToyTransformer(nnx.Module):
     )
 
   def get_model_input(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the dummy example inputs used for LoRA tracing (see the module-level function).
     return get_dummy_inputs_for_lora_toy_transformer_tests()
 
 
 def get_dummy_inputs_for_lora_toy_transformer_tests():
+  # [FUNCTION DOC]
+  # HELPER: returns example inputs for LoRA application: x and positions as int32 ones of shape
+  # (1, 1), cache None, and a boolean all-true attention mask of shape (1, 1, 1).
   return {
       'x': jnp.ones((1, 1), dtype=jnp.int32),
       'positions': jnp.ones((1, 1), dtype=jnp.int32),
@@ -231,6 +299,10 @@ def get_lora_model(
     rank: int = 4,
     alpha: float = 2.0,
 ) -> nnx.Module:
+  # [FUNCTION DOC]
+  # HELPER: applies qwix LoRA to a model. Inputs: model, module_path regex (default matches w1 and
+  # w2 layers), optional mesh, rank (4), alpha (2.0). Traces with the dummy inputs; reshards onto the
+  # mesh if provided. Output: the LoRA model.
   """Apply LoRA to ToyTransformer."""
   lora_provider = qwix.LoraProvider(
       module_path=module_path,
@@ -247,6 +319,10 @@ def get_lora_model(
 
 
 class MockVocab(spm.SentencePieceProcessor):
+  # [CLASS DOC]
+  # HELPER: mock SentencePiece processor with a whitespace-tokenized fixed vocabulary. Class
+  # attribute: default word-to-id mapping (pad 0, BOS 1, EOS 2, then 19 words with ids 3 to 21).
+  # pad/bos/eos ids are 0/1/2.
   """Mock vocabulary for testing."""
 
   DEFAULT_MAPPING = {
@@ -278,6 +354,12 @@ class MockVocab(spm.SentencePieceProcessor):
       self, mapping_text_to_id: dict[str, int] | None = None,
       is_multimodal=False
   ):
+    # [FUNCTION DOC]
+    # HELPER: initializes the base processor; sets a start id of 3; when multimodal, adds image
+    # tokens (ids 22-25) to the default mapping; uses the given mapping if truthy else the default,
+    # and stores the vocab size as the mapping length.
+    # KNOWN ISSUE: the multimodal update mutates the shared class-level default mapping in place, so
+    # image tokens leak into every later instance (and into vocab sizes) in the same process.
     super().__init__()
     self._start_id = 3
     if is_multimodal:
@@ -291,22 +373,36 @@ class MockVocab(spm.SentencePieceProcessor):
     self._vocab_size = len(self._mapping_text_to_id)
 
   def pad_id(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: returns pad id 0.
     return 0
 
   def bos_id(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: returns BOS id 1.
     return 1
 
   def eos_id(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: returns EOS id 2.
     return 2
 
   def GetPieceSize(self) -> int:  # pylint: disable=invalid-name
+    # [FUNCTION DOC]
+    # HELPER: returns the vocabulary size (mapping length).
     return self._vocab_size
 
   def DecodeIds(self, ids: Iterable[int]) -> str:  # pylint: disable=invalid-name
+    # [FUNCTION DOC]
+    # HELPER: decodes ids by reverse lookup in the mapping and joins the words with single spaces.
+    # Raises KeyError for unknown ids.
     reverse_mapping = {v: k for k, v in self._mapping_text_to_id.items()}
     return ' '.join(reverse_mapping[e] for e in ids)
 
   def EncodeAsIds(self, text: str, **kwargs) -> list[int]:  # pylint: disable=invalid-name
+    # [FUNCTION DOC]
+    # HELPER: encodes text by splitting on single spaces and mapping known words to ids; unknown
+    # words are silently dropped; extra kwargs ignored. Output: list of ids.
     words = text.split(' ')
     res = [
         self._mapping_text_to_id[word]
@@ -317,9 +413,15 @@ class MockVocab(spm.SentencePieceProcessor):
 
 
 class ToyTransformerWithScoreHead(nnx.Module):
+  # [CLASS DOC]
+  # HELPER: wraps a transformer backbone with a bias-free linear score head (head_dim to 1) applied
+  # to the backbone's last hidden states, mimicking a reward/value model.
   """Toy transformer with a score head."""
 
   def __init__(self, transformer: nnx.Module, rngs: nnx.Rngs):
+    # [FUNCTION DOC]
+    # HELPER: stores the backbone and creates the score head with input size equal to the backbone's
+    # head_dim.
     """Initializes the transformer with a score head.
 
     Args:
@@ -336,6 +438,11 @@ class ToyTransformerWithScoreHead(nnx.Module):
     )
 
   def __call__(self, *args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: runs the backbone with all given args plus output_hidden_states True (TypeError if the
+    # caller also passes that keyword), pops the sown intermediates, takes the last element of the
+    # "all_hidden_states" entry and applies the score head. Output: scores with trailing dim 1.
+    # Side effects: removes intermediates from the backbone state.
     self.transformer(*args, **kwargs, output_hidden_states=True)
     hidden_states = nnx.pop(self.transformer, nnx.Intermediate)[
         'all_hidden_states'
@@ -350,6 +457,9 @@ class ToyTransformerWithScoreHead(nnx.Module):
     reraise=True,
 )
 def safe_list_files(repo_id):
+  # [FUNCTION DOC]
+  # HELPER: lists files of a HuggingFace repo, retried up to 3 attempts with exponential backoff
+  # (4 to 10 seconds), re-raising the last error.
   return huggingface_hub.list_repo_files(repo_id)
 
 
@@ -359,12 +469,19 @@ def safe_list_files(repo_id):
     reraise=True,
 )
 def safe_download(repo_id, filename, local_dir):
+  # [FUNCTION DOC]
+  # HELPER: downloads one file from a HuggingFace repo into local_dir with the same retry policy;
+  # returns the local file path.
   return huggingface_hub.hf_hub_download(
       repo_id=repo_id, filename=filename, local_dir=local_dir
   )
 
 
 def download_from_huggingface(repo_id: str, model_path: str):
+  # [FUNCTION DOC]
+  # HELPER: prints a login reminder, lists the repo files, skips those under "original/",
+  # downloads each into model_path via the retrying helper, and prints the list. Output: none.
+  # Side effects: network and disk writes, stdout.
   """Download checkpoint files from huggingface."""
   print('Make sure you logged in to the huggingface cli.')
 
@@ -378,6 +495,9 @@ def download_from_huggingface(repo_id: str, model_path: str):
 
 
 def batch_templatize(prompts: List[str], tokenizer: Any):
+  # [FUNCTION DOC]
+  # HELPER: asserts the tokenizer has apply_chat_template, then returns, for each prompt, the
+  # untokenized chat-templated string of a single user message with a generation prompt appended.
   """Use tokenizer to batch templatize the prompts."""
   assert hasattr(tokenizer, 'apply_chat_template')
   out = []
@@ -398,6 +518,10 @@ def validate_llm_outputs(
     expected_output_pattern: List[Tuple[str, List[str]]],
     serving_outputs: List[str],
 ):
+  # [FUNCTION DOC]
+  # HELPER: for each (prompt, keywords) pair zipped with generated outputs, asserts every keyword
+  # (case-insensitive) appears in the stripped lowercased output; AssertionError naming the prompt
+  # and keyword otherwise. Extra items in either list are ignored.
   for (prompt, expectations), generated in zip(
       expected_output_pattern, serving_outputs
   ):
@@ -410,6 +534,9 @@ def validate_llm_outputs(
 
 
 def delete_directory(path: str):
+  # [FUNCTION DOC]
+  # HELPER: deletes a directory tree if the path exists and is a directory, printing what happened;
+  # prints a message (and does nothing) if the path is not a directory or does not exist.
   """Safely delete directory from filesystem."""
   if os.path.exists(path):
     if os.path.isdir(path):
@@ -422,6 +549,11 @@ def delete_directory(path: str):
 
 
 def clear_jax_arrays():
+  # [FUNCTION DOC]
+  # HELPER: deletes every module-global variable of this module bound to a JAX array, then runs
+  # garbage collection. Side effects: mutates module globals.
+  # KNOWN ISSUE: it only inspects this test-utility module's own globals, not the caller's, so it
+  # typically frees nothing.
   """Clear all the Jax arrays from hbm."""
   for name, obj in list(globals().items()):
     if isinstance(obj, jnp.ndarray):
@@ -430,6 +562,9 @@ def clear_jax_arrays():
 
 
 def is_running_in_colab() -> bool:
+  # [FUNCTION DOC]
+  # HELPER: returns True when an IPython module is loaded and its current shell has a "kernel"
+  # attribute (Colab/Jupyter); False on missing module, missing function or attribute errors.
   """Checks if the code is running within a Colab IPython kernel."""
   try:
     # get_ipython() is defined in IPython. Check for 'kernel' attribute

@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: abstract base test case for verifying "save LoRA-merged model" functionality across
+# model architectures. Subclasses provide the architecture-specific config, checkpoint writer,
+# LoRA module regex, expected projection keys, the merge-and-save call and optionally a loader
+# from a safetensors checkpoint. The base supplies fixtures (temp dirs, LoRA hyperparameters),
+# deterministic dummy base-model creation, LoRA application with random LoRA weights, an
+# expected-merge formula and three shared test methods. Module alias: create_dummy_model from the
+# dummy model creator. No side effects at import.
+
 """Base test class for LoRA merged model saving and loading tests.
 
 This module provides a common base class for testing LoRA merged model
@@ -48,6 +57,13 @@ create_dummy_model = dummy_model_creator.create_dummy_model
 
 
 class LoraParamsTestBase(absltest.TestCase, abc.ABC):
+  # [CLASS DOC]
+  # HELPER: abstract absltest TestCase (also an ABC). Fixture attributes: rank 4, alpha 16, random
+  # seed 42, LoRA init scale 0.01, base-model init scale 0.02, a temp directory with "base" and
+  # "merged" subpaths, and the subclass-built config. Tests: merged-save produces files, all
+  # projection keys present, forward-pass equivalence (skipped unless a loader is provided).
+  # KNOWN ISSUE: the class declares abstract methods, so test loaders that collect this base class
+  # directly would fail to instantiate it; it is meant to be used only via subclasses.
   """Base test class for LoRA merged model saving and loading.
 
   Subclasses must implement:
@@ -60,6 +76,10 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
   """
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: test fixture setup: sets LoRA hyperparameters and scales, creates a fresh temp dir and
+    # derives base checkpoint and merged output dir paths (not created), then builds the config via
+    # the subclass hook. Side effects: temp directory creation.
     """Set up test fixtures."""
     super().setUp()
 
@@ -79,6 +99,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     self.config = self.create_config()
 
   def tearDown(self):
+    # [FUNCTION DOC]
+    # HELPER: removes the temp directory tree if it exists, then calls the parent teardown.
     """Clean up test fixtures."""
     if os.path.exists(self.temp_dir):
       shutil.rmtree(self.temp_dir)
@@ -86,6 +108,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
 
   @abc.abstractmethod
   def create_config(self):
+    # [FUNCTION DOC]
+    # HELPER: abstract hook returning a small model config for fast tests.
     """Create model-specific configuration.
 
     Returns:
@@ -95,6 +119,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
 
   @abc.abstractmethod
   def create_checkpoint(self, model) -> str:
+    # [FUNCTION DOC]
+    # HELPER: abstract hook writing the base model's weights as a safetensors checkpoint plus a
+    # minimal config.json and returning the checkpoint directory.
     """Extract model weights and save in safetensors format.
 
     This method should:
@@ -114,6 +141,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
 
   @abc.abstractmethod
   def get_lora_module_path(self) -> str:
+    # [FUNCTION DOC]
+    # HELPER: abstract hook returning the qwix LoRA module-path regex.
     """Get regex pattern for LoRA target modules.
 
     Returns:
@@ -125,6 +154,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
 
   @abc.abstractmethod
   def get_projection_keys(self, layer_idx: int) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: abstract hook returning the safetensors keys of the projection weights in a layer.
     """Get list of projection weight keys for a given layer.
 
     Args:
@@ -138,6 +169,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
 
   @abc.abstractmethod
   def save_merged_model(self, lora_model):
+    # [FUNCTION DOC]
+    # HELPER: abstract hook that merges LoRA into the base weights and saves to the merged output dir.
     """Save LoRA merged model using architecture-specific function.
 
     Args:
@@ -146,6 +179,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     pass
 
   def create_model_from_checkpoint(self, checkpoint_dir: str):
+    # [FUNCTION DOC]
+    # HELPER: optional hook loading a model from a safetensors checkpoint; the default returns None,
+    # and its being un-overridden makes the equivalence test skip.
     """Load model from safetensors checkpoint (optional).
 
     Override this method to enable forward pass equivalence testing.
@@ -159,6 +195,8 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     return None
 
   def get_model_class(self):
+    # [FUNCTION DOC]
+    # HELPER: hook returning the model class for dummy creation; default raises NotImplementedError.
     """Get model class for dummy model creation.
 
     Override if needed for architecture-specific model class.
@@ -170,6 +208,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     raise NotImplementedError("Subclass must implement get_model_class()")
 
   def _create_base_model(self):
+    # [FUNCTION DOC]
+    # HELPER: creates the base model via the dummy model creator with the subclass model class, the
+    # config, no mesh, float32, the fixture seed and base scale. Output: the model.
     """Create a base model with deterministic weights."""
     model = create_dummy_model(
         model_class=self.get_model_class(),
@@ -182,6 +223,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     return model
 
   def _apply_lora_to_model(self, model):
+    # [FUNCTION DOC]
+    # HELPER: applies qwix LoRA (subclass regex, fixture rank and alpha) using the model's example
+    # inputs, then randomly initializes the LoRA weights. Output: the LoRA model.
     """Apply LoRA to a model.
 
     Args:
@@ -207,6 +251,12 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     return lora_model
 
   def _initialize_lora_weights(self, lora_model):
+    # [FUNCTION DOC]
+    # HELPER: randomly initializes LoRA weights in place. Starting from a PRNG key seeded with seed
+    # + 1000, for each layer in the model's layers list and each of the "attn" and "mlp" submodules
+    # present, iterates over all attribute names of the submodule; for each non-None attribute that
+    # has w_lora_a, w_lora_b, kernel_lora_a or kernel_lora_b, splits the key and sets that parameter to
+    # lora_scale times a standard normal sample of the same shape. Side effects: mutates parameters.
     """Initialize LoRA weights with random values.
 
     Override this method for architecture-specific weight initialization.
@@ -255,6 +305,11 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
             )
 
   def _compute_expected_merged_weight(self, base_weight, lora_a, lora_b):
+    # [FUNCTION DOC]
+    # HELPER: computes the expected merged weight. Converts LoRA A and B to numpy; a 3-D A is reshaped
+    # by merging its first two dims, a 3-D B by merging its last two dims; delta is A times B scaled
+    # by alpha / rank; result is base weight plus the transposed delta (base assumed stored as
+    # output-by-input). Output: numpy array. Shape mismatch raises ValueError.
     """Compute expected merged weight: base + (lora_a @ lora_b) * (alpha/rank).
 
     Args:
@@ -289,6 +344,10 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
   # ============================================================================
 
   def test_save_lora_merged_model(self):
+    # [FUNCTION DOC]
+    # Test: creates base model and checkpoint, applies LoRA, verifies at least one LoRA parameter
+    # exists in the graph, saves the merged model, and verifies the merged dir, its model.safetensors
+    # (non-empty when loaded) and a copied config.json exist.
     """Test LoRA merged model saving and output file creation."""
     # Create base model and checkpoint
     base_model = self._create_base_model()
@@ -325,6 +384,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     self.assertTrue(os.path.exists(config_path))
 
   def test_all_projections_merged(self):
+    # [FUNCTION DOC]
+    # Test: after creating checkpoint, applying LoRA and saving, loads the merged safetensors and
+    # verifies each projection key for layer 0 is present, not None and non-empty.
     """Test that all projection types are present in merged state."""
     # Create base model and checkpoint
     base_model = self._create_base_model()
@@ -347,6 +409,10 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
       self.assertGreater(merged_state[key].size, 0)
 
   def test_forward_pass_equivalence(self):
+    # [FUNCTION DOC]
+    # Test: skipped when the subclass did not override the loader hook. Otherwise creates base model
+    # and checkpoint, applies LoRA, runs a forward pass on fixed random inputs, saves the merged model,
+    # reloads it, runs the same forward pass and asserts outputs match within absolute tolerance 1e-2.
     """Test that outputs match between LoRA model and merged-then-reloaded model.
 
     This test is optional and requires implementing
@@ -397,6 +463,10 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     )
 
   def _create_test_inputs(self):
+    # [FUNCTION DOC]
+    # HELPER: builds forward inputs: batch 2, length 10 random int tokens (key 123) in [0, vocab) where
+    # vocab is the config's vocab_size or else num_embed; positions 0..9 repeated per row; mask None.
+    # Output: tuple (tokens, positions, mask).
     """Create test inputs for forward pass.
 
     Override this method for architecture-specific input requirements.
@@ -421,6 +491,9 @@ class LoraParamsTestBase(absltest.TestCase, abc.ABC):
     return input_tokens, positions, attention_mask
 
   def _run_forward_pass(self, model, input_tokens, positions, attention_mask):
+    # [FUNCTION DOC]
+    # HELPER: calls the model with keyword args input_tokens, positions, cache None and attention_mask;
+    # returns whatever it returns (expected (output, cache)).
     """Run forward pass through model.
 
     Override this method for architecture-specific forward pass parameters.

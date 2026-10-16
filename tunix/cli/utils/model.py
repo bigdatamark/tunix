@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# HELPER: model/tokenizer construction utilities for the Tunix CLI. Loads models through the
+# AutoModel factory from a configured source (e.g. GCS, Kaggle, HuggingFace), optionally wraps
+# them with LoRA/QLoRA via qwix, resolves the tokenizer path for some model families, and builds
+# the tokenizer adapter. Module constant: the default tokenizer path from the base config
+# ("meta-llama/Llama-3.1-8B"), used to detect "not overridden".
+
 """Utilities for creating and managing models in Tunix CLI."""
 
 import os
@@ -29,6 +37,18 @@ _DEFAULT_TOKENIZER_PATH = 'meta-llama/Llama-3.1-8B'
 
 
 def apply_lora_to_model(base_model, mesh, lora_config):
+  # [FUNCTION DOC]
+  # Wraps a base model with LoRA (or QLoRA) adapters.
+  # Inputs: base_model - an nnx model that provides a method returning example model inputs;
+  # mesh - JAX mesh or None; lora_config - mapping with required module_path, rank, alpha and
+  # optional tile_size and weight_qtype.
+  # Logic: logs the config; builds LoraProvider kwargs from the required keys plus tile_size and
+  # weight_qtype when present (logging "Qlora is applied" when weight_qtype exists, else "Lora is
+  # applied"). Creates the qwix LoraProvider (on TypeError logs the error and re-raises). Applies
+  # LoRA using the model's example inputs as keyword arguments. If mesh is given, reshards the
+  # LoRA model onto the mesh.
+  # Output: the LoRA-wrapped model. Exceptions: KeyError for missing required keys, TypeError from
+  # the provider, qwix errors. Side effects: logging, device memory allocation.
   """Apply Lora to the base model if given lora config."""
   logging.info('lora_config %r', lora_config)
   # Basic keyword arguments for LoraProvider
@@ -66,6 +86,12 @@ def apply_lora_to_model(base_model, mesh, lora_config):
 
 
 def create_tokenizer(tokenizer_config, tokenizer_path: str | None):
+  # [FUNCTION DOC]
+  # Builds the tokenizer adapter. Inputs: tokenizer_config mapping (tokenizer_path,
+  # tokenizer_type, add_bos, add_eos) and an optional tokenizer_path override (used when truthy,
+  # otherwise the config's path). Output: Tokenizer constructed positionally with type, path,
+  # add_bos, add_eos and the HF_TOKEN environment variable (or None). Exceptions: KeyError for
+  # missing config keys, tokenizer loading errors. Side effects: may download tokenizer files.
   if not tokenizer_path:
     tokenizer_path = tokenizer_config['tokenizer_path']
   tokenizer_type, add_bos, add_eos = (
@@ -88,6 +114,21 @@ def create_model(
     tokenizer_config: dict[str, Any],
     mesh: jax.sharding.Mesh,
 ) -> Tuple[nnx.Module, str]:
+  # [FUNCTION DOC]
+  # Creates a model from config and resolves the tokenizer path.
+  # Inputs: model_config (model_source, model_id, model_name, model_display required; optional
+  # model_download_path, intermediate_ckpt_dir, rng_seed default 0, model_path,
+  # use_flash_attention default False, flash_attention_block_size default 1024, remat_config
+  # default 1, lora_config), tokenizer_config (tokenizer_path), mesh.
+  # Logic: converts model_source to the ModelSource enum, raising ValueError listing valid sources
+  # if unknown. Loads model and its local path via AutoModel from_pretrained with the above options.
+  # Determines the model family from model_name: for gemma3 from "gcs", if the tokenizer path is
+  # empty or the default, uses the public Gemma3 tokenizer GCS path; for gemma/gemma1p1/gemma2 from
+  # "kaggle", under the same condition uses "tokenizer.model" inside the model path. If lora_config
+  # is truthy applies LoRA, otherwise logs full-weight training. If model_display is truthy, prints
+  # the model with nnx display.
+  # Output: tuple of (model, tokenizer_path). Exceptions: ValueError, KeyError, loading errors.
+  # Side effects: downloads, device allocation, logging/printing.
   """Creates a model and determines the tokenizer path based on the model config.
 
   This function handles model loading from various sources (GCS, Kaggle, HF)

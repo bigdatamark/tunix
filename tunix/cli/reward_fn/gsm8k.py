@@ -11,6 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# GSM8K-style reward functions for the CLI GRPO pipeline.
+# Module constants: tag strings for the reasoning block ("<reasoning>"/"</reasoning>") and the
+# answer block ("<answer>"/"</answer>"); a type alias describing the reward-function signature
+# (any arguments, returns a list of floats); and a compiled regex (multiline + dot-matches-newline)
+# that matches: reasoning start tag, at least one char (non-greedy), reasoning end tag, any
+# chars, answer start tag, then captures (group 1) a non-greedy non-empty answer up to either
+# the answer end tag or end of string.
+# All reward functions take the batch of prompts, the batch of completion strings and arbitrary
+# keyword arguments (some also take the gold "answer" list) and return one score per completion.
+# Side effects: none at import time; check_answer may log when an env var is set.
+
 """Reward functions for the RLHF pipeline."""
 
 import os
@@ -36,6 +49,10 @@ match_format = re.compile(
 # All reward functions must have this signature.
 # range: [0, 3]
 def match_format_exactly(prompts, completions, **kwargs):
+  # [FUNCTION DOC]
+  # Format reward: for each completion returns 3.0 if the module-level format regex finds a match
+  # anywhere in the completion, else integer 0. Inputs: prompts (unused), completions (list of
+  # strings), extra kwargs ignored. Output: list of scores in range [0, 3]. No exceptions/side effects.
   return [
       0 if match_format.search(response) is None else 3.0
       for response in completions
@@ -44,6 +61,11 @@ def match_format_exactly(prompts, completions, **kwargs):
 
 # range: [-2, 2]
 def match_format_approximately(prompts, completions, **kwargs):
+  # [FUNCTION DOC]
+  # Approximate-format reward: for each completion starts from 0 and, for each of the four tags
+  # (reasoning start, reasoning end, answer start, answer end), adds 0.5 if the tag occurs exactly
+  # once in the completion, otherwise subtracts 0.5. Inputs: prompts (unused), completions (list of
+  # strings), kwargs ignored. Output: list of scores in [-2, 2]. No exceptions/side effects.
   scores = []
 
   for completion in completions:
@@ -61,6 +83,19 @@ def match_format_approximately(prompts, completions, **kwargs):
 
 # range: [-1, 3]
 def check_answer(prompts, completions, answer, **kwargs):
+  # [FUNCTION DOC]
+  # Answer-correctness reward. Inputs: prompts, completions (list of strings), answer (list of gold
+  # answers, any type), kwargs ignored.
+  # Logic: gold answers are stringified, stripped and have commas removed. If the environment
+  # variable LOG_GRPO_ROLLOUT equals "1", logs prompts, completions, raw and cleaned gold answers at
+  # INFO level. For each completion extracts the format regex's capture group (stripped, commas
+  # removed) or None when there is no match. Scoring, pairwise with gold answers (zip truncates to
+  # the shorter list): no extraction gives 0; exact string match gives 3.0; otherwise both are
+  # parsed as floats: numerically equal gives 3.0; gold equal to zero gives -1.0 if guess is nonzero
+  # else 0.0; otherwise the ratio guess/gold in [0.9, 1.1] gives 0.5, in [0.8, 1.2] gives 0.25,
+  # anything else -1.0. A float-conversion failure gives -0.5.
+  # Output: list of scores in [-1, 3]. Exceptions: none escape (ValueError/ZeroDivisionError caught).
+  # Side effects: optional logging.
   """Checks if the extracted response matches the gold answer."""
   # Clean formatting (e.g. stripping spaces and commas).
   clean_answers = [str(a).strip().replace(",", "") for a in answer]
@@ -117,6 +152,15 @@ def check_answer(prompts, completions, answer, **kwargs):
 
 # range: [0, 1.5]
 def check_numbers(prompts, completions, answer, **kwargs):
+  # [FUNCTION DOC]
+  # Numeric-match reward. Inputs: prompts (unused), completions, answer (gold answers), kwargs.
+  # Logic: uses a regex (multiline + dotall) finding the answer start tag followed (non-greedy) by
+  # the first run of one or more digits/dots, captured. Gold answers are stringified, stripped,
+  # commas removed. For each pair (zip truncation): no capture gives 0; otherwise both values are
+  # parsed to floats and compared: equal gives 1.5, else 0.0; a parse failure (e.g. a capture of
+  # just dots) gives 0. Output: list of scores in [0, 1.5]. No exceptions escape; no side effects.
+  # KNOWN ISSUE: the captured number cannot include a leading minus sign, so negative answers can
+  # never be matched; also the tag in the regex is not escaped (harmless for these tags).
   match_numbers = re.compile(
       rf"{solution_start}.*?([\d\.]{{1,}})", flags=re.MULTILINE | re.DOTALL
   )

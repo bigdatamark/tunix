@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# HELPER: dataset utilities for the Tunix CLI. Provides a structural protocol for tokenizers that
+# support chat templating, chat-template application to records, a safe parser for literal
+# call-argument strings, dynamic loading of a dataset factory from a module path or .py file
+# (with optional call arguments in the specifier), and post-processing (prompt-key normalization,
+# length filtering, truncation, train/validation split, epoch repetition and batching) of grain
+# datasets. Module aliases: Tokenizer and TokenizerAdapter from the tokenizer adapter module.
+# No side effects at import.
+
 """Utilities for handling and loading datasets in tunix CLI."""
 
 import ast
@@ -14,6 +23,11 @@ TokenizerAdapter = tokenizer_adapter.TokenizerAdapter
 
 
 class ChatTemplateTokenizer(Protocol):
+  # [CLASS DOC]
+  # HELPER: typing Protocol describing any tokenizer with an apply_chat_template method taking a
+  # list of role/content message dicts, a tokenize flag (default False) and an
+  # add_generation_prompt flag (default True), returning a string or list of token ids.
+  # Used only for static typing; it has no runtime behavior.
 
   def apply_chat_template(
       self,
@@ -21,12 +35,20 @@ class ChatTemplateTokenizer(Protocol):
       tokenize: bool = False,
       add_generation_prompt: bool = True,
   ) -> str | list[int]:
+    # [FUNCTION DOC]
+    # HELPER: protocol method stub (body is an ellipsis); declares the chat-template signature only.
     ...
 
 
 def apply_chat_template(
     x, tokenizer: ChatTemplateTokenizer
 ) -> dict[str, Any]:
+  # [FUNCTION DOC]
+  # HELPER: applies the tokenizer's chat template to a record. Input: record x containing a
+  # "prompt" field (list of chat messages) and a tokenizer. Output: new dict with "prompts" set to
+  # the untokenized templated string with a generation prompt appended, plus every other key of x
+  # except "prompt" (the "prompt" key is dropped). Raises KeyError if "prompt" is missing.
+  # No side effects.
   return {
       "prompts": tokenizer.apply_chat_template(
           x["prompt"], tokenize=False, add_generation_prompt=True
@@ -36,6 +58,17 @@ def apply_chat_template(
 
 
 def parse_call_string(arg_string: str) -> tuple[list[Any], dict[str, Any]]:
+  # [FUNCTION DOC]
+  # Parses a literal argument-list string. Input: e.g. text of comma-separated positional literals
+  # and name=literal keyword pairs. Logic: blank/whitespace input returns an empty list and dict.
+  # Otherwise wraps the text as a call to a dummy function, parses it as Python source into a syntax
+  # tree (SyntaxError becomes ValueError), checks the first statement is an expression whose value
+  # is a call (else ValueError "Internal error"), and literal-evaluates each positional argument and
+  # each keyword value in order. Output: tuple of (positional list, keyword dict).
+  # Exceptions: ValueError for bad syntax or non-literal values (literal evaluation raises
+  # ValueError); no code is executed. No side effects.
+  # KNOWN ISSUE: a starred-kwargs entry yields a keyword with a None name, which ends up as a None
+  # key in the dict rather than being rejected.
   """Parses a string containing function call arguments and keyword arguments.
 
   Args:
@@ -85,6 +118,28 @@ def get_dataset_from_module(
     apply_chat_template_to_dataset: bool = False,
     **dataset_kwargs,
 ):
+  # [FUNCTION DOC]
+  # Loads a dataset by calling a factory function located by a specifier string.
+  # Inputs: specifier "module.path[:func[(args)]]" or "/path/file.py[:func[(args)]]"; optional
+  # tokenizer; apply_chat_template_to_dataset flag; extra keyword args forwarded to the factory.
+  # Logic: if the specifier contains both "(" and ":", splits at the last "(" into specifier and
+  # argument text. Then, if a ":" remains, splits at the last ":" into module part and function
+  # name. If the module part is an existing path ending in ".py", loads it as a module from file
+  # (module name = file base name) and executes it, wrapping execution failures in ImportError;
+  # otherwise imports it by dotted name, wrapping any failure in ImportError. If a function name was
+  # given, looks it up on the module (AttributeError if missing) and, when argument text exists,
+  # strips trailing ")" characters and parses it as literal args/kwargs; with no function name uses
+  # the module's create_dataset. Calls the function with the positional args and the merge of the
+  # forwarded kwargs and parsed kwargs (parsed take precedence). If chat templating is not
+  # requested returns the dataset; otherwise requires a tokenizer (ValueError if None) and returns
+  # the dataset mapped with the chat-template helper.
+  # Output: the dataset object returned by the factory (possibly mapped).
+  # Exceptions: ImportError, ValueError, AttributeError, factory errors.
+  # Side effects: imports/executes arbitrary module code.
+  # KNOWN ISSUE: the None checks for spec/module happen after module_from_spec is called with the
+  # spec, so a None spec would fail earlier with a different error; argument parsing ignores
+  # arguments when no ":" function name is present (they would not be split off since "(" splitting
+  # requires ":"); stripping all trailing ")" can remove parentheses belonging to the last argument.
   """Get dataset from module.
 
   Examples of specifier:
@@ -176,6 +231,25 @@ def post_init_dataset(
     prompt_key: str = "prompts",
     custom_batch_fn: Optional[Callable] = None,
 ):
+  # [FUNCTION DOC]
+  # Post-processes a grain map dataset into batched train and optional validation iter datasets.
+  # Inputs: dataset (grain MapDataset supporting len, map, filter, slicing, repeat); tokenizer with
+  # encode; batch_size; num_batches (optional cap on number of examples as num_batches * batch_size);
+  # max_prompt_length (optional); fraction (train split fraction, default 1.0); num_epochs (default
+  # 1); prompt_key (default "prompts"); custom_batch_fn (optional batching function).
+  # Logic: records original length. If prompt_key differs from "prompts", maps each record to add a
+  # "prompts" field equal to the control-token-sanitized value of the source key and thereafter uses
+  # "prompts". If max_prompt_length is positive, filters out records whose encoded prompt has more
+  # tokens than the limit. Raises ValueError (with diagnostics) if nothing remains. If num_batches is
+  # given, truncates to min(num_batches * batch_size, length). If 0 < fraction < 1, splits at
+  # floor(length * fraction) into first and second segments; else the whole set is the first segment
+  # and there is no second. Raises ValueError if the first segment is empty. Each segment is repeated
+  # num_epochs times, converted to an iter dataset and batched with batch_size and custom_batch_fn.
+  # Output: tuple (train_batches, validation_batches or None).
+  # Exceptions: ValueError as above; tokenizer errors. Side effects: none beyond dataset pipeline creation.
+  # KNOWN ISSUE: the length after filtering is computed with len on a filtered map dataset, which
+  # in grain still reports the pre-filter length, so the emptiness check may not detect an
+  # all-filtered dataset; also the docstring omits prompt_key, custom_batch_fn and the tuple return.
   """Applies post-initialization transformations to a dataset.
 
   This function filters, batches, and optionally limits the number of batches
@@ -200,6 +274,9 @@ def post_init_dataset(
     source_prompt_key = prompt_key
 
     def normalize_prompt_key(x):
+      # [FUNCTION DOC]
+      # HELPER: returns a copy of the record with "prompts" set to the sanitized (control tokens
+      # neutralized) text of the configured source prompt key. KeyError if that key is missing.
       return {
           **x,
           "prompts": token_sanitization.sanitize_control_tokens(
@@ -213,6 +290,9 @@ def post_init_dataset(
   if max_prompt_length is not None and max_prompt_length > 0:
 
     def prompt_length_filter(x):
+      # [FUNCTION DOC]
+      # HELPER: filter predicate; true when the tokenizer encoding of the record's prompt has at most
+      # max_prompt_length tokens.
       tokens = tokenizer.encode(x[prompt_key])
       return len(tokens) <= max_prompt_length
 

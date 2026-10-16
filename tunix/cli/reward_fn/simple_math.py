@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# Simple binary reward functions (format and answer correctness) for math-style GRPO training.
+# Module constants: reasoning and answer tag strings, a reward-function signature type alias,
+# and a compiled regex (multiline + dotall) requiring, between optional leading whitespace at a
+# line start and optional trailing whitespace at a line end: reasoning start tag, non-empty
+# reasoning, reasoning end tag, any text, answer start tag, captured non-empty answer, answer end
+# tag. Each reward function returns one score per completion. No side effects.
+
 """simple format and answer binary reward functions."""
 
 import re
@@ -35,6 +44,10 @@ match_format = re.compile(
 
 # binary reward function on format
 def check_format(prompts, completions, r=0.1, **kwargs):
+  # [FUNCTION DOC]
+  # Binary format reward. Inputs: prompts (unused), completions (list of strings), r - reward value
+  # (default 0.1), kwargs ignored. Output: list with r for each completion where the module format
+  # regex finds a match, else integer 0. No exceptions or side effects.
   return [
       0 if match_format.search(response) is None else r
       for response in completions
@@ -44,6 +57,16 @@ def check_format(prompts, completions, r=0.1, **kwargs):
 # binary reward function on answer correctness
 # NB does not use sympy, only checks float equality 
 def check_answer(prompts, completions, answer, r=1, **kwargs):
+  # [FUNCTION DOC]
+  # Binary answer-correctness reward. Inputs: prompts (unused), completions, answer (list of gold
+  # answer strings), r - reward for a correct answer (default 1), kwargs ignored.
+  # Logic: finds the answer start tag followed (non-greedy) by the first run of digits/dots, captured
+  # (or None). For each pair (zip truncation): None gives 0; else gold and guess are stripped and
+  # parsed as floats; equal gives r, unequal gives 0.0; a ValueError on parsing gives 0.
+  # Output: list of scores. No side effects.
+  # KNOWN ISSUE: the comprehension variable shadows the parameter r inside the comprehension only
+  # (harmless), negative numbers are never captured, and gold answers must be strings (a non-string
+  # gold answer raises AttributeError on strip, which is not caught).
   match_numbers = re.compile(
       rf"{solution_start}.*?([\d\.]{{1,}})", flags=re.MULTILINE | re.DOTALL
   )

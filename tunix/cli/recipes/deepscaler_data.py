@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Dataset loader for the DeepScaleR agentic GRPO recipe used by the CLI.
+# Exposes a single function that reads the DeepScaleR training JSON (local path or any
+# fsspec-supported URL such as GCS) and turns it into a grain map dataset whose elements are
+# dictionaries with keys "prompts" (the question followed by a fixed step-by-step / boxed-answer
+# instruction), "question" and "answer". Depends on the HuggingFace datasets library, fsspec,
+# grain and pandas. No side effects at import time.
+
 """Dataset loading for the DeepScaleR agentic GRPO recipe.
 
 Returns a raw grain.MapDataset ready for post_init_dataset().
@@ -30,6 +38,25 @@ def create_dataset(
     shuffle: bool = False,
     seed: int = 42,
 ) -> grain.MapDataset:
+  # [FUNCTION DOC]
+  # Builds the DeepScaleR training dataset for the agentic GRPO recipe.
+  # Inputs: train_data_path - path/URL of a JSON file (records with "problem" and "answer" fields),
+  # opened via fsspec and parsed with pandas JSON reader; eval_data_path - path/URL of a parquet
+  # file opened in binary mode via fsspec and parsed with pandas; shuffle - whether to shuffle the
+  # training rows; seed - shuffle seed.
+  # Logic: defines an instruction string asking to think step by step and put the final answer
+  # inside a LaTeX boxed command. Loads both files into DataFrames. Converts the training
+  # DataFrame into a HuggingFace Dataset and maps each row (with index, ignored) to a dict with
+  # "question" (from "problem"), "ground_truth" (from "answer") and "data_source" set to "math";
+  # the original columns are kept by the HF map. Optionally shuffles with the seed. Wraps the result
+  # as a grain MapDataset source and lazily maps each item to a dict with "prompts" equal to the
+  # question, a space, then the instruction; "question"; and "answer" (prefers "question" over
+  # "problem", and "answer" over "ground_truth", defaulting to empty strings).
+  # Output: grain MapDataset of the training set only.
+  # Exceptions: file-not-found / IO / parse errors from fsspec and pandas propagate.
+  # Side effects: reads both files (network access for remote URLs).
+  # KNOWN ISSUE: the eval parquet file is read into memory but never used or returned, despite
+  # the docstring saying the function loads the AIME eval set.
   """Load DeepScaleR train set and AIME eval set.
 
   Args:
@@ -46,6 +73,11 @@ def create_dataset(
   )
 
   def _preprocess(example, index):
+    # [FUNCTION DOC]
+    # HELPER: per-row HF map callback. Input: a row dict and its index (discarded). Output: a new
+    # dict with "question" taken from the row's "problem", "ground_truth" taken from the row's
+    # "answer", and "data_source" fixed to "math". Raises KeyError if those fields are missing.
+    # No side effects.
     del index
     return {
         "question": example["problem"],
@@ -54,6 +86,12 @@ def create_dataset(
     }
 
   def _to_prompt(item):
+    # [FUNCTION DOC]
+    # HELPER: per-element grain map callback turning a record into the prompt format. Input: a
+    # dict-like item. Reads the question (key "question", falling back to "problem", then empty
+    # string) and the answer (key "answer", falling back to "ground_truth", then empty string).
+    # Output: dict with "prompts" equal to question + space + the enclosing instruction string,
+    # plus "question" and "answer". No exceptions or side effects.
     question = item.get("question", item.get("problem", ""))
     answer = item.get("answer", item.get("ground_truth", ""))
     return {

@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Command-line entry point for GRPO reinforcement-learning training, in either standard
+# single-turn mode ("grpo") or agentic multi-turn mode ("agentic_grpo"), selected by the
+# training_mode config key. Defines an absl flag "pathways_bns" (default None), a pipeline class
+# extending the CLI config class that builds role-to-mesh assignments, rollout/cluster/training/perf
+# configs, the RL cluster (actor and reference models), the dataset and the learner, plus helpers
+# to configure Pathways (via BNS address or on Cloud) and a main function run by absl app.
+# Side effects at import: registers the absl flag.
+
 """Main entry point for GRPO training (standard and agentic).
 
 Set ``training_mode: "grpo"`` (default) for standard single-turn GRPO, or
@@ -61,6 +70,13 @@ _PATHWAYS_BNS = flags.DEFINE_string(
 
 
 class GrpoPipeline(config.HyperParameters):
+  # [CLASS DOC]
+  # GRPO pipeline built from the merged CLI config (see the config base class). Extra state:
+  # data_module (lazily imported dataset module or None). Class constants: mapping from each RL role
+  # (actor, critic, reference, reward, rollout) to its config section name, and lowercase role-name
+  # aliases used by "same_mesh_as". Mesh policy: actor always owns a mesh; any role with an explicit
+  # mesh owns its own slice; others share the actor mesh or the role named by same_mesh_as; all
+  # owners must agree on one allocation policy. Public entry: run_grpo_trainer.
   """Runs standard GRPO or agentic GRPO depending on ``training_mode``.
 
   ``training_mode: "grpo"`` (default) — standard single-turn GRPO using
@@ -86,6 +102,9 @@ class GrpoPipeline(config.HyperParameters):
   """
 
   def __init__(self, argv: list[str], **kwargs):
+    # [FUNCTION DOC]
+    # Constructor: sets data_module to None, then runs the base config loading/validation with argv
+    # and kwargs (see base class). Exceptions as for the base class.
     self.data_module: types.ModuleType | None = None
     super().__init__(argv, **kwargs)
 
@@ -108,6 +127,9 @@ class GrpoPipeline(config.HyperParameters):
   }
 
   def _resolve_split_role(self, role_name: str) -> rl_cluster_lib.Role:
+    # [FUNCTION DOC]
+    # HELPER: maps a role name (trimmed, case-insensitive) to its Role enum; ValueError listing valid
+    # names if unknown.
     normalized = role_name.strip().lower()
     if normalized not in self._SPLIT_ROLE_ALIASES:
       valid_roles = sorted(self._SPLIT_ROLE_ALIASES)
@@ -119,6 +141,10 @@ class GrpoPipeline(config.HyperParameters):
   def _get_same_mesh_as_map(
       self,
   ) -> dict[rl_cluster_lib.Role, rl_cluster_lib.Role]:
+    # [FUNCTION DOC]
+    # HELPER: builds a mapping role to target role from each role section's "same_mesh_as" value
+    # (missing/None sections treated as empty). ValueError for unknown names, or if the actor section
+    # specifies same_mesh_as (actor must own its mesh).
     same_mesh_as = {}
     for role, model_key in self._ROLE_TO_MODEL_KEY.items():
       model_cfg = self.config.get(model_key, {}) or {}
@@ -133,6 +159,9 @@ class GrpoPipeline(config.HyperParameters):
     return same_mesh_as
 
   def _is_role_active(self, role: rl_cluster_lib.Role) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: actor, reference and rollout are always active; critic and reward are active only when
+    # their config section key is present.
     if role in (
         rl_cluster_lib.Role.ACTOR,
         rl_cluster_lib.Role.REFERENCE,
@@ -145,6 +174,12 @@ class GrpoPipeline(config.HyperParameters):
   def _resolve_mesh_owners(
       self,
   ) -> dict[rl_cluster_lib.Role, rl_cluster_lib.Role]:
+    # [FUNCTION DOC]
+    # HELPER: resolves, for every participating role, the role that owns its mesh. Participating roles
+    # are active roles plus those with same_mesh_as. Base owner: the role itself if it is the actor or
+    # has a truthy mesh, else the actor. Roles with same_mesh_as must not also have a mesh (ValueError)
+    # and follow the chain of targets recursively to the final base owner; a cycle raises ValueError,
+    # and a target that is not participating raises ValueError. Output: dict role to owner role.
     same_mesh_as = self._get_same_mesh_as_map()
     base_owners = {}
     for role, model_key in self._ROLE_TO_MODEL_KEY.items():
@@ -161,6 +196,10 @@ class GrpoPipeline(config.HyperParameters):
         role: rl_cluster_lib.Role,
         seen: set[rl_cluster_lib.Role],
     ) -> rl_cluster_lib.Role:
+      # [FUNCTION DOC]
+      # HELPER: recursive owner lookup with a visited set: ValueError on revisiting a role (cycle);
+      # roles without same_mesh_as return their base owner; otherwise checks the target participates
+      # (ValueError if not) and recurses on it. Mutates the visited set.
       if role in seen:
         raise ValueError("same_mesh_as contains a cycle.")
       if role not in same_mesh_as:
@@ -191,6 +230,14 @@ class GrpoPipeline(config.HyperParameters):
     return role_to_owner
 
   def create_role_to_mesh(self):
+    # [FUNCTION DOC]
+    # Builds the role-to-mesh mapping. Gets all JAX devices and mesh owners; collects distinct owners in
+    # role-declaration order. For each owner parses its mesh shape and allocation policy (all must match,
+    # else ValueError) and records (section name, product of shape) as a device requirement. Allocates
+    # disjoint named device slices via the mesh utility using the agreed policy (or the default when no
+    # owners), then creates a mesh for each owner from its shape, axis names and assigned devices.
+    # Output: dict role to the owner's JAX mesh. Exceptions: ValueError from config/allocation (e.g.
+    # insufficient devices). Side effects: queries devices.
     """Builds the role-to-mesh mapping for GRPO execution.
 
     Any role with an explicit ``*.mesh`` config gets a dedicated device slice.
@@ -259,6 +306,17 @@ class GrpoPipeline(config.HyperParameters):
       self,
       role_to_mesh: dict[rl_cluster_lib.Role, jax.sharding.Mesh] | None = None,
   ) -> base_rollout.RolloutConfig:
+    # [FUNCTION DOC]
+    # Builds the rollout config. Reads rollout_config, training_mode (default "grpo") and
+    # rollout_engine (default "vanilla"). Keeps only rollout_config keys that are RolloutConfig fields;
+    # if total_generation_steps is present it also becomes max_tokens_to_generate. In agentic mode, the
+    # KV cache size is max_prompt_length + total_generation_steps + 256 (missing values count 0) and
+    # max running requests come from agentic_grpo_config.max_concurrency (default 16). In standard mode,
+    # the KV cache size is set (same formula) only when both lengths are truthy, and max running requests
+    # is batch_size (default 1) times grpo_config.num_generations (default 1). Adds engine-specific
+    # fields (filtered to valid fields) and constructs the RolloutConfig.
+    # Inputs: optional role_to_mesh (required for vllm). Output: RolloutConfig. Exceptions: TypeError for
+    # wrong config types, ValueError from the engine helper. Side effects: logging; env var for vllm.
     """Build RolloutConfig from YAML.
 
     Standard mode: pass rollout_config fields through with kv_cache_size =
@@ -327,6 +385,21 @@ class GrpoPipeline(config.HyperParameters):
       max_running_requests: int,
       role_to_mesh: dict[rl_cluster_lib.Role, jax.sharding.Mesh] | None = None,
   ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: returns engine-specific RolloutConfig fields. Model version defaults to the actor
+    # model_id. For "sglang_jax": fields read from sglang_jax_config with defaults (model version, static
+    # memory fraction 0.8, random-weight init True, radix cache disabled True, deterministic sampling
+    # False, chunked prefill 2048, max running requests from the caller, page size 128, sort for
+    # top-p/min-p False). For "vllm": requires role_to_mesh (ValueError otherwise); reads the rollout
+    # mesh device-array shape; max_num_seqs from rollout_config override, else vllm_config, else 768;
+    # max batched tokens from rollout_config override, else vllm_config, else max_num_seqs times KV cache
+    # size integer-divided by 4; sets VLLM_ALLOW_LONG_MAX_MODEL_LEN to "1" in the environment; returns
+    # model version, HBM utilization 0.4, TPU backend "jax", server mode True, async scheduling True,
+    # tensor parallel size = second mesh dim (or 1), data parallel size = first mesh dim, the two
+    # limits, and engine kwargs (default: kv cache metrics on, stats logging on, prefix caching on).
+    # Any other engine returns an empty dict.
+    # KNOWN ISSUE: the docstring says "for agentic mode" but it is used in both modes; with standard mode
+    # and missing lengths the KV cache size is 0, making the default max batched tokens 0.
     """Return engine-specific RolloutConfig fields for agentic mode."""
     model_id = self._config_mapping("actor_model_config").get("model_id", "")
 
@@ -413,6 +486,9 @@ class GrpoPipeline(config.HyperParameters):
       role_to_mesh: dict[rl_cluster_lib.Role, jax.sharding.Mesh],
       rollout_config: base_rollout.RolloutConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Builds the RL ClusterConfig: role_to_mesh, rollout engine string, offload_to_cpu bool, the RL
+    # training config, and the given rollout config (built from role_to_mesh if None). Keyword-only args.
     if rollout_config is None:
       rollout_config = self.create_rollout_config(role_to_mesh=role_to_mesh)
     return rl_cluster_lib.ClusterConfig(
@@ -424,6 +500,10 @@ class GrpoPipeline(config.HyperParameters):
     )
 
   def create_rl_training_config(self):
+    # [FUNCTION DOC]
+    # Builds RLTrainingConfig from rl_training_config: the processed training-config dict (optimizer
+    # sections dropped) plus actor_optimizer and critic_optimizer created from their nested sections
+    # when present. Exceptions: optimizer/config errors and TypeError for unknown fields.
     base_key = "rl_training_config"
     constructed_rl_training_config = self.obtain_training_config_dict(base_key)
 
@@ -440,6 +520,12 @@ class GrpoPipeline(config.HyperParameters):
     return rl_cluster_lib.RLTrainingConfig(**constructed_rl_training_config)
 
   def create_perf_config(self, cluster_config: rl_cluster_lib.ClusterConfig):
+    # [FUNCTION DOC]
+    # Builds a PerfMetricsConfig from the cluster's perf_metrics_options, or returns None if unset.
+    # When v1 is enabled, sets custom_export_fn from the configured dotted path (ValueError if it
+    # cannot be loaded) or else the default exporter derived from the cluster config. When v2 is
+    # enabled, likewise sets custom_export_fn_v2 from its path or the experimental exporter's export
+    # method (with trace writer flag and trace dir). Output: config or None.
     perf_metrics_options = cluster_config.training_config.perf_metrics_options
     if not perf_metrics_options:
       return None
@@ -484,6 +570,17 @@ class GrpoPipeline(config.HyperParameters):
     return perf_config
 
   def create_rl_cluster(self, tokenizer):
+    # [FUNCTION DOC]
+    # Builds the RL cluster. Creates role meshes and the rollout config. If reference_model_config has
+    # lora_config, logs a warning and deletes it from the live config. Creates the reference model on the
+    # reference mesh. Actor: if actor_model_config has lora_config, wraps the reference model with LoRA
+    # on the actor mesh; otherwise clones the reference model (split into graph and params, deep-copies
+    # params, merges back). Builds the cluster config and perf config and returns an RLCluster with actor,
+    # reference, tokenizer, cluster config and perf config.
+    # Side effects: mutates config, loads models, allocates devices.
+    # KNOWN ISSUE: the actor is always derived from the reference model config, so other
+    # actor_model_config settings (e.g. a different model_id or checkpoint) are ignored; the LoRA actor
+    # shares base weights with the reference model object.
     role_to_mesh = self.create_role_to_mesh()
     rollout_config = self.create_rollout_config(role_to_mesh=role_to_mesh)
     reference_model_config = self._mutable_config_mapping(
@@ -530,6 +627,19 @@ class GrpoPipeline(config.HyperParameters):
     )
 
   def compute_params(self, dataset):
+    # [FUNCTION DOC]
+    # Derives training step counts and fills optimizer scheduling defaults in the live config.
+    # Input: the raw dataset. Logic: takes rl_training_config.max_steps if truthy; otherwise ValueError if
+    # the dataset has no length. Computes dataset length; num_batches from config or dataset length
+    # integer-divided by batch_size (default 1), stored back into config. num_train_epochs defaults to 1;
+    # train_fraction defaults to 0.8 when falsy. allowed steps = int(num_batches * epochs * fraction);
+    # max_steps defaults to it, and a larger explicit max_steps raises ValueError. Stores max_steps.
+    # If actor_optimizer_config exists it must be a mutable mapping (ValueError otherwise); missing
+    # decay_steps is set to max_steps, missing warmup_steps to config warmup_steps or warmup_ratio
+    # (default 0.1) times max_steps. Logs the result. Output: none.
+    # KNOWN ISSUE: the out-of-range check for train_fraction uses "<= 0 and > 1", which can never be
+    # true; len is called even when max_steps is given and the dataset has no length (TypeError); the
+    # 0.8 default here differs from the 1.0 default used when the dataset is split in the run method.
     rl_training_config = self._mutable_config_mapping("rl_training_config")
 
     # Return early if max_steps is already specified.
@@ -604,17 +714,30 @@ class GrpoPipeline(config.HyperParameters):
   # ------------------------------------------------------------------
 
   def _get_tokenizer(self):
+    # [FUNCTION DOC]
+    # HELPER: creates the tokenizer from tokenizer_config using its tokenizer_path.
     return model_lib.create_tokenizer(
         self.config["tokenizer_config"],
         self.config["tokenizer_config"]["tokenizer_path"],
     )
 
   def _get_data_module(self,):
+    # [FUNCTION DOC]
+    # HELPER: imports and caches the module named by config["data_module"]; returns it.
     if self.data_module is None:
       self.data_module = importlib.import_module(self.config["data_module"])
     return self.data_module
 
   def _get_dataset(self, tokenizer):
+    # [FUNCTION DOC]
+    # HELPER: loads the training dataset. apply_chat_template_to_dataset must be set (ValueError if
+    # None). If data_module is set, loads via the dynamic module loader with the tokenizer, the
+    # templating flag and data_config kwargs. Otherwise by data_source: "local" uses the math example
+    # loader with data_directory; "tfds" uses dataset_name, tfds_download and train_split (falling back
+    # to split, then "train"); "huggingface" uses dataset_name and the same split logic; other sources
+    # raise ValueError. Output: the dataset.
+    # KNOWN ISSUE: the tfds branch does not pass the tokenizer, so chat templating there always uses the
+    # fixed text template.
     apply_chat_template_to_dataset = self.config.get(
         "apply_chat_template_to_dataset"
     )
@@ -668,6 +791,11 @@ class GrpoPipeline(config.HyperParameters):
   # ------------------------------------------------------------------
 
   def _create_agentic_grpo_config(self):
+    # [FUNCTION DOC]
+    # HELPER: builds the agentic GRPOConfig from agentic_grpo_config. If episode_timeout is absent and
+    # per_turn_timeout_secs is given, episode_timeout = per-turn timeout times max_turns (default 1);
+    # per_turn_timeout_secs is removed when episode_timeout is absent. max_response_length defaults to
+    # rollout_config.total_generation_steps (default 8192). max_turns and any non-field keys are dropped.
     """Build GRPOConfig (agentic) from the agentic_grpo_config YAML section."""
     from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig  # pylint: disable=g-import-not-at-top
 
@@ -692,6 +820,9 @@ class GrpoPipeline(config.HyperParameters):
     return GRPOConfig(**{k: v for k, v in cfg.items() if k in valid})
 
   def _create_chat_parser(self, tokenizer: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: returns a Qwen chat template parser when chat_parser_config.type is "qwen", otherwise the
+    # default chat template parser, both wrapping the tokenizer.
     """Instantiate a chat parser based on chat_parser_config.type."""
     from tunix.rl.agentic.parser.chat_template_parser import parser as chat_parser_lib  # pylint: disable=g-import-not-at-top
 
@@ -703,6 +834,9 @@ class GrpoPipeline(config.HyperParameters):
     return chat_parser_lib.DefaultChatTemplateParser(tokenizer)
 
   def _load_class_from_path(self, dotted_path: str) -> type[Any]:
+    # [FUNCTION DOC]
+    # HELPER: imports a class from "package.module.ClassName" (split at the last dot). Raises
+    # ValueError without a dot, ImportError/AttributeError if not found.
     """Load a Python class from a dotted module path.
 
     Args:
@@ -715,6 +849,9 @@ class GrpoPipeline(config.HyperParameters):
     return getattr(importlib.import_module(module_path), class_name)
 
   def _load_raw_dataset(self, tokenizer):
+    # [FUNCTION DOC]
+    # HELPER: loads the dataset (see the dataset loader) and, if data_module is configured, its optional
+    # module-level batch_fn. Output: (dataset, batch_fn or None).
     """Load a raw grain.MapDataset from data_module.
 
     The module must expose ``create_dataset(**data_config) -> grain.MapDataset``
@@ -737,6 +874,11 @@ class GrpoPipeline(config.HyperParameters):
     return dataset, batch_fn
 
   def _setup_kubernetes(self) -> None:
+    # [FUNCTION DOC]
+    # HELPER: if kubernetes_config is non-empty, sets KUBECONFIG (default "~/.kube/config"),
+    # NODE_SELECTOR_KEY (default GKE nodepool label) and NODE_SELECTOR_VAL (default "deepswe-cpu-pool")
+    # env vars, then tries to load the kube config and create a CoreV1 client (result discarded);
+    # any failure is logged as a warning. Side effects: environment mutation.
     k8s_cfg = self._config_mapping("kubernetes_config")
     if not k8s_cfg:
       return
@@ -761,6 +903,18 @@ class GrpoPipeline(config.HyperParameters):
   # ------------------------------------------------------------------
 
   def _run(self, mode: str = "grpo"):
+    # [FUNCTION DOC]
+    # HELPER: executes training for the given mode. Sets up Kubernetes, tokenizer, chat parser, raw
+    # dataset and batch fn; computes step parameters; post-processes the dataset (batch size, num
+    # batches, rollout max_prompt_length, train_fraction default 1.0, num_train_epochs default 1,
+    # prompt_key default "prompts", custom batch fn) keeping only the training split; builds the RL
+    # cluster. Mode "grpo": trains a GrpoLearner with config reward functions and GrpoConfig from
+    # grpo_config. Mode "agentic_grpo": builds the agentic config, optional reward functions (only if
+    # reward_functions is set), chat parser, optional agent class/kwargs and env class/kwargs loaded from
+    # dotted paths, and trains the agentic GRPOLearner. Other modes raise ValueError (after all setup).
+    # Side effects: full training run.
+    # KNOWN ISSUE: the docstring describes only agentic training; an unsupported mode is detected only
+    # after models and data are loaded.
     """Execute agentic GRPO training (DeepScaleR, DeepSWE, etc.)."""
     self._setup_kubernetes()
 
@@ -841,12 +995,17 @@ class GrpoPipeline(config.HyperParameters):
   # ------------------------------------------------------------------
 
   def run_grpo_trainer(self):
+    # [FUNCTION DOC]
+    # Runs training for config training_mode (default "grpo").
     """Dispatch to standard or agentic GRPO based on training_mode."""
     mode = self.config.get("training_mode", "grpo")
     self._run(mode=mode)
 
 
 def _setup_jax_pathways(pathways_bns: str):
+  # [FUNCTION DOC]
+  # HELPER: sets the pathways_ifrt flag, the JAX XLA backend to "pathways" and the backend target to
+  # the given address. Side effects: global JAX/flag state.
   """Sets up Jax with Pathways."""
   flags.FLAGS.pathways_ifrt = True
   jax.config.update("jax_xla_backend", "pathways")
@@ -854,12 +1013,17 @@ def _setup_jax_pathways(pathways_bns: str):
 
 
 def _setup_pathways_on_cloud():
+  # [FUNCTION DOC]
+  # HELPER: imports pathwaysutils and initializes it (Pathways on Cloud). ImportError if missing.
   import pathwaysutils  # type: ignore[import-not-found,import-untyped]  # pytype: disable=import-error  # pyright: ignore[reportMissingImports]  # pylint: disable=g-import-not-at-top
 
   pathwaysutils.initialize()
 
 
 def main(argv, **kwargs):
+  # [FUNCTION DOC]
+  # CLI main: configures Pathways via BNS when the flag is set, and Pathways-on-Cloud when
+  # JAX_PLATFORMS equals "proxy"; builds the pipeline from argv/kwargs, logs its config and runs training.
   if _PATHWAYS_BNS.value:
     _setup_jax_pathways(_PATHWAYS_BNS.value)
 

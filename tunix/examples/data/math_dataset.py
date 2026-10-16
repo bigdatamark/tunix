@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# GSM8K-style math dataset loading for RL (GRPO) examples. Loads data from TFDS (gsm8k),
+# HuggingFace Datasets, or a local parquet file into grain datasets and optionally formats each
+# record into a prompt containing a system prompt that asks for reasoning between reasoning tags
+# and a single numeric answer between answer tags. Module constants: the four tag strings, the
+# system prompt text, and a Gemma chat-turn template with system_prompt and question placeholders.
+# Side effects at import: imports the TFDS gsm8k builder module to register it.
+
 import logging
 import os
 
@@ -42,6 +50,9 @@ TEMPLATE = """<start_of_turn>user
 
 
 def extract_hash_answer(text: str) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: extracts a GSM8K answer: returns None if the text has no "####"; otherwise the text
+  # between the first and second "####" occurrence (i.e. after the first one), stripped, with commas removed.
   if "####" not in text:
     return None
   return text.split("####")[1].strip().replace(",", "")
@@ -54,6 +65,16 @@ def apply_template(
     tokenize=False,
     add_generation_prompt=True,
 ):
+  # [FUNCTION DOC]
+  # Formats each record of a dataset into prompt/question/answer.
+  # Inputs: dataset (anything with map), tokenizer (optional), tokenize flag, add_generation_prompt flag.
+  # Logic: if the tokenizer exists and has apply_chat_template, formatting uses it with a system
+  # message (system prompt) and a user message (question) and the given flags; otherwise uses the
+  # module template filled with the system prompt and question. Logs which path is taken. Each
+  # record is copied to a dict, bytes values decoded as UTF-8, the question sanitized of control
+  # tokens, and mapped to "prompts" (formatted), "question" (sanitized) and "answer" (hash answer
+  # extraction of the record's answer).
+  # Output: the mapped dataset. Exceptions: KeyError if question/answer missing. Side effects: logging.
   """Applies chat template with tokenizer to dataset."""
 
   _apply_template = None
@@ -74,6 +95,8 @@ def apply_template(
     )
 
   def _process_element(x):
+    # [FUNCTION DOC]
+    # HELPER: per-record mapping described in the enclosing function's doc.
     item = dict(x)
     for key, value in item.items():
       if isinstance(value, bytes):
@@ -96,6 +119,11 @@ def get_tfds_dataset(
     split: str,
     shuffle_seed: int = 42,
 ) -> grain.MapDataset:
+  # [FUNCTION DOC]
+  # Loads a TFDS dataset split as a shuffled grain MapDataset. Creates data_dir if given and
+  # missing; opens the split as an ArrayRecord TFDS data source with the download flag; wraps it in
+  # a MapDataset source and shuffles with shuffle_seed. Output: MapDataset. Side effects: directory
+  # creation, downloads.
   """Get dataset from tfds.
 
   Args:
@@ -126,6 +154,9 @@ def get_tfds_dataset(
 def _parse_huggingface_dataset_name(
     dataset_name: str,
 ) -> tuple[str, str | None]:
+  # [FUNCTION DOC]
+  # HELPER: parses a HF dataset spec. "name:config" returns (name, config or None if empty);
+  # otherwise a name containing "/" returns (name, "default"); otherwise (name, None).
   """Parses a Hugging Face dataset name into dataset/config components."""
   if ":" in dataset_name:
     name, config_name = dataset_name.split(":", maxsplit=1)
@@ -142,6 +173,9 @@ def get_huggingface_dataset(
     split: str,
     shuffle_seed: int = 42,
 ) -> grain.MapDataset:
+  # [FUNCTION DOC]
+  # Loads a HuggingFace dataset split. Parses name/config, loads the split, shuffles it with the
+  # seed, and wraps it as a grain MapDataset source. Output: MapDataset. Side effects: downloads.
   """Gets a dataset from Hugging Face Datasets."""
   hf_dataset_name, config_name = _parse_huggingface_dataset_name(dataset_name)
   data = hf_datasets.load_dataset(
@@ -161,6 +195,18 @@ def create_dataset(
     split: str = "train",
     apply_chat_template_to_dataset: bool = False,
 ):
+  # [FUNCTION DOC]
+  # Creates a math dataset from a source.
+  # Inputs: data_source ("local", "huggingface", "tfds"); dataset (parquet path, HF name, or "gsm8k");
+  # tokenizer; tfds_download; split (default "train"); apply_chat_template_to_dataset.
+  # Logic: "local" with a ".parquet" path builds a grain ParquetIterDataset; "huggingface" loads via
+  # the HF loader; "tfds" with "gsm8k" loads via TFDS using data dir "./data/<split>" when
+  # downloading, else None; anything else raises ValueError. If templating is requested, applies
+  # the prompt template (untokenized).
+  # Output: grain MapDataset or ParquetIterDataset (unbatched). Exceptions: ValueError.
+  # Side effects: downloads, directory creation, logging.
+  # KNOWN ISSUE: the docstring says "batched" and mentions directories for local data, but nothing
+  # is batched and only paths ending in ".parquet" are accepted for "local".
   """Creates a dataset based on the given name.
 
   Args:
