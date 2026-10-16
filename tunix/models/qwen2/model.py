@@ -741,6 +741,13 @@ class Attention(nnx.Module):
         def sharded_splash_attn(
             kernel, q_block, k_block, v_block, q_seg_block, kv_seg_block
         ):
+          # [FUNCTION DOC] HELPER: Per-shard flash (splash) attention used when segment ids are present.
+          # Behavior: wraps the per-device query/key/value blocks and the query/key-value segment-id blocks into a splash SegmentIds
+          # record, then maps the precompiled splash kernel over the batch dimension of the blocks.
+          # Inputs: kernel (precompiled splash multi-head attention kernel), q_block/k_block/v_block (per-shard [batch, heads, seq, head_dim]
+          # arrays), q_seg_block and kv_seg_block (per-shard [batch, seq] segment ids; the key/value ids are unsharded along sequence).
+          # Outputs: per-shard attention output with the same layout as q_block. Exceptions: none raised directly. Side effects: none.
+          # Decorated with a shard_map over the mesh so it runs once per device shard.
           seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
           return jax.vmap(kernel)(
               q_block, k_block, v_block, segment_ids=seg_ids
@@ -764,6 +771,11 @@ class Attention(nnx.Module):
             check_rep=False,
         )
         def sharded_splash_attn(kernel, q_block, k_block, v_block):
+          # [FUNCTION DOC] HELPER: Per-shard flash (splash) attention used when no segment ids are given.
+          # Behavior: maps the precompiled splash kernel over the batch dimension of the per-device query/key/value blocks.
+          # Inputs: kernel (precompiled splash attention kernel), q_block (sharded queries), k_block/v_block (keys/values unsharded along sequence).
+          # Outputs: per-shard attention output with the same layout as q_block. Exceptions: none raised directly. Side effects: none.
+          # KNOWN ISSUE: no attention mask is applied on this path, so padding positions are not masked (attn_mask is ignored).
           return jax.vmap(kernel)(q_block, k_block, v_block)
 
         qkv = sharded_splash_attn(
