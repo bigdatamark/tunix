@@ -1,3 +1,32 @@
+# [MODULE DOC]
+# Notebook-style script ("# %%" cells, top-level code) reproducing DeepScaleR: single-turn agentic GRPO
+# training of DeepSeek-R1-Distill-Qwen-1.5B on the DeepScaleR-Preview math dataset, with AIME-2024 as
+# test data, using tunix's agentic GRPOLearner and the math_rewards.math_reward reward. Steps:
+# 1. Configures Python/absl logging to INFO; imports tunix modules inside an etils adhoc reload
+# context if available (else a null context); tries pathwaysutils.initialize() (errors swallowed).
+# 2. Parses known CLI args: batch_size 128, mini_batch_size 128, learning_rate 1e-6, b1 0.9, b2 0.99,
+# weight_decay 0.01, num_batches 312, num_generations 8, beta 0.0, epsilon 0.2, epsilon_high 0.28,
+# max_prompt_length 2048, max_response_length 8192, temperature 0.8, top_p 0.95, top_k None,
+# max_concurrency 768, shuffle_data False, seed 42, loss_agg_mode "token-mean", kl_loss_mode
+# "low_var_kl". Constants: 3 epochs, MAX_STEPS = num_batches * 3, 10% warmup then cosine decay,
+# grad clip 1, block remat, float32 weights, checkpoints every 500 steps keeping 4.
+# 3. ROLLOUT_ENGINE env var (default "sglang_jax"; also vllm, vanilla). For sglang_jax/vllm builds a
+# rollout mesh (4,1) on the first 4 devices and a trainer mesh (4,1) on the last 4 devices; raises
+# ValueError if fewer than 8 devices. Vanilla uses mesh None for both.
+# 4. Chooses internal (gfile) or GCS (fsspec) paths, loads the tokenizer (local model path in g3, HF id
+# otherwise), a default chat template parser, and train/val/test datasets via create_datasets and
+# data_lib.post_init_dataset (50 test batches).
+# 5. Loads reference and actor models from safetensors on the trainer mesh (actor is a separate copy,
+# or LoRA when TRAIN_WITH_LORA, False by default).
+# 6. Builds checkpointing, metrics logger (TensorBoard /tmp/tensorboard/grpo, wandb config from args),
+# AdamW with warmup-cosine schedule chained after clipping, rollout config for the engine (else
+# ValueError), ClusterConfig (train micro batch 2), GRPOConfig, PerfMetricsConfig (traces to
+# /tmp/agentic_perf), RLCluster, GRPOLearner with metric_fn, and trains.
+# KNOWN ISSUE: with ROLLOUT_ENGINE "vanilla" the meshes are None, so model loading on trainer_mesh is
+# expected to fail.
+# KNOWN ISSUE: --shuffle_data uses type=bool; vars(args) is mutated when building the wandb config;
+# bare except clauses swallow all errors; optax is imported twice; GENERATION_CONFIGS, MESH and the
+# ModelAgent/TaskEnvironment/TrajectoryCollectEngine aliases are unused.
 # %%
 
 # [WIP] Reproduction of [Deepscaler](https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2) with Single-turn Agentic framework.
@@ -323,7 +352,16 @@ def create_datasets(
     train_ds_path: str = DEEPSCALER_DATA_PATH,
     test_ds_path: str = AIME_2024_DATA_PATH,
 ):
+  # [FUNCTION DOC]
+  # Reads the training JSON (train_ds_path, default DeepScaleR) and test Parquet (test_ds_path, default
+  # AIME-2024) via file_open into pandas, converts each to a HF Dataset and maps preprocess_fn (adds
+  # question, ground_truth, data_source columns while keeping the originals), optionally shuffles both
+  # with SEED, and wraps each in a grain MapDataset mapped by process_item. Output: (train, test)
+  # MapDatasets of dicts {prompts, question, answer}. Raises KeyError if problem/answer columns are
+  # missing; IO errors propagate.
   def preprocess_fn(example, index):
+    # [FUNCTION DOC]
+    # HELPER: maps a raw row to {question: problem, ground_truth: answer, data_source: "math"}; index unused.
     return {
         "question": example["problem"],
         "ground_truth": example["answer"],
@@ -343,6 +381,10 @@ def create_datasets(
     test_ds = test_ds.shuffle(SEED)
 
   def process_item(item):
+    # [FUNCTION DOC]
+    # HELPER: builds the prompt "<question> Let's think step by step, and put your final answer within
+    # boxed{}." (with a LaTeX backslash before boxed) and returns {prompts, question, answer} using the
+    # original "answer" column.
     question = item["question"]
     answer = item["answer"]
 
@@ -405,6 +447,12 @@ qwen2_ref = params_lib.create_model_from_safe_tensors(
 
 # %%
 def get_lora_model(base_model, model_mesh):
+  # [FUNCTION DOC]
+  # Applies qwix LoRA (rank RANK, alpha ALPHA) with a Gemma-style module regex (q_einsum, kv_einsum,
+  # gate/down/up_proj, attn_vec_einsum) using base_model.get_model_input(), then constrains and writes
+  # back the sharded state under model_mesh. Output: LoRA model. Unused unless TRAIN_WITH_LORA.
+  # KNOWN ISSUE: Qwen2 attention modules use q/k/v/o projection names, so the regex likely only adapts
+  # the MLP projections.
   lora_provider = qwix.LoraProvider(
       module_path=(
           ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj|"
@@ -617,6 +665,13 @@ show_hbm_usage("after RLCluster creation")
 
 # %%
 def metric_fn(prompts, completions, rewards, advantages, **kwargs):
+  # [FUNCTION DOC]
+  # Custom metric function passed to GRPOLearner. Input: rewards (numpy array for one group); other args
+  # ignored. Computes solve_all (all rewards above 0.1), solve_none (all exactly 0), solve_partial
+  # (neither), solve_ratio (fraction above 0.1). Output: dict mapping "rewards/solve_all",
+  # "rewards/solve_none", "rewards/solve_partial" (1 or 0) and "rewards/solve_ratio" to
+  # (value, np.mean) pairs.
+  # KNOWN ISSUE: rewards in (0, 0.1] count as neither solved nor unsolved.
   del prompts, completions, advantages, kwargs
   solve_all = (rewards > 0.1).all()
   solve_none = (rewards == 0).all()

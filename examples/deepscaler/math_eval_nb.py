@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Notebook-style ("# %%" cells) math evaluation for Qwen2-family models (Qwen2.5-1.5B-Instruct,
+# DeepSeek-R1-Distill-Qwen-1.5B, DeepScaleR-1.5B-Preview) on MATH-500 and AIME-2024. Detects an
+# internal "g3" environment (gfile + ecolab adhoc reload, file_open = gfile.Open) or "git" (null
+# context, file_open = fsspec.open, data/models under gs://tunix). Defines answer extraction and
+# grading helpers and Qwen25MathEvaluator, then (top-level) evaluates DeepSeek-R1-Distill-Qwen-1.5B on
+# MATH-500 (prompt 1024, generation 1024, batch 8) and DeepScaleR-1.5B-Preview on AIME-2024 (prompt
+# 2048, generation 32768, batch 1) on a (1,2) ("fsdp","tp") mesh, with temperature 0.6, top_p 0.95,
+# printing accuracy. NUM_BATCHES env var (positive int) limits the number of batches.
+# Side effects: GCS/HF reads, device memory, heavy stdout logging.
 # %%
 from pprint import pprint
 import datasets as datasets_lib
@@ -50,6 +60,9 @@ import re
 
 
 def has_safetensors(path):
+  # [FUNCTION DOC]
+  # HELPER: returns True if any file under path (recursive walk; gfile in g3, else the fsspec filesystem
+  # for the path) ends with ".safetensors", else False.
   if NOTEBOOK_ENV == "g3":
     for _, _, filenames in gfile.Walk(path):
       for filename in filenames:
@@ -68,6 +81,19 @@ def has_safetensors(path):
 
 # Only used for Math500
 def extract_answer_robust(passage: str) -> str:
+  # [FUNCTION DOC]
+  # Extracts a final answer from a model response (used for MATH-500). Empty input gives "".
+  # 1) Finds the first "\boxed", skips whitespace, and if followed by an opening brace returns the
+  # stripped content up to the matching closing brace (brace counting handles nesting).
+  # 2) Otherwise tries, in order, lenient regexes (case-insensitive, dotall): boxed with backslash,
+  # boxed without backslash, boxed content up to a sentence end, and "final answer is"/"answer is"
+  # followed by boxed; uses the last match, strips trailing punctuation and closing parens, and if it
+  # contains a fraction command appends closing braces to balance unmatched opening braces.
+  # 3) Otherwise matches "boxed" followed by up to 200 non-newline chars and cuts at the first of
+  # ".", ")", newline, "The ", "Thus", "Therefore" (checked in that order), then strips punctuation.
+  # Returns "" if nothing matches. Output: str (never None).
+  # KNOWN ISSUE: the local variable stack is unused; step 1 uses only the first boxed occurrence, not the
+  # last.
   if not passage:
     return ""
 
@@ -136,6 +162,16 @@ def extract_answer_robust(passage: str) -> str:
 # only used for AIME-2024
 THOUGHT_DELIMITER_END = "</think>"
 def evaluate_correctness(response: Any, ground_truths: Any) -> bool:
+  # [FUNCTION DOC]
+  # Grades a response for AIME-2024. None or empty response gives False. If "</think>" occurs, the
+  # solution is the text after the first delimiter (the second split segment), else the whole response.
+  # Extracts the answer via math_utils.extract_answer (None gives False). ground_truths None gives
+  # False; a scalar str/float/int is wrapped in a list; each truth is stringified and, if it contains
+  # boxed, replaced by its extracted answer (dropped if extraction fails). Returns True if any processed
+  # truth matches by grade_answer_mathd, grade_answer_sympy or grade_answer_special_handling, else
+  # False. Side effect: prints diagnostics.
+  # KNOWN ISSUE: with multiple "</think>" delimiters only the segment between the first and second is
+  # graded.
   """Evaluate the correctness of a response."""
   if response is None or response == "":
     print(f"{response=} {ground_truths=} IS NOT CORRECT")
@@ -186,6 +222,10 @@ def evaluate_correctness(response: Any, ground_truths: Any) -> bool:
 # %%
 
 class Qwen25MathEvaluator:
+  # [CLASS DOC]
+  # Evaluator holding config (model_config, model_version (HF id), model_path, dataset path, prompt and
+  # generation lengths, sampler_type vanilla|sglang_jax|vllm), a JAX mesh, tokenizer, model and the
+  # chosen sampler (sampler_vanilla, sampler_sglang or sampler_vllm attribute).
 
   def __init__(
       self,
@@ -198,6 +238,10 @@ class Qwen25MathEvaluator:
       max_generation_steps: int = 1024,  # Increased from 512
       sampler_type: str = "vanilla",  # vanilla, vllm, or sglang-jax
   ):
+    # [FUNCTION DOC]
+    # Stores arguments, builds the mesh from mesh_config (default [[1,4],["fsdp","tp"]]) with Auto axis
+    # types, sets tokenizer/model/sampler to None and prints setup info. Raises if the mesh needs more
+    # devices than are available.
     self.model_config = model_config
     self.model_version = model_version
     self.model_path = model_path
@@ -220,6 +264,8 @@ class Qwen25MathEvaluator:
     print(f"Available devices: {jax.devices()}")
 
   def model_from_safe_tensors(self):
+    # [FUNCTION DOC]
+    # HELPER: inside the mesh context, loads the Qwen2 model from safetensors in model_path into self.model.
     print("Loading model from safe tensors...")
     with self.mesh:
       self.model = qwen2_params_lib.create_model_from_safe_tensors(
@@ -227,6 +273,12 @@ class Qwen25MathEvaluator:
       )
 
   def model_from_orbax_ckpt(self):
+    # [FUNCTION DOC]
+    # HELPER: builds an abstract Qwen2 via eval_shape, maps its state to bfloat16 ShapeDtypeStructs with
+    # named shardings, opens an Orbax CheckpointManager at model_path with model_params and
+    # optimizer_state PyTree handlers, restores only model_params at step 160, and merges the restored
+    # state into self.model.
+    # KNOWN ISSUE: the checkpoint step 160 is hard-coded.
     print(f"Loading model from orbax checkpoint {self.model_path}...")
     with self.mesh:
       abs_model: nnx.Module = nnx.eval_shape(
@@ -263,6 +315,15 @@ class Qwen25MathEvaluator:
       self.model = nnx.merge(graphdef, new_state)
 
   def load_model(self):
+    # [FUNCTION DOC]
+    # Loads the HF tokenizer (from model_version in git env, model_path in g3; trust_remote_code), loads
+    # the model from safetensors if any exist under model_path else from the Orbax checkpoint, and
+    # creates the sampler for sampler_type with context prompt + generation + 100: vanilla Sampler with a
+    # KV cache config; sglang_jax (via internal stub module, mem fraction 0.4, radix cache off) or vllm
+    # (internal stub, HBM 0.8, max 30 seqs) with weights synced from the model. Raises ValueError for an
+    # unknown type. Output: dict with model, tokenizer, sampler and config.
+    # KNOWN ISSUE: the returned "sampler" entry is always None because the sampler is stored under
+    # type-specific attribute names; the sglang/vllm branches import internal-only stub modules.
     print("Loading model components...")
 
     print("Loading tokenizer...")
@@ -363,9 +424,19 @@ class Qwen25MathEvaluator:
     }
 
   def load_dataset(self, split: str = "test") -> grain.MapDataset:
+    # [FUNCTION DOC]
+    # Reads the dataset file (JSONL, JSON or otherwise Parquet) via file_open into pandas, converts to a
+    # HF Dataset mapped to {question: problem, answer: answer, data_source: "math"}, prints the first
+    # example, and wraps it in a grain MapDataset mapped by process_item, which builds a chat-templated
+    # prompt string (generation prompt, untokenized): for AIME the question followed by a "think step by
+    # step, boxed answer" instruction, otherwise the instruction followed by the question. Prints the
+    # first formatted prompt. The split argument is only printed. Output: grain MapDataset of dicts
+    # with prompt, question, answer. Raises KeyError if problem/answer columns are missing.
     print(f"Loading {self.dataset} dataset (split: {split})...")
 
     def preprocess_fn(example, idx):
+      # [FUNCTION DOC]
+      # HELPER: maps a raw row to {question, answer, data_source "math"}; idx unused.
       return {
           "question": example["problem"],
           "answer": example["answer"],
@@ -387,6 +458,9 @@ class Qwen25MathEvaluator:
     pprint(test_ds[0])
 
     def process_item(item):
+      # [FUNCTION DOC]
+      # HELPER: builds the chat-templated prompt for one item as described in load_dataset and returns
+      # {prompt, question, answer}.
       question = item["question"]
       answer = item["answer"]
 
@@ -423,6 +497,14 @@ class Qwen25MathEvaluator:
       top_p: float = 0.95,
       seed: int | None = None,
   ) -> list[str]:
+    # [FUNCTION DOC]
+    # Generates completions for a list of prompt strings. Raises RuntimeError if the tokenizer is not
+    # loaded. Computes the longest prompt token length and a safe generation length = min(max generation
+    # steps, cache size - longest prompt - 100) with cache size = prompt + generation + 100, warning if
+    # below 256. Uses the first token id of "<|im_end|>" as EOS for vanilla. Calls the selected sampler
+    # (vanilla with a PRNGKey from seed; sglang_jax with integer seed and padded output; vllm with no seed),
+    # without echo. Output: list of generated texts. Raises ValueError for unknown sampler types.
+    # KNOWN ISSUE: a long prompt can make the safe length zero or negative, which is passed through.
     if self.tokenizer is None:
       raise RuntimeError(
           "Model components not loaded. Call load_model() first."
@@ -491,6 +573,18 @@ class Qwen25MathEvaluator:
       num_passes: int = 1,
       debug_first_n: int = 3,  # NEW: Debug first N examples
   ) -> Dict[str, Any]:
+    # [FUNCTION DOC]
+    # Runs the evaluation: prints config, loads the dataset, batches it (optionally truncated to
+    # num_batches), and for each batch generates num_passes responses per prompt (seed = pass index except
+    # for vllm). For each question, iterates responses until one is correct: AIME datasets use
+    # evaluate_correctness; others use extract_answer_robust then grade_answer_mathd or grade_answer_sympy.
+    # A question counts as correct if the last graded response is correct. Prints detailed debug output
+    # for the first debug_first_n questions and progress every 10. Output: dict with correct, total,
+    # accuracy (percent, 0 if empty), sampling settings, num_passes and detailed_results (question,
+    # answer, responses, extracted answers, correct).
+    # KNOWN ISSUE: for AIME the extracted_answers list stays empty, so per-response debug output is skipped;
+    # the "first 300 chars" debug label prints the full prompt; the None check on extract_answer_robust's
+    # result never triggers because it returns "" instead.
     print("=" * 60)
     print("Starting Evaluation")
     print("=" * 60)

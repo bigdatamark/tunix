@@ -163,11 +163,11 @@ class FilterSphinxWarnings(logging.Filter):
 
 
 def setup(app):
-# [FUNCTION DOC]
-# Sphinx extension hook. Gets the "sphinx" logger, finds handlers that are Sphinx WarningStreamHandler
-# instances, takes the first, and inserts a FilterSphinxWarnings(app) at position 0 of its filters.
-# Inputs: app (Sphinx application). Output: none. Raises ValueError (unpacking) if no
-# WarningStreamHandler is attached. Side effect: mutates global logging handler filters.
+  # [FUNCTION DOC]
+  # Sphinx extension hook. Gets the "sphinx" logger, finds handlers that are Sphinx WarningStreamHandler
+  # instances, takes the first, and inserts a FilterSphinxWarnings(app) at position 0 of its filters.
+  # Inputs: app (Sphinx application). Output: none. Raises ValueError (unpacking) if no
+  # WarningStreamHandler is attached. Side effect: mutates global logging handler filters.
   """Set up custom logging filters."""
   logger = logging.getLogger("sphinx")
   warning_handler, *_ = [
