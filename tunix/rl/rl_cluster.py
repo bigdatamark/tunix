@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Client-facing RL cluster abstraction. Defines Mode (train/eval), Role
+# (actor, critic, reference, reward, rollout), RLTrainingConfig (training
+# config with RL batch-size knobs), ClusterConfig (meshes per role, rollout
+# engine choice and configs, CPU offload), and RLCluster, which loads and
+# places all models on their meshes, decides which roles share weights,
+# builds the rollout engine (vanilla, vLLM, sglang-jax or a custom
+# BaseRollout), an inference worker for critic/reference/reward models and
+# RL trainers for actor and critic, and exposes generation, log-prob, value
+# and reward computation, weight sync, CPU offloading and step-keyed metric
+# buffering/logging. Aliases: ModelOrPath, MetricsT, MetricsBuffer.
 """Client facing abstraction for interacting with RL training cluster."""
 
 import collections
@@ -63,16 +74,25 @@ MetricsBuffer = perf_metrics.MetricsBuffer
 
 
 class Mode(enum.Enum):
+  # [CLASS DOC]
+  # Enum of workload mode with values "train" and "eval"; used to select the
+  # rollout config and the metrics buffer.
   """Mode of RolloutConfig."""
 
   TRAIN = "train"
   EVAL = "eval"
 
   def __str__(self):
+    # [FUNCTION DOC]
+    # Returns the enum value string ("train" or "eval").
     return self.value
 
 
 class Role(enum.Enum):
+  # [CLASS DOC]
+  # Enum of model roles: ACTOR (policy being trained), CRITIC (value model, PPO
+  # only), REFERENCE (frozen policy for KL), REWARD (reward model), ROLLOUT
+  # (generation copy of the policy). Values are lowercase names.
   """Role of the model."""
 
   ACTOR = "actor"  # policy model
@@ -84,6 +104,17 @@ class Role(enum.Enum):
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class RLTrainingConfig(peft_trainer.TrainingConfig):
+  # [CLASS DOC]
+  # Slotted keyword-only dataclass extending peft_trainer.TrainingConfig.
+  # Fields: actor_optimizer (required optax transform), critic_optimizer
+  # (optional), mini_batch_size (prompts per optimizer update),
+  # train_micro_batch_size (prompts per gradient-accumulation micro step),
+  # rollout_micro_batch_size and compute_logps_micro_batch_size (prompts per
+  # generation / log-prob chunk). All optional sizes must be positive ints.
+  # KNOWN ISSUE: the docstring states the divisibility relations backwards (the
+  # full batch must be divisible by mini_batch_size, and mini_batch_size by
+  # train_micro_batch_size); it also says the critic uses the actor optimizer
+  # when critic_optimizer is None, but the critic trainer is given None.
   """RLTraining config.
 
   Attributes:
@@ -109,6 +140,13 @@ class RLTrainingConfig(peft_trainer.TrainingConfig):
   compute_logps_micro_batch_size: int | None = None
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Validates each optional batch size is a positive int (ValueError
+    # otherwise). Raises ValueError if gradient_accumulation_steps was set by the
+    # user. If train_micro_batch_size is set: requires mini_batch_size
+    # (ValueError), requires mini_batch_size divisible by it (ValueError), and
+    # sets gradient_accumulation_steps to their quotient (mutation).
+    # Does not call the parent __post_init__.
     """Validates the configuration after initialization."""
     for name in [
         "mini_batch_size",
@@ -144,6 +182,17 @@ class RLTrainingConfig(peft_trainer.TrainingConfig):
 
 @dataclasses.dataclass(kw_only=True, frozen=True)
 class ClusterConfig:
+  # [CLASS DOC]
+  # Frozen keyword-only dataclass. Fields: role_to_mesh (dict Role to Mesh;
+  # same meshes mean colocated roles), role_to_logical_axis_rule (optional
+  # dict Role to logical axis rules), rollout_engine ("vanilla", "vllm",
+  # "sglang_jax", a BaseRollout subclass, or a functools.partial of one;
+  # default "vanilla"), offload_to_cpu (default False), training_config
+  # (RLTrainingConfig, required), rollout_config (RolloutConfig or dict Mode
+  # to RolloutConfig; must include TRAIN).
+  # KNOWN ISSUE: the docstring documents rollout_vllm_* attributes that are not
+  # fields here (they live in RolloutConfig). The role_to_mesh dict is
+  # mutated by RLCluster despite the frozen dataclass.
   """Cluster config.
 
   Attributes:
@@ -181,6 +230,17 @@ class ClusterConfig:
 
 
 class RLCluster:
+  # [CLASS DOC]
+  # Owns all models and services for an RL run. Public attributes:
+  # cluster_config, perf_config, r2m (role to mesh dict, same object as the
+  # config's), tokenizer (TokenizerAdapter), global_steps (int, starts at 0).
+  # Properties: rollout, inference_worker, actor_trainer, critic_trainer
+  # (AttributeError when no separate critic trainer exists), perf, perf_v2.
+  # Private state: backbone sharing map (role to list of roles sharing the
+  # same weights), anchor policy state (pinned-host snapshot of actor weights
+  # from the last sync, used for old log-probs), default memory kind, metrics
+  # logger, buffered train/eval metric buffers (list of MetricsBuffer keyed by
+  # global step), optional external metrics logger.
   """RLCluster."""
 
   def __init__(
@@ -194,6 +254,22 @@ class RLCluster:
       cluster_config: ClusterConfig,
       perf_config: perf_metrics.PerfMetricsConfig | None = None,
   ):
+    # [FUNCTION DOC]
+    # Keyword-only inputs: actor (nnx module; paths unsupported), optional
+    # critic, reference and reward models, tokenizer, cluster_config, optional
+    # perf_config. Steps: build the backbone sharing map; load the train actor
+    # on the actor mesh. Raises ValueError if rollout_config is None or is a dict
+    # lacking a TRAIN entry. Rollout actor: same object as train actor if actor
+    # and rollout meshes match; for the vanilla engine a separately loaded copy
+    # on the rollout mesh cast to the TRAIN rollout data_type; otherwise the
+    # train actor (initial weights for external engines). Loads reference (warns
+    # if colocated with a LoRA actor but not sharing backbone), critic (and, if
+    # critic shared backbone with the actor, copies non-LoRA actor state into
+    # it) and reward models. Wraps the tokenizer, creates the metrics logger and
+    # empty buffers, calls _init_cluster, runs garbage collection, and sets
+    # global_steps to 0.
+    # KNOWN ISSUE: Role.CRITIC is never added to the sharing map, so the critic
+    # backbone-copy branch is dead code.
     self.cluster_config = cluster_config
     self.perf_config = perf_config
     self.r2m = cluster_config.role_to_mesh
@@ -272,6 +348,13 @@ class RLCluster:
       actor: ModelOrPath,
       reference: ModelOrPath | None = None,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Creates a defaultdict(list) sharing map. If actor and rollout meshes
+    # are equal, marks ACTOR and ROLLOUT as sharing. Returns early if actor (or
+    # a given reference) is not an nnx module. If the actor has LoRA enabled and
+    # a reference is given on the same mesh as the actor, marks ACTOR and
+    # REFERENCE as sharing (they share the base weights). Then propagates so
+    # every role sharing with ACTOR also shares with the others.
     """Initializes the backbone sharing map."""
     self._backbone_sharing_map: dict[Role, list[Role]] = (
         collections.defaultdict(list)
@@ -305,6 +388,16 @@ class RLCluster:
       mesh: Mesh,
       data_type: jnp.dtype | None = None,
   ) -> nnx.Module:
+    # [FUNCTION DOC]
+    # HELPER: Inputs: model (must be an nnx module, else NotImplementedError),
+    # mesh, optional data_type. Determines the model's current mesh and whether
+    # any parameter is in default (device) memory. If the target mesh is
+    # non-empty and differs, builds NamedShardings on the target mesh from the
+    # variables' partition specs (empty spec when None), keeping device memory
+    # or pinned host, optionally casts to data_type (if different from the first
+    # leaf's dtype), reshards and merges a new model. Then, if on device and
+    # offload_to_cpu is set, moves parameters to pinned host. Returns the model.
+    # KNOWN ISSUE: data_type casting only happens when resharding is needed.
     """Loads model with given mesh to the given memory_kind.
 
     If input is already an NNX model, check if the model is sharded on the
@@ -361,6 +454,32 @@ class RLCluster:
       raise NotImplementedError("Loading from path is not supported yet.")
 
   def _init_cluster(self):
+    # [FUNCTION DOC]
+    # HELPER: Builds services. 1) Validates a string rollout_engine is vanilla,
+    # vllm or sglang_jax (ValueError). KV cache size is the max over TRAIN and
+    # EVAL configs. vanilla: requires the rollout actor to have a config
+    # (ValueError), loads it from CPU if offloading, creates VanillaRollout with
+    # a CacheConfig from the model config (layers, kv heads, head dim), then
+    # offloads. vllm: uses the TRAIN config, creates VllmRollout within the
+    # rollout mesh / logical-axis context with max_model_len = KV cache size.
+    # sglang_jax: raises ValueError if the actor uses LoRA without static LoRA
+    # enabled; creates SglangJaxRollout. Custom class or partial of a
+    # BaseRollout subclass: called with rollout_actor, tokenizer, mesh and the
+    # TRAIN config. Anything else raises NotImplementedError. If the engine
+    # exposes a non-None mesh, it replaces the rollout mesh. 2) Perf tracers are
+    # no-op unless perf_config provides v1/v2 export functions, in which case
+    # tracers over all devices of all meshes are created (v2 treats rollout and
+    # environment spans as concurrent). 3) Creates the InferenceWorker with the
+    # available critic, reference and reward models (deleting the reference and
+    # reward attributes). 4) If a critic exists and does not share the actor
+    # backbone, creates the critic Trainer (deep-copied config with prefix
+    # "critic", checkpoint subdirectory "critic", critic optimizer, metadata
+    # global_step + 1 and role) and offloads it; deletes the critic attribute.
+    # 5) Creates the actor Trainer likewise (prefix/subdirectory "actor"), deletes
+    # rollout_actor and train_actor attributes, offloads the actor if enabled,
+    # and snapshots the actor state to pinned host as the anchor policy state.
+    # KNOWN ISSUE: the vLLM check for a None model version can never trigger
+    # because the default is an empty string.
     """Initializes the RL cluster."""
     # 1. Initialize rollout.
     if isinstance(
@@ -589,6 +708,9 @@ class RLCluster:
     )
 
   def _propagate_backbone_sharing_map(self):
+    # [FUNCTION DOC]
+    # HELPER: For every pair of distinct roles that both share with ACTOR, adds
+    # each to the other's sharing list (may add duplicates if called twice).
     """Propagates backbone sharing map."""
     for role in self._backbone_sharing_map[Role.ACTOR]:
       for other_role in self._backbone_sharing_map[Role.ACTOR]:
@@ -596,6 +718,10 @@ class RLCluster:
           self._backbone_sharing_map[role].append(other_role)
 
   def _put_model_on_memory_kind(self, model: nnx.Module, memory_kind: str):
+    # [FUNCTION DOC]
+    # HELPER: Moves all of the model's variables to memory_kind ("pinned_host" or
+    # "device"; ValueError otherwise) via put_params_on_memory_kind and updates
+    # the model in place.
     """Puts model on the given memory kind."""
     if memory_kind not in ["pinned_host", "device"]:
       raise ValueError(f"Unsupported memory kind. Received: {memory_kind}")
@@ -610,6 +736,12 @@ class RLCluster:
       params: jaxtyping.PyTree,
       role: Role,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Propagates params of the model playing role to every role sharing
+    # weights with it: ROLLOUT gets an nnx update of rollout_actor if it still
+    # exists, else rollout.update_params; REFERENCE gets the non-LoRA part of the
+    # params (from the attribute or the inference worker model); ACTOR gets an
+    # nnx update of the train actor or trainer model.
     """Updates models sharing weights."""
     for role in self._backbone_sharing_map[role]:
       if role == Role.ROLLOUT:
@@ -637,6 +769,9 @@ class RLCluster:
         nnx.update(actor_model, params)
 
   def _is_state_on_device(self, state: jaxtyping.PyTree) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns true if any leaf of the state has a sharding whose memory
+    # kind is the default (device) memory kind; false for empty states.
     shardings = jax.tree.map(
         lambda x: x.sharding if hasattr(x, "sharding") else None, state
     )
@@ -651,6 +786,9 @@ class RLCluster:
     )
 
   def _maybe_load_model_from_cpu(self, model: nnx.Module, role: Role):
+    # [FUNCTION DOC]
+    # HELPER: If offload_to_cpu is enabled, moves the model to device memory and
+    # pushes its state to roles sharing weights; otherwise does nothing.
     """Loads model from CPU if needed."""
     if not self.cluster_config.offload_to_cpu:
       return
@@ -658,6 +796,9 @@ class RLCluster:
     self._update_models_sharing_weights(nnx.state(model), role)
 
   def _maybe_offload_model_to_cpu(self, model: nnx.Module, role: Role):
+    # [FUNCTION DOC]
+    # HELPER: If offload_to_cpu is enabled, moves the model to pinned host memory
+    # and pushes its state to roles sharing weights; otherwise does nothing.
     """Offloads model to CPU if needed."""
     if not self.cluster_config.offload_to_cpu:
       return
@@ -666,31 +807,46 @@ class RLCluster:
 
   @property
   def rollout(self) -> base_rollout.BaseRollout:
+    # [FUNCTION DOC]
+    # Property: the rollout engine.
     return self._rollout
 
   @property
   def inference_worker(self) -> inference_worker.InferenceWorker:
+    # [FUNCTION DOC]
+    # Property: the inference worker holding critic/reference/reward models.
     return self._inference_worker
 
   @property
   def actor_trainer(self) -> rl_trainer.Trainer:
+    # [FUNCTION DOC]
+    # Property: the actor Trainer.
     return self._actor_trainer
 
   @property
   def critic_trainer(self) -> rl_trainer.Trainer:
+    # [FUNCTION DOC]
+    # Property: the critic Trainer; raises AttributeError if none was created.
     return self._critic_trainer
 
   @property
   def perf(self) -> perf_trace.Tracer:
+    # [FUNCTION DOC]
+    # Property: the v1 perf tracer (no-op by default).
     """The v1 performance tracer."""
     return self._perf
 
   @property
   def perf_v2(self) -> perf_tracer_v2.Tracer:
+    # [FUNCTION DOC]
+    # Property: the v2 perf tracer (no-op by default).
     """The v2 performance tracer."""
     return self._perf_v2
 
   def close(self):
+    # [FUNCTION DOC]
+    # Logs all remaining buffered train and eval metrics, then closes the actor
+    # trainer and, if present, the critic trainer.
     for m in self._buffered_train_metrics + self._buffered_eval_metrics:
       self._log_metrics(m)
     self.actor_trainer.close()
@@ -698,6 +854,15 @@ class RLCluster:
       self.critic_trainer.close()
 
   def _log_metrics(self, metrics_buffer: MetricsBuffer) -> None:
+    # [FUNCTION DOC]
+    # HELPER: For each metric (name to pair of value list and aggregation):
+    # converts values to a NumPy array (skips with a warning if that fails);
+    # string arrays, or object arrays whose first element is a string, are
+    # logged as info text and skipped; otherwise applies the aggregation when
+    # present and the array is non-empty. Splits the name at the first "/" into
+    # prefix and name (prefix "global" if none) and logs via the metrics logger
+    # with the buffer's mode and global step. Finally passes the whole buffer to
+    # the external metrics logger if set.
     """Log metrics."""
     for metric_name, (value, op) in metrics_buffer.metrics.items():
       # Convert to numpy array immediately.
@@ -750,6 +915,9 @@ class RLCluster:
   def with_external_metrics_logger(
       self, external_metrics_logger: Callable[[MetricsBuffer], None]
   ):
+    # [FUNCTION DOC]
+    # Sets the external metrics logger callback (receives each MetricsBuffer
+    # after logging) and returns self for chaining.
     self._external_metrics_logger = external_metrics_logger
     return self
 
@@ -758,6 +926,18 @@ class RLCluster:
       metrics: MetricsT,
       mode: Mode = Mode.TRAIN,
   ) -> None:
+    # [FUNCTION DOC]
+    # Inputs: metrics dict (name to pair of value and aggregation or None),
+    # mode. Selects the train or eval buffer list; creates a buffer for the
+    # current global step if the list is empty. If the oldest train buffer's
+    # step differs from the current global step, appends a new train buffer for
+    # the current step and logs (and removes) the oldest train buffer and the
+    # oldest eval buffer if any. Then appends each value to the latest buffer of
+    # the selected list (creating the entry with the aggregation on first use).
+    # KNOWN ISSUE: in EVAL mode with no train buffer yet, indexing the train list
+    # raises IndexError; the new train buffer created on step change is labeled
+    # with the caller's mode (may be "eval"); and eval values are appended to
+    # the latest eval buffer, which may belong to an older step.
     """Buffers rl metrics to be logged.
 
     Actual logging will happen when global steps are incremented.
@@ -803,6 +983,13 @@ class RLCluster:
       mode: Mode = Mode.TRAIN,
       step: int = 0,
   ) -> None:
+    # [FUNCTION DOC]
+    # Like buffer_metrics but keyed by an explicit step (for async producers):
+    # creates a buffer for the current global step if the list is empty, or a new
+    # buffer for step if it differs from the latest buffer's step; appends the
+    # values; then logs and removes the oldest train buffer and the oldest eval
+    # buffer if their step is below the current global step (at most one each
+    # per call).
     """Buffers rl metrics to be logged for async training.
 
     Actual logging will happen when global steps are incremented.
@@ -849,6 +1036,10 @@ class RLCluster:
         self._log_metrics(m)
 
   def update_actor(self, train_ds, eval_ds, skip_jit=False):
+    # [FUNCTION DOC]
+    # Within the actor mesh/axis-rule context: loads the actor from CPU if
+    # offloading, trains the actor trainer on train_ds with optional eval_ds
+    # (inside a perf span group), and offloads again. Returns None.
     with self._get_mesh_and_logical_axis_rules_cm(Role.ACTOR):
       self._maybe_load_model_from_cpu(self.actor_trainer.model, Role.ACTOR)
       with self._perf.span_group("actor_training"):
@@ -856,6 +1047,8 @@ class RLCluster:
       self._maybe_offload_model_to_cpu(self.actor_trainer.model, Role.ACTOR)
 
   def update_critic(self, train_ds, eval_ds, skip_jit=False):
+    # [FUNCTION DOC]
+    # Same as update_actor for the critic trainer within the critic mesh context.
     with self._get_mesh_and_logical_axis_rules_cm(Role.CRITIC):
       self._maybe_load_model_from_cpu(self.critic_trainer.model, Role.CRITIC)
       with self._perf.span_group("critic_training"):
@@ -871,6 +1064,21 @@ class RLCluster:
       trace_tags: Mapping[str, Any] | None = None,
       max_generation_steps: int | None = None,
   ) -> base_rollout.RolloutOutput:
+    # [FUNCTION DOC]
+    # Inputs: prompts (strings, or chat conversations if apply_chat_template),
+    # apply_chat_template flag, mode, optional micro_batch_size, optional perf
+    # trace tags, optional max_generation_steps override. With chat template,
+    # renders each conversation via the tokenizer with a generation prompt and
+    # thinking disabled (ValueError if no tokenizer). Raises ValueError for an
+    # empty prompt list. Within the rollout mesh context: loads the rollout
+    # model from CPU if offloading (and pushes its state into the engine),
+    # selects the rollout config for mode (optionally replacing
+    # max_tokens_to_generate), and calls rollout.generate on consecutive chunks
+    # of micro_batch_size prompts inside perf spans tagged with role "rollout";
+    # then offloads again. Concatenates per-chunk text, logprobs and logits
+    # (None if the first chunk has none), tokens, and left-padded prompt tokens
+    # (concatenated along batch; requires equal widths). Returns a
+    # RolloutOutput.
     """Generates text from the given prompts.
 
     Args:
@@ -980,6 +1188,14 @@ class RLCluster:
       eos_id: int,
       micro_batch_size: int | None = None,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Inputs: prompt and completion token arrays, pad and eos ids, optional micro
+    # batch size. Raises ValueError for an empty batch. Within the reference
+    # mesh context, shards inputs along the training data_sharding_axis, loads
+    # the reference model from CPU if needed, and computes reference per-token
+    # logps chunk by chunk via the inference worker using the TRAIN rollout
+    # temperature; concatenates along batch, offloads, and returns the array
+    # (batch by completion length).
     """Gets the per-token logps of the reference model."""
     batch_size = prompt_tokens.shape[0]
     if batch_size == 0:
@@ -1028,6 +1244,13 @@ class RLCluster:
       completion_tokens: jax.Array,
       micro_batch_size: int | None = None,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Inputs: prompt and completion tokens, optional micro batch size. Raises
+    # ValueError for an empty batch. Within the rollout mesh context, loads the
+    # rollout model from CPU if offloading (syncing the engine), computes
+    # per-token logps chunk by chunk with rollout.get_per_token_logps,
+    # concatenates, offloads again, and returns them. These are the "old"
+    # policy logps from the rollout copy of the model.
     """Gets the per-token logps of the current policy model."""
     batch_size = prompt_tokens.shape[0]
     if batch_size == 0:
@@ -1065,6 +1288,17 @@ class RLCluster:
       micro_batch_size: int | None = None,
       temperature: float | None = None,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Inputs: prompt and completion tokens, pad/eos ids, optional micro batch
+    # size, optional temperature (defaults to the TRAIN rollout temperature).
+    # Raises ValueError for an empty batch or when no anchor policy state exists.
+    # Within the actor mesh context, shards inputs, temporarily offloads the
+    # live actor weights to host if they are on device and offloading is
+    # enabled, moves the anchor (last-synced) state to device memory if needed,
+    # computes stop-gradient per-token logps chunk by chunk with the actor
+    # graph and the anchor state at the given temperature, frees the temporary
+    # copy, restores the actor to device memory if it was moved, and returns
+    # the concatenated logps.
     """Gets per-token logps from the actor model on the trainer side.
 
     Mirrors `get_ref_per_token_logps` — must pass through the rollout temperature
@@ -1142,6 +1376,16 @@ class RLCluster:
       return actor_per_token_logps
 
   def sync_weights(self):
+    # [FUNCTION DOC]
+    # Pushes trainer weights to the rollout engine. On non-TPU/GPU backends
+    # (e.g. CPU) wraps the operation in transfer guards disallowing explicit
+    # host/device transfers; otherwise no guard. Filters actor state to LoRA
+    # params if LoRA is enabled, else all nnx Params; calls
+    # rollout.update_params with them and the filter type tuple; re-snapshots
+    # the full actor state to pinned host as the anchor policy state.
+    # Increments global_steps by one. Returns None.
+    # KNOWN ISSUE: the transfer guards are only active on non-accelerator
+    # backends, which looks inverted relative to their purpose.
     """Syncs the weights of between the sampler model and trainer model."""
     if jax.devices() and jax.default_backend() not in ["tpu", "gpu"]:
       cm = contextlib.ExitStack()
@@ -1172,6 +1416,9 @@ class RLCluster:
       pad_id: int,
       eos_id: int,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Within the critic mesh context returns inference_worker.get_values for the
+    # tokens (per-token values over prompt+completion).
     with self._get_mesh_and_logical_axis_rules_cm(Role.CRITIC):
       return self.inference_worker.get_values(
           prompt_tokens,
@@ -1187,6 +1434,9 @@ class RLCluster:
       pad_id: int,
       eos_id: int,
   ) -> jax.Array:
+    # [FUNCTION DOC]
+    # Within the reward mesh context returns inference_worker.get_rewards for the
+    # tokens (per-token reward-model scores over prompt+completion).
     with self._get_mesh_and_logical_axis_rules_cm(Role.REWARD):
       return self.inference_worker.get_rewards(
           prompt_tokens,
@@ -1196,6 +1446,9 @@ class RLCluster:
       )
 
   def get_rollout_config(self, mode: Mode) -> base_rollout.RolloutConfig:
+    # [FUNCTION DOC]
+    # Returns the rollout config for mode when rollout_config is a dict
+    # (KeyError if missing), else the single config.
     """Returns the rollout config for the given mode."""
     if isinstance(self.cluster_config.rollout_config, dict):
       return self.cluster_config.rollout_config[mode]
@@ -1204,6 +1457,11 @@ class RLCluster:
 
   @contextlib.contextmanager
   def _get_mesh_and_logical_axis_rules_cm(self, role: Role):
+    # [FUNCTION DOC]
+    # HELPER: Generator-based context manager for role: enters the role's mesh
+    # and, if logical axis rules exist for the role, the flax logical axis rules
+    # context (else a null context). Yields a pair of (mesh, rules context
+    # value). Raises KeyError if the role has no mesh.
     """Returns a context manager for the mesh and logical axis rules.
 
     This is used for models that uses logical sharding, so XLA can generate the

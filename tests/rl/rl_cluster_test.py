@@ -217,6 +217,10 @@ class RlClusterTest(parameterized.TestCase):
       expected_perf_type,
       expected_perf_v2_type,
   ):
+    # [FUNCTION DOC]
+    # Verifies the v1 perf tracer is a real PerfTracer only when a v1
+    # custom export fn is configured (else NoopTracer), and likewise for
+    # the v2 tracer with a v2 export fn, on 2D and 3D meshes.
     mesh = Mesh(np.array(jax.devices()).reshape(*reshape_dims), mesh_axes)
     cluster_config = rl_cluster_lib.ClusterConfig(
         role_to_mesh={
@@ -257,6 +261,11 @@ class RlClusterTest(parameterized.TestCase):
     self.assertIsInstance(rl_cluster.perf_v2, expected_perf_v2_type)
 
   def test_batch_size_config(self):
+    # [FUNCTION DOC]
+    # Verifies gradient_accumulation_steps is derived as mini_batch_size /
+    # train_micro_batch_size (8 / 4 = 2), is None when neither is set, and
+    # ValueError is raised when mini is not divisible by micro, mini is
+    # negative, or micro is set without mini.
     cfg = rl_cluster_lib.RLTrainingConfig(
         actor_optimizer=optax.sgd(1e-3),
         critic_optimizer=None,
@@ -285,6 +294,12 @@ class RlClusterTest(parameterized.TestCase):
         )
 
   def test_generate_with_chat_template(self):  # pylint: disable=g-doc-args
+    # [FUNCTION DOC]
+    # With a mock HF tokenizer and rollout.generate replaced by a mock,
+    # verifies generate(apply_chat_template True) formats each message list
+    # via apply_chat_template (generation prompt on, no tokenization,
+    # thinking disabled), passes the formatted strings to rollout.generate
+    # once, and returns its output.
     mesh = Mesh(
         np.array(jax.devices()).reshape(self.device_count, 1), ('fsdp', 'tp')
     )
@@ -361,6 +376,12 @@ class RlClusterTest(parameterized.TestCase):
       rollout_engine: str,
       rollout_config: base_rollout.RolloutConfig,
   ) -> rl_cluster_lib.RLCluster:
+    # [FUNCTION DOC]
+    # HELPER: builds an RLCluster with a toy actor on the first half of
+    # devices (also used for reference) and the rollout role on the second
+    # half, using the given rollout_engine (string, class or partial) and
+    # rollout_config (config, dict, or None); sgd optimizer, max_steps 10.
+    # Propagates any construction error.
     split_index = self.device_count // 2
     actor_mesh = Mesh(
         np.array(jax.devices()[:split_index]).reshape(split_index, 1),
@@ -395,6 +416,8 @@ class RlClusterTest(parameterized.TestCase):
     )
 
   def test_init_cluster_invalid_engine_string(self):
+    # [FUNCTION DOC]
+    # Verifies an unknown engine name raises ValueError.
     with self.assertRaisesRegex(
         ValueError, '`cluster_config.rollout_engine` should be one of'
     ):
@@ -404,6 +427,8 @@ class RlClusterTest(parameterized.TestCase):
 
   @parameterized.parameters('vanilla', 'vllm', 'sglang_jax')
   def test_init_rollout_engine_missing_config_raises_error(self, engine):
+    # [FUNCTION DOC]
+    # Verifies a None rollout_config raises ValueError for each engine.
     with self.assertRaisesRegex(
         ValueError, '`cluster_config.rollout_config` cannot be None.'
     ):
@@ -411,6 +436,9 @@ class RlClusterTest(parameterized.TestCase):
 
   @parameterized.parameters('vanilla', 'vllm', 'sglang_jax')
   def test_init_rollout_engine_empty_dict_config_raises_error(self, engine):
+    # [FUNCTION DOC]
+    # Verifies a dict rollout_config lacking a train entry raises
+    # ValueError for each engine.
     with self.assertRaisesRegex(
         ValueError,
         'Rollout config is a dict but missing a train config.',
@@ -450,6 +478,10 @@ class RlClusterTest(parameterized.TestCase):
   def test_init_vanilla_rollout_engine(
       self, mock_vanilla_cls, rollout_config, expected_cache_size
   ):
+    # [FUNCTION DOC]
+    # With VanillaRollout patched, verifies it is constructed once, becomes
+    # rl_cluster.rollout, and receives a CacheConfig whose size is the KV
+    # cache size (the maximum across modes for a per-mode dict).
     rl_cluster = self._create_test_rl_cluster('vanilla', rollout_config)
 
     mock_vanilla_cls.assert_called_once()
@@ -463,6 +495,9 @@ class RlClusterTest(parameterized.TestCase):
     )
 
   def test_init_vanilla_rollout_engine_missing_model_config(self):
+    # [FUNCTION DOC]
+    # Verifies the vanilla engine raises ValueError when the actor model
+    # has no config attribute.
     split_index = self.device_count // 2
     actor_mesh = Mesh(
         np.array(jax.devices()[:split_index]).reshape(split_index, 1),
@@ -485,8 +520,12 @@ class RlClusterTest(parameterized.TestCase):
 
     # A dummy model without config
     class DummyModel(nnx.Module):
+      # [CLASS DOC]
+      # HELPER: nnx module with one zero parameter and no config attribute.
 
       def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: creates parameter w of shape (1,) filled with zeros.
         self.w = nnx.Param(jnp.zeros((1,)))
 
     with self.assertRaisesRegex(
@@ -528,6 +567,10 @@ class RlClusterTest(parameterized.TestCase):
       rollout_config,
       expected_train_config,
   ):
+    # [FUNCTION DOC]
+    # With MockRollout's initializer patched, verifies passing the
+    # MockRollout class as engine constructs it once and passes the train
+    # rollout config (the train entry when a dict is given).
     with mock.patch.object(
         mock_rollout.MockRollout, '__init__', autospec=True, return_value=None
     ) as mock_init:
@@ -584,6 +627,10 @@ class RlClusterTest(parameterized.TestCase):
       expected_train_config,
       expected_cache_size,
   ):
+    # [FUNCTION DOC]
+    # With VllmRollout patched, verifies it is constructed once with the
+    # train rollout config, an integer cache size (maximum across modes)
+    # and a mesh. Skipped in run_prod.
     # Internal placeholder for vllm rollout worker stub, don't change this line.
     from tunix.rl.rollout import vllm_rollout
 
@@ -603,6 +650,8 @@ class RlClusterTest(parameterized.TestCase):
 
   @unittest.skipIf(is_run_prod, 'Skipping in run_prod')
   def test_init_vllm_rollout_engine_missing_version_raises(self):
+    # [FUNCTION DOC]
+    # Verifies vLLM without rollout_vllm_model_version raises ValueError.
     rollout_config = base_rollout.RolloutConfig(
         rollout_vllm_model_version=None,
     )
@@ -640,6 +689,9 @@ class RlClusterTest(parameterized.TestCase):
   def test_init_sglang_jax_rollout_engine(
       self, rollout_config, expected_train_config
   ):
+    # [FUNCTION DOC]
+    # With SglangJaxRollout patched, verifies it is constructed once with
+    # the train rollout config and a mesh. Skipped in run_prod.
     # Internal placeholder for sglang_jax rollout worker stub, don't change this line.
     from tunix.rl.rollout import sglang_jax_rollout
 
@@ -657,6 +709,9 @@ class RlClusterTest(parameterized.TestCase):
   @unittest.skipIf(is_run_prod, 'Skipping in run_prod')
   @mock.patch.object(rl_cluster_lib.sft_utils, 'is_lora_enabled', autospec=True)
   def test_init_sglang_jax_rollout_engine_lora_error(self, mock_is_lora):
+    # [FUNCTION DOC]
+    # Verifies SGLang-JAX raises ValueError when the actor uses LoRA but
+    # static LoRA is not enabled in the rollout config.
     mock_is_lora.return_value = True
     rollout_config = base_rollout.RolloutConfig(
         rollout_sglang_jax_enable_static_lora=False
@@ -668,7 +723,12 @@ class RlClusterTest(parameterized.TestCase):
       self._create_test_rl_cluster('sglang_jax', rollout_config)
 
   def test_init_cluster_unsupported_engine_type(self):
+    # [FUNCTION DOC]
+    # Verifies a class not derived from BaseRollout raises
+    # NotImplementedError "Rollout engine ... not supported".
     class InvalidEngine:
+      # [CLASS DOC]
+      # HELPER: arbitrary class that is not a rollout engine.
       pass
 
     with self.assertRaisesRegex(
@@ -677,9 +737,21 @@ class RlClusterTest(parameterized.TestCase):
       self._create_test_rl_cluster(InvalidEngine, base_rollout.RolloutConfig())
 
   def test_user_defined_rollout_engine_class(self):
+    # [FUNCTION DOC]
+    # Verifies a user BaseRollout subclass can be passed as the engine,
+    # either as a partial with bound kwargs (my_arg 1) or as the class
+    # itself (my_arg 0); the cluster instantiates it passing rollout_config
+    # as a kwarg, and the ROLLOUT entry of the role-to-mesh map is replaced
+    # by the engine's own mesh property.
     class CustomRolloutEngine(base_rollout.BaseRollout):
+      # [CLASS DOC]
+      # HELPER: minimal rollout engine with fixed outputs and a one-device
+      # mesh.
 
       def __init__(self, my_arg: int = 0, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: stores my_arg and kwargs["rollout_config"] as config;
+        # raises KeyError if rollout_config is not passed.
         self.my_arg = my_arg
         self.config = kwargs['rollout_config']
 
