@@ -57,7 +57,6 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 @dataclasses.dataclass
 class VllmConfig:
-  """Vllm rollout configuations."""
   # [CLASS DOC]
   # Mutable dataclass of vLLM rollout settings.
   # Sampler fields: server_mode (use the in-process driver), mapping_config
@@ -74,6 +73,7 @@ class VllmConfig:
   # tensor_parallel_size, data_parallel_size and expert_parallel_size, which may
   # not appear in engine_kwargs. sampling_kwargs is a dict of default extra
   # SamplingParams attributes.
+  """Vllm rollout configuations."""
 
   # Sampler related
   server_mode: bool = False

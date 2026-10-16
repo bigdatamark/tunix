@@ -1,5 +1,17 @@
 # Copyright 2025 Google LLC
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.export.PerfMetricsExport (perf v1 GRPO metric
+# export): from_cluster_config creates a PerfettoTraceWriter (with trace_dir
+# or None when empty) only when perf metrics options exist and the trace
+# writer is enabled; from_role_to_devices builds an export function that,
+# given a PerfSpanQuery over host and device timelines, returns a dict of
+# metric name to a sequence whose first item is the value, covering
+# global_step/weight_sync times, per-role sum/mean rollout, reference
+# inference and actor training (step) times, and for non-colocated layouts
+# rollout idle time, first micro-batch rollout time and gap metrics; it also
+# logs the trace via the writer when given. time.perf_counter is patched to
+# script device-span end times.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -37,6 +49,12 @@ def _create_mock_cluster_config_with_perf_metrics(
     enable_trace_writer: bool = True,
     perf_metrics_trace_dir: str = "",
 ) -> mock.Mock:
+  # [FUNCTION DOC]
+  # HELPER: builds an autospec'd ClusterConfig whose rollout, actor and
+  # reference roles share a mesh of one mock TPU device, and whose
+  # training_config.perf_metrics_options is either an autospec'd
+  # PerfMetricsOptions with the given trace_dir and enable_trace_writer, or
+  # None when enable_perf_metrics is False. Output: the mock config.
   """Creates a mock ClusterConfig object for testing.
 
   Args:
@@ -80,6 +98,8 @@ def _create_mock_cluster_config_with_perf_metrics(
 
 
 class ExportTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for PerfMetricsExport construction and metrics.
 
   @parameterized.named_parameters(
       dict(
@@ -96,6 +116,9 @@ class ExportTest(parameterized.TestCase):
   def test_from_cluster_config_trace_writer_enabled(
       self, perf_metrics_trace_dir, expected_log_dir
   ):
+    # [FUNCTION DOC]
+    # Verifies from_cluster_config constructs PerfettoTraceWriter with the trace
+    # dir, or None when the dir is empty.
     cluster_config = _create_mock_cluster_config_with_perf_metrics(
         perf_metrics_trace_dir=perf_metrics_trace_dir
     )
@@ -120,6 +143,9 @@ class ExportTest(parameterized.TestCase):
   def test_from_cluster_config_trace_writer_disabled(
       self, enable_perf_metrics, enable_trace_writer
   ):
+    # [FUNCTION DOC]
+    # Verifies no PerfettoTraceWriter is created when the trace writer is
+    # disabled or perf metrics options are None.
     trace_dir = "test_trace_dir"
     cluster_config = _create_mock_cluster_config_with_perf_metrics(
         perf_metrics_trace_dir=trace_dir,
@@ -136,6 +162,11 @@ class ExportTest(parameterized.TestCase):
   def test_export_grpo_metrics_colocated_with_trace_writer(
       self, mock_perf_counter
   ):
+    # [FUNCTION DOC]
+    # Verifies fully colocated layout (all roles on tpu0): builds one global
+    # step with rollout, reference inference and two actor train steps, then
+    # weight sync, and checks global_step_time 1.3, weight_sync_time 0.1, sum and
+    # mean role times, and that log_trace is called once on the trace writer.
     # tpu0 span end times
     mock_perf_counter.side_effect = [0.41, 0.61, 1.21]
     mock_trace_writer = mock.create_autospec(
@@ -223,6 +254,10 @@ class ExportTest(parameterized.TestCase):
   def test_export_grpo_metrics_rollout_1_actor_2_reference_2(
       self, mock_perf_counter
   ):
+    # [FUNCTION DOC]
+    # Verifies rollout on tpu0 with actor and reference on tpu1: in addition to
+    # role times expects rollout_idle_time 0.69, first_micro_batch_rollout_time
+    # 0.41 and zero between-micro-batch gap sum/mean.
     mock_perf_counter.side_effect = [0.41, 0.61, 1.21, 1.21]
 
     export_fn = PerfMetricsExport.from_role_to_devices({
@@ -305,6 +340,10 @@ class ExportTest(parameterized.TestCase):
 
   @patch("time.perf_counter")
   def test_export_grpo_metrics_fully_disaggregated(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies fully disaggregated layout (rollout tpu0, reference tpu1, actor
+    # tpu2): expects role times plus rollout idle/first micro-batch times and
+    # zero refer/actor gap sum/mean.
     mock_perf_counter.side_effect = [0.41, 0.61, 1.21, 1.21, 1.21]
 
     export_fn = PerfMetricsExport.from_role_to_devices({

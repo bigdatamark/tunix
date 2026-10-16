@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# End-to-end tests for tunix.rl.ppo.ppo_learner.PPOLearner on toy
+# transformers: builds an RLCluster with actor, critic (created from the
+# actor), reference and optional reward model on the current physical mesh
+# with the vanilla rollout engine, trains on a tiny grain dataset of
+# strings, and checks parameter updates, step counters, logged metrics, and
+# when generation / log-prob functions are invoked relative to trainer
+# steps. Contains a commented-out iterator test that is not executed.
+# Side effects: sets XLA_FLAGS env var at import; setUpClass sets the CPU
+# device count (DEVICE_COUNTS env var, default 2) via chex and prints it.
+# KNOWN ISSUE: XLA_FLAGS is set after jax is imported, so it likely has no
+# effect.
+
 # import itertools
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -43,28 +56,48 @@ _DUMMY_DATA = [
 
 
 def reward_1(completions, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning 0..n-1 for n completions.
   return jnp.arange(len(completions))
 
 
 def reward_2(prompts, answer, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning 0..n-1 for n answers (answer comes from the
+  # dataset's "answer" field).
   return jnp.arange(len(answer))
 
 
 class MySource(grain.RandomAccessDataSource):
+  # [CLASS DOC]
+  # HELPER: random-access grain source over a list of strings (default the
+  # four dummy strings) repeated repeat times.
 
   def __init__(self, data=None, repeat=1):
+    # [FUNCTION DOC]
+    # HELPER: stores data (default _DUMMY_DATA) concatenated repeat times.
     if data is None:
       data = _DUMMY_DATA
     self._data = data * repeat
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the item at idx.
     return self._data[idx]
 
   def __len__(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the number of stored items.
     return len(self._data)
 
 
 def _dummy_dataset(source=MySource(), batch_size: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: builds a grain MapDataset from source (a MySource or any
+  # sequence), batched by batch_size, mapping each batch to a dict with
+  # "prompts" and "answer" both set to the batch.
+  # KNOWN ISSUE: the default source is a single MySource instance created
+  # at definition time and shared across calls.
   return (
       grain.MapDataset.source(source)
       .batch(batch_size)
@@ -73,9 +106,14 @@ def _dummy_dataset(source=MySource(), batch_size: int = 1):
 
 
 class PPOLearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # End-to-end PPO training tests on CPU devices.
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: sets the number of CPU devices from DEVICE_COUNTS (default 2)
+    # and prints it.
     super().setUpClass()
     num_cpus = int(os.environ.get('DEVICE_COUNTS', 2))
     chex.set_n_cpu_devices(num_cpus)

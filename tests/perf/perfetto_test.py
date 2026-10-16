@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.perfetto.PerfettoTraceWriter (perf v1 Perfetto
+# export): construction creates the trace directory and opens
+# '<dir>/perfetto_trace_<time>.pb' for append, logging an ERROR and disabling
+# dumping on OSError or GCS ('gs://') paths; write() appends a serialized
+# TraceProtoBuilder; log_trace() emits track descriptors (root, Main, and
+# per-role Rollout/Reference/Actor tracks with uuids 2000+) and
+# SLICE_BEGIN/SLICE_END track events (timestamps in nanoseconds) for the
+# merged main span tree and each role's spans, then serializes once.
+# Filesystem and time calls are mocked.
 import builtins
 import os
 import time
@@ -28,6 +38,14 @@ from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent
 
 
 def _create_mock_spans():
+  # [FUNCTION DOC]
+  # HELPER: builds a span tree global_step(0-10) > mini_batch_step(0-10) with
+  # rollout span (0-4), refer_inference span (4-6) and an actor_training group
+  # (6-9) holding a peft_train_step span (6-9).
+  # Output: tuple of ([global_step group], [rollout span], [refer span],
+  # [actor group]).
+  # KNOWN ISSUE: the comment says reference inference spans 3-6 but the span
+  # begins at 4.0.
   """Creates a nested span group for testing."""
   g_global_step = span.SpanGroup("global_step")
   g_global_step.begin = 0.0
@@ -67,11 +85,16 @@ def _create_mock_spans():
 
 
 class PerfettoTraceWriterTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for PerfettoTraceWriter.
 
   @mock.patch.object(os, "makedirs", autospec=True)
   @mock.patch.object(builtins, "open", autospec=True)
   @mock.patch.object(time, "time", autospec=True)
   def test_init_success(self, mock_time, mock_open, mock_makedirs):
+    # [FUNCTION DOC]
+    # Verifies init calls makedirs(dir, exist_ok=True), opens the timestamped
+    # trace file in 'ab' mode and stores its path (time.time patched to 12345).
     mock_time.return_value = 12345
     writer = perfetto.PerfettoTraceWriter("/tmp/test_dir")
 
@@ -85,6 +108,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
 
   @mock.patch.object(os, "makedirs", autospec=True)
   def test_init_failure_logs_error(self, mock_makedirs):
+    # [FUNCTION DOC]
+    # Verifies an OSError from makedirs leaves _trace_file_path None and logs
+    # one ERROR with the skip message and the original error.
     mock_makedirs.side_effect = OSError("Permission denied")
     with self.assertLogs(level="ERROR") as cm:
       writer = perfetto.PerfettoTraceWriter("/tmp/test_dir")
@@ -99,6 +125,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
 
   @mock.patch.object(os, "makedirs", autospec=True)
   def test_init_with_gcs_path_logs_error(self, mock_makedirs):
+    # [FUNCTION DOC]
+    # Verifies a gs:// path is rejected with one ERROR mentioning GCS paths are
+    # unsupported, without calling makedirs.
     with self.assertLogs(level="ERROR") as cm:
       writer = perfetto.PerfettoTraceWriter("gs://my-bucket/test_dir")
     self.assertIsNone(writer._trace_file_path)
@@ -118,6 +147,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
   @mock.patch.object(os, "makedirs", autospec=True)
   @mock.patch.object(builtins, "open", autospec=True)
   def test_write(self, mock_open, mock_makedirs):
+    # [FUNCTION DOC]
+    # Verifies write() opens the file again and writes builder.serialize() bytes
+    # exactly once.
     mock_file = mock_open.return_value
     # Context manager setup
     mock_open.return_value.__enter__.return_value = mock_file
@@ -137,12 +169,22 @@ class PerfettoTraceWriterTest(absltest.TestCase):
   @mock.patch.object(builtins, "open", autospec=True)
   @mock.patch.object(perfetto, "TraceProtoBuilder", autospec=True)
   def test_log_trace(self, mock_builder_cls, mock_open, mock_makedirs):
+    # [FUNCTION DOC]
+    # Verifies log_trace emits exactly 25 packets in order: 5 track descriptors
+    # (root with explicit child ordering, Main uuid 1, Rollout 2000, Reference
+    # 2001, Actor 2002, each parented to root with sibling rank equal to uuid),
+    # 12 merged-main slice events, 2 rollout, 2 reference and 4 actor events with
+    # correct types, track uuids, nanosecond timestamps and names; serialize is
+    # called once.
     mock_builder = mock_builder_cls.return_value
     mock_file = mock_open.return_value
     mock_open.return_value.__enter__.return_value = mock_file
     captured_packets = []
 
     def add_packet_side_effect():
+      # [FUNCTION DOC]
+      # HELPER: add_packet side effect creating an autospec'd TracePacket with
+      # autospec'd track_descriptor/track_event, recording and returning it.
       p = mock.create_autospec(TracePacket, instance=True)
       p.track_descriptor = mock.create_autospec(TrackDescriptor, instance=True)
       p.track_event = mock.create_autospec(TrackEvent, instance=True)
@@ -165,6 +207,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
     ChildTracksOrdering = perfetto.TrackDescriptor.ChildTracksOrdering
 
     def assert_global_track(packet):
+      # [FUNCTION DOC]
+      # HELPER: asserts a packet is the root track descriptor with explicit child
+      # ordering.
       self.assertEqual(packet.track_descriptor.uuid, perfetto.ROOT_TRACK_UUID)
       self.assertEqual(
           packet.track_descriptor.child_ordering,
@@ -172,6 +217,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
       )
 
     def assert_metadata(packet, name, uuid):
+      # [FUNCTION DOC]
+      # HELPER: asserts a track descriptor's uuid, name, root parent and sibling
+      # rank equal to uuid.
       self.assertEqual(packet.track_descriptor.uuid, uuid)
       self.assertEqual(packet.track_descriptor.name, name)
       self.assertEqual(
@@ -180,6 +228,9 @@ class PerfettoTraceWriterTest(absltest.TestCase):
       self.assertEqual(packet.track_descriptor.sibling_order_rank, uuid)
 
     def assert_slice(packet, type_, uuid, ts, name=None):
+      # [FUNCTION DOC]
+      # HELPER: asserts a track event's type, track uuid, timestamp and (if given)
+      # name.
       self.assertEqual(packet.track_event.type, type_)
       self.assertEqual(packet.track_event.track_uuid, uuid)
       self.assertEqual(packet.timestamp, ts)

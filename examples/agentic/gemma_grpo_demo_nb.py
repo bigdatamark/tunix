@@ -8,6 +8,27 @@ coding problems, etc.
 
 We use v5e-8 for this experiment.
 """
+# [MODULE DOC]
+# Notebook-style demo ("# %%" cells, top-level code) training Gemma 2 2B-IT with LoRA on GSM8K using
+# tunix's agentic GRPOLearner with async rollouts on one (2,4) ("fsdp","tp") mesh shared by actor,
+# reference and rollout. Detects environment: "g3" if internal gfile/xprof import, else "oss"
+# (those names set to None). In g3, Colab adhoc reload context is used for tunix imports.
+# Hyperparameters: prompt length 256, 768 generation steps, temperature 0.9, top_p 1.0, top_k 50,
+# 4 generations, 1 iteration, beta 0.08, epsilon 0.2, batch size 16, 100 batches, 5 test batches,
+# 1 epoch, AdamW (peak LR 3e-6, b1 0.9, b2 0.99, wd 0.1) with 10% warmup then cosine decay, chained
+# after global-norm clipping 0.1, checkpoint every 500 steps keeping 4, LoRA rank/alpha 64 on modules
+# matching ".*attention". Data: script_utils.get_train_and_eval_datasets / get_dataset from local or
+# internal paths with the reasoning/answer SYSTEM_PROMPT and the GSM8K answer extractor; the test set is
+# batched and truncated to 5 batches. Model: get_ref_model loads the reference (internal Orbax
+# checkpoint or Kaggle download + conversion), LoRA policy via model_utils.apply_lora_to_model.
+# Reward functions: format exact (3.0), format approximate (+/-0.5 per tag), answer correctness, and
+# number correctness. Builds ClusterConfig (vanilla rollout engine, kv cache prompt+gen+256, micro
+# batch 1, mini batch 4, TensorBoard at /tmp/tensorboard/grpo), GRPOConfig (empty system prompt, max
+# concurrency 8), Gemma tokenizer and chat parser, RLCluster, and GRPOLearner, then trains (optionally
+# profiled) with the validation set for evaluation. Side effects: downloads, device memory, checkpoint
+# and log files, prints.
+# KNOWN ISSUE: bare except clauses in the reward functions swallow all exceptions (including
+# KeyboardInterrupt).
 
 # %%
 # Imports
@@ -225,6 +246,9 @@ value) between {solution_start} and {solution_end}."""
 
 # %%
 def extract_hash_answer(text: str) -> str | None:
+  # [FUNCTION DOC]
+  # HELPER: returns the stripped text after the first "####" (GSM8K final answer) or None if absent;
+  # any text after a second "####" is dropped.
   if '####' not in text:
     return None
   return text.split('####')[1].strip()
@@ -289,6 +313,13 @@ MODEL_CONFIG = {
 
 
 def get_ref_model():
+  # [FUNCTION DOC]
+  # Builds a JAX mesh from MESH (Auto axis types) and loads the reference Gemma 2 model. g3: builds an
+  # abstract Gemma from the MODEL_VERSION config via eval_shape, makes float32 ShapeDtypeStructs with
+  # named shardings, restores params from NNX_CKPT_DIR/<version> with an Orbax StandardCheckpointer and
+  # merges them; returns (model, mesh, None). OSS: calls model_utils.create_model with a Kaggle config for
+  # gemma-2-<version> (download and intermediate checkpoint dirs) and returns (model, mesh,
+  # tokenizer_path). Raises KeyError for unknown MODEL_VERSION in g3 and download/restore errors.
   """Loads the reference model, from CNS in g3 or Kaggle in OSS."""
   mesh = jax.make_mesh(
       *MESH, axis_types=(jax.sharding.AxisType.Auto,) * len(MESH[0])
@@ -376,6 +407,9 @@ print(
 # %%
 # Give the model a reward of 3 points if the format matches exactly.
 def match_format_exactly(prompts, completions, **kargs):
+  # [FUNCTION DOC]
+  # Reward fn: 3.0 per completion that matches match_format (optional whitespace, reasoning block,
+  # anything, answer block, optional whitespace; multiline, dotall), else 0. Other args ignored.
   scores = []
   for completion in completions:
     score = 0
@@ -389,6 +423,9 @@ def match_format_exactly(prompts, completions, **kargs):
 
 # We also reward the model if the format of the output matches partially.
 def match_format_approximately(prompts, completions, **kargs):
+  # [FUNCTION DOC]
+  # Reward fn: per completion, +0.5 for each of the four tags occurring exactly once, else -0.5 each
+  # (range -2 to 2).
   scores = []
 
   for completion in completions:
@@ -408,6 +445,11 @@ def match_format_approximately(prompts, completions, **kargs):
 # answer does not match exactly, i.e., based on how close the answer is to the
 # correct value.
 def check_answer(prompts, completions, answer, **kargs):
+  # [FUNCTION DOC]
+  # Reward fn: extracts the answer-block content via match_format group 1 (None if no match gives 0).
+  # Exact equality with the true answer gives 3.0, equality after stripping 1.5; otherwise float ratio
+  # guess/answer in [0.9,1.1] gives 0.5, in [0.8,1.2] gives 0.25, else -1.0; any parse/division error
+  # gives -0.5. Output: list of scores.
   responses = completions
 
   extracted_responses = [
@@ -456,6 +498,12 @@ print(match_numbers.findall(f'{solution_start}  0.34  {solution_end}'))
 
 
 def check_numbers(prompts, completions, answer, **kargs):
+  # [FUNCTION DOC]
+  # Reward fn: requires kwarg "question" (KeyError otherwise, though it is unused). Extracts the first
+  # run of digits/dots after the answer start tag via match_numbers; None gives 0. Compares stripped
+  # float conversions of guess and answer: 1.5 if equal, else 0.0; conversion errors give 0.
+  # KNOWN ISSUE: match_numbers ignores signs and thousands separators, so negative answers and answers
+  # with commas (which float rejects) always score 0.
   question = kargs['question']
   responses = completions
 

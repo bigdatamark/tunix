@@ -13,6 +13,18 @@
 # limitations under the License.
 
 """SFT script for Gemma 3 vision-language model."""
+# [MODULE DOC]
+# absl app that fine-tunes the Gemma 3 4B (pretrained, multimodal) model with LoRA on the
+# unsloth/LaTeX_OCR image-to-LaTeX dataset using tunix PeftTrainer, with qualitative evaluation
+# before and after training. Prompt: INPUT_TEMPLATE (user turn with an image placeholder and the
+# instruction "Write the LaTeX representation for this image.", then the model turn start); the image
+# placeholder is expanded to 256 image tokens framed by start/end-of-image markers. Checkpoint and
+# tokenizer come from fixed GCS paths. Flags: seed 42, batch_size 4, val_batch_size 64, num_epochs 1,
+# max_seq_len 768, eval_every_n_steps 20 (non-positive disables eval), val_split (unused),
+# test_dataset_frac 0.1, qual_eval_num_samples 5, max_steps 100, full_ckpt_dir ("none" disables
+# checkpointing), logging_dir, results_dir, save_interval_steps 100, lora_rank 8, lora_alpha 8,
+# lora_target_modules (text and vision projection regex).
+# KNOWN ISSUE: --val_split is defined but the validation split size is hard-coded to 0.1.
 
 import csv
 import dataclasses
@@ -89,6 +101,9 @@ _LORA_TARGET_MODULES = flags.DEFINE_string(
 
 @dataclasses.dataclass
 class LoraConfig:
+  # [CLASS DOC]
+  # Dataclass of LoRA settings: rank (8), alpha (8), target_modules (regex of module paths to adapt,
+  # covering text attention/MLP and vision query/key/value/out/fc layers).
   """Configuration for LoRA (Low-Rank Adaptation).
 
   Attributes:
@@ -105,13 +120,22 @@ class LoraConfig:
 
 
 class _Preprocess(grain.MapTransform):
+  # [CLASS DOC]
+  # HELPER: grain MapTransform turning a raw example (dict with PIL "image" and "text") into
+  # (image array, prompt token ids, target token ids).
   """Preprocess the image and tokenize the input."""
 
   def __init__(self, image_processor, tokenizer):
+    # [FUNCTION DOC]
+    # HELPER: stores the image processor and tokenizer.
     self.image_processor = image_processor
     self.tokenizer = tokenizer
 
   def map(self, element):
+    # [FUNCTION DOC]
+    # Runs the image processor on element["image"] and takes the first result as a numpy array; builds
+    # the prompt by expanding the image placeholder into 256 image tokens; tokenizes the prompt without EOS
+    # and element["text"] with EOS. Output: tuple (image, src_tokens, dst_tokens).
     """Preprocess the image and tokenize the input."""
     image = np.array(self.image_processor(element["image"])[0])
 
@@ -125,13 +149,22 @@ class _Preprocess(grain.MapTransform):
 
 
 class _BuildTrainInput(grain.MapTransform):
+  # [CLASS DOC]
+  # HELPER: grain MapTransform building peft_trainer.TrainingInput from (image, src, dst) tuples, with
+  # loss masked to the target tokens and right padding to max_seq_len.
   """Build a TrainingInput from a tuple of source and destination tokens."""
 
   def __init__(self, max_seq_len: int, pad_value: int | bool):
+    # [FUNCTION DOC]
+    # HELPER: stores max_seq_len and the token pad value.
     self.max_seq_len = max_seq_len
     self.pad_value = pad_value
 
   def map(self, element):
+    # [FUNCTION DOC]
+    # Concatenates source and target tokens; mask is False over source and True over target; pads tokens
+    # with pad_value and the mask with 0 (False) up to max_seq_len (no truncation). Output: TrainingInput
+    # (input_tokens, input_mask, images).
     images, src_tokens, dst_tokens = element
     # The input sequence fed to the model is simply the concatenation of the
     # source and the destination.
@@ -157,6 +190,9 @@ class _BuildTrainInput(grain.MapTransform):
   def _pad_up_to_max_len(
       self, input_tensor: np.ndarray, pad_value: int
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: right-pads a 1-D array with pad_value to max_seq_len; arrays already at least that long
+    # are returned unchanged (unpadded, not truncated).
     """Pad the given tensor up to sequence length of a batch."""
     seq_len = input_tensor.shape[0]
     to_pad = np.maximum(self.max_seq_len - seq_len, 0)
@@ -169,16 +205,25 @@ class _BuildTrainInput(grain.MapTransform):
 
 
 class _FilterOverlength(grain.FilterTransform):
+  # [CLASS DOC]
+  # HELPER: grain FilterTransform dropping TrainingInputs whose token length exceeds max_seq_len.
   """Filter out overlength examples."""
 
   def __init__(self, max_seq_len):
+    # [FUNCTION DOC]
+    # HELPER: stores max_seq_len.
     self.max_seq_len = max_seq_len
 
   def filter(self, element) -> bool:
+    # [FUNCTION DOC]
+    # Returns True to keep the element when input_tokens length is at most max_seq_len.
     return element.input_tokens.shape[0] <= self.max_seq_len
 
 
 def load_data_processors(model_config):
+  # [FUNCTION DOC]
+  # Creates the image processor from model_config.vision_config and a SentencePiece tokenizer from
+  # TOKENIZER_PATH. Output: (image_processor, tokenizer). Side effects: reads from GCS.
   """Loads data processors.
 
   Args:
@@ -202,6 +247,11 @@ def load_dataset(
     num_epochs: int,
     max_seq_len: int,
 ):
+  # [FUNCTION DOC]
+  # Builds a grain DataLoader over data_source with an IndexSampler (num_epochs, no sharding) and
+  # operations: _Preprocess, _BuildTrainInput (pad id from tokenizer), _FilterOverlength, and Batch
+  # (batch_size, drop remainder); 8 workers with buffer 4. Output: DataLoader.
+  # KNOWN ISSUE: docstring documents a "split" argument that does not exist.
   """Loads the dataset.
 
   Args:
@@ -239,6 +289,10 @@ def load_model(
     mesh,
     lora_config: LoraConfig | None = None,
 ):
+  # [FUNCTION DOC]
+  # Loads Gemma 3 from MODEL_CKPT_PATH in bfloat16 sharded on mesh; if lora_config is given wraps it with
+  # qwix LoRA (target regex, rank, alpha) using model.get_model_input() as tracing inputs.
+  # Output: the (possibly LoRA) model.
   """Loads the model and optionally applies LoRA.
 
   Args:
@@ -281,6 +335,12 @@ def train(
     logging_dir,
     mesh,
 ):
+  # [FUNCTION DOC]
+  # Trains with PeftTrainer and AdamW (LR 1e-5). Metrics logged to logging_dir every 20 steps;
+  # checkpoints every save_interval_steps keeping 1 when full_ckpt_dir is not None. The model input
+  # function computes positions and attention mask from non-pad tokens and passes tokens, loss mask,
+  # positions, attention mask and images. Runs trainer.train(train_ds, val_ds) inside the mesh context.
+  # No output. Side effects: device compute, logs, checkpoints.
   """Training loop.
 
   Args:
@@ -296,6 +356,9 @@ def train(
   """
 
   def gen_model_input_fn(x):
+    # [FUNCTION DOC]
+    # HELPER: maps a TrainingInput batch to model kwargs: input_tokens, input_mask, positions and
+    # attention_mask (from model.get_positions_and_attention_mask with the non-pad mask), images.
     pad_mask = x.input_tokens != tokenizer.pad_id()
     positions, attention_mask = model.get_positions_and_attention_mask(
         x.input_tokens,
@@ -342,6 +405,11 @@ def qual_eval_sample(
     top_p=1.0,
     max_generation_steps=768,
 ):
+  # [FUNCTION DOC]
+  # Generates text for one test example: wraps the example image as a nested list, builds the prompt
+  # with 256 image tokens, and calls the sampler with echo True, the given sampling parameters
+  # (defaults greedy top_k 1), seed from the flag, and EOS ids 1 and 106. Output: the first generated
+  # text (including the echoed prompt).
   """Qualitative evaluation."""
 
   image = [[element["image"]]]
@@ -367,6 +435,11 @@ def qual_eval_sample(
 def run_qual_eval(
     model, tokenizer, image_processor, model_config, test_data_source, prefix
 ):
+  # [FUNCTION DOC]
+  # Builds a Sampler (cache size 1300) with the image processor, creates results_dir/<prefix>_training,
+  # and for the first qual_eval_num_samples test examples saves the image as PNG and writes a CSV row
+  # (image path, generated text) to results.csv. No output. Side effects: prints and file writes.
+  # Raises IndexError if the test set is smaller than the sample count.
   """Runs qualitative evaluation."""
   print(f"Running qualitative evaluation {prefix} training...")
   sampler = sampler_lib.Sampler(
@@ -400,6 +473,12 @@ def run_qual_eval(
 
 
 def main(argv):
+  # [FUNCTION DOC]
+  # absl entry point. Requires exactly 8 devices (mesh (1,4)) or 1 device (mesh (1,1)), else ValueError.
+  # Loads the gemma3_4b_pt multimodal config, processors, the LaTeX_OCR train split (split 90/10 into
+  # train/val when eval enabled), the first test_dataset_frac percent of the test split, the LoRA model,
+  # runs qualitative eval "before", trains, and runs qualitative eval "after".
+  # KNOWN ISSUE: with 8 devices the mesh uses only 4 of them.
   del argv  # Unused.
 
   num_tpus = len(jax.devices())

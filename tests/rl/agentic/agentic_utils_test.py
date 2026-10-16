@@ -216,6 +216,8 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_single_assistant_message(self):
+    # [FUNCTION DOC]
+    # Verifies an assistant message gets mask 1 for every token.
     messages = [{'role': 'assistant', 'content': 'hello'}]
     expected_text = 'role:assistant content:hello'
     expected_tokens = [ord(c) for c in expected_text]
@@ -233,6 +235,9 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_multiple_messages(self):
+    # [FUNCTION DOC]
+    # Verifies tokens and masks of consecutive messages are concatenated in
+    # order and parse is called once per message.
     messages = [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'hello'},
@@ -256,6 +261,9 @@ class MessagesToTokensTest(unittest.TestCase):
     self.assertEqual(self.mock_parser.parse.call_count, 2)
 
   def test_with_contains_first_msg(self):
+    # [FUNCTION DOC]
+    # Verifies contains_first_msg True sets is_first_msg only for the first
+    # message's parse call.
     messages = [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'hello'},
@@ -286,6 +294,9 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_with_contains_generation_msg(self):
+    # [FUNCTION DOC]
+    # Verifies contains_generation_msg True sets add_generation_prompt only
+    # for the last message's parse call.
     messages = [
         {'role': 'user', 'content': 'hi'},
         {'role': 'assistant', 'content': 'hello'},
@@ -316,9 +327,16 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_with_assistant_token_stripping(self):
+    # [FUNCTION DOC]
+    # Verifies that for an assistant message the parser's assistant_token
+    # prefix is removed before encoding, so only the remaining text is
+    # encoded (once, without special tokens) and masked with 1.
     self.mock_parser.assistant_token = '<|asst|>'
 
     def parse_side_effect_with_token(messages, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: renders "content:<c>", prefixed by the assistant token for
+      # assistant messages.
       del kwargs
       msg = messages[0]
       text = f'content:{msg["content"]}'
@@ -345,6 +363,9 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_with_preprocess_messages(self):
+    # [FUNCTION DOC]
+    # Verifies that when the parser has preprocess_messages it is called
+    # once with the raw messages and parse runs only over its result.
     mock_parser_with_preprocess = mock.Mock(
         spec=['parse', 'assistant_token', 'preprocess_messages']
     )
@@ -383,6 +404,10 @@ class MessagesToTokensTest(unittest.TestCase):
     )
 
   def test_with_tokenizer_without_add_special_tokens_arg(self):
+    # [FUNCTION DOC]
+    # Verifies a tokenizer whose encode takes only the text is called with
+    # just the text (no add_special_tokens keyword) and still produces the
+    # expected tokens and masks.
     mock_tokenizer_simple = mock.Mock(spec=['encode', 'dedup_bos_ids'])
     # Simple tokenizer mock: returns list of char codes
     mock_tokenizer_simple.encode.side_effect = lambda s: [ord(c) for c in s]

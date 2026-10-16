@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# PPO (Proximal Policy Optimization, actor-critic) config and learner.
+# PPOConfig extends AlgorithmConfig with GAE, clipping, KL and entropy
+# settings. PPOLearner extends RLLearner: it installs registered policy and
+# value losses on the actor and critic trainers, and its rollout step
+# generates one completion per prompt, computes reference/old log-probs,
+# critic values, terminal scores (reward model or reward functions), a
+# KL-penalized token-level reward, and GAE advantages and returns. Exports a
+# PPO-specific TrainExample and aliases PpoConfig, PpoLearner; registry is the
+# default function registry.
 """PPO learner."""
 
 from __future__ import annotations
@@ -41,12 +51,26 @@ registry = function_registry.default_registry
 
 @flax.struct.dataclass(frozen=True)
 class TrainExample(common.TrainExample):
+  # [CLASS DOC]
+  # Frozen flax struct extending common.TrainExample with optional returns
+  # (per-token GAE returns, value targets) and old_values (per-token critic
+  # values at rollout time).
   returns: jax.Array | None = None
   old_values: jax.Array | None = None
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class PPOConfig(algo_config_lib.AlgorithmConfig):
+  # [CLASS DOC]
+  # Slotted keyword-only dataclass. Defaults: algo_variant "ppo",
+  # advantage_estimator "gae", policy_loss_fn "ppo", value_loss_fn "ppo"
+  # (registry name), reward_manager "sequence-level", num_iterations 1,
+  # gamma 1.0, gae_lambda 0.95, beta 0.04 (KL penalty folded into rewards),
+  # epsilon 0.2, epsilon_low / epsilon_high (default to epsilon), epsilon_c
+  # (dual-clip lower bound, must exceed 1, None disables), entropy_coef (None
+  # or 0 disables), clip_range_value 0.2 (value clipping), kl_method
+  # "low_var_kl" (kl, mse_kl or low_var_kl).
+  # KNOWN ISSUE: the docstring lists mini_batch_size, which is not a field.
   """Configuration for PPO learner.
 
   Attributes:
@@ -98,6 +122,13 @@ class PPOConfig(algo_config_lib.AlgorithmConfig):
   kl_method: str = "low_var_kl"
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Fills epsilon_low and epsilon_high with epsilon when they are falsy
+    # (so an explicit 0.0 is also replaced). Raises ValueError if epsilon_c is
+    # set and not greater than 1, or kl_method is not one of kl, mse_kl,
+    # low_var_kl. Returns None.
+    # KNOWN ISSUE: does not call AlgorithmConfig.__post_init__, so the base
+    # selector validation and config logging are skipped.
     self.epsilon_low = self.epsilon_low if self.epsilon_low else self.epsilon
     self.epsilon_high = self.epsilon_high if self.epsilon_high else self.epsilon
     self.epsilon = self.epsilon
@@ -137,6 +168,22 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
       metric_fns: Sequence[MetricFn] | None = None,
       data_shuffle_seed: int | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: rl_cluster (must have a critic in its inference worker), ppo_config,
+    # optional reward_fns, optional metric_fns, optional data_shuffle_seed. Calls
+    # RLLearner.__init__. Raises ValueError unless exactly one of reward_fns and
+    # an inference-worker "reward" model is provided, and if the critic is
+    # missing/falsy. Records whether a reward model is used. Actor trainer: loss
+    # is the registered policy loss (has_aux), with model inputs train_example,
+    # algo_config, pad_id and eos_id. Critic trainer: loss is the registered
+    # value loss (has_aux), with inputs train_example, clip_range_value, pad_id
+    # and eos_id. Metrics: actor logs pg_clipfrac, plus pg_clipfrac_lower if
+    # dual-clip is on and loss/entropy if entropy_coef > 0; critic logs
+    # vpred_mean and vf_clipfrac (all mean-aggregated). Raises LookupError for
+    # unknown loss names.
+    # KNOWN ISSUE: the error paths index the private models dict directly, so a
+    # missing "reward" or "critic" key raises KeyError instead of the intended
+    # ValueError message.
     """Initializes the `PPOLearner`.
 
     Args:
@@ -237,6 +284,34 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
       training_input: TrainingInputT,
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
   ) -> TrainExample:
+    # [FUNCTION DOC]
+    # Inputs: training_input dict with "prompts" and extra columns, mode. Steps:
+    # 1) Resolve rollout config for mode, pad and eos ids. Generate completions
+    # with the rollout micro batch size (mode not passed to generate). Right
+    # pad completions to max_tokens_to_generate; prompt ids are left padded;
+    # prompt mask int32 and completion mask are "not pad".
+    # 2) eos_idx per row = maximum position from the completion mask (index of
+    # the last valid completion token; 0 for empty).
+    # 3) Reference logps if beta != 0, else None; old policy logps always.
+    # 4) Critic values over prompt+completion, sliced to the T positions that
+    # precede each completion token, masked by completion mask.
+    # 5) Scores: with a reward model, per-token scores sliced to the completion
+    # and taken at eos_idx; otherwise _compute_rewards on texts (and extra
+    # columns).
+    # 6) Token rewards: zeros shaped like completion ids, plus score at eos_idx;
+    # if beta != 0, minus beta times masked KL(old logps, ref logps) using
+    # kl_method and kl_clamp_value.
+    # 7) Advantages and returns from the registered estimator (rewards, values,
+    # completion mask, gamma, gae_lambda).
+    # 8) Buffer metrics: score mean/max/min, per-sequence reward sums, mean KL
+    # penalty (if beta != 0), completion lengths, masked advantage / return /
+    # value mean/max/min, and user metric functions (given last-token scores as
+    # rewards).
+    # Returns a PPO TrainExample with prompt/completion ids and masks,
+    # reference and old logps, advantages, returns and old values.
+    # KNOWN ISSUE: the reward tensor is created with the integer dtype of the
+    # completion ids, so adding float scores at eos_idx truncates them to
+    # integers (before the KL subtraction promotes to float).
     """Generates completions and computes advantages for PPO training.
 
     Args:
@@ -499,6 +574,10 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
   def _compute_trajectory_ids(
       self, example: TrainingInputT, steps: int
   ) -> List[str]:
+    # [FUNCTION DOC]
+    # Returns one trajectory id per prompt: the string of its global row offset
+    # (steps times batch size plus index), where batch size is the number of
+    # prompts divided by _num_generations (always 1).
     """Computes the trajectory ID for each prompt in the batch.
 
     Trajectory id is same as the offset of the example in the data source.
@@ -516,9 +595,13 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
     return row_offsets.astype(str).tolist()
 
   def _num_iterations(self) -> int:
+    # [FUNCTION DOC]
+    # Returns algo_config.num_iterations.
     return self.algo_config.num_iterations
 
   def _num_generations(self) -> int:
+    # [FUNCTION DOC]
+    # Returns 1: PPO samples a single completion per prompt.
     return 1
 
   def train(  # pylint: disable=useless-parent-delegation
@@ -527,6 +610,9 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
       eval_ds: Iterable[TrainingInputT] | None = None,
       skip_jit: bool = False,
   ) -> None:
+    # [FUNCTION DOC]
+    # Runs the PPO training loop by delegating to RLLearner.train with the same
+    # arguments. Returns None.
     """PPO training loop."""
     super().train(train_ds, eval_ds, skip_jit)
 

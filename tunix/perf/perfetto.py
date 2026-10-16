@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Perfetto trace writer (perf v1). Converts one GRPO step's spans into Perfetto
+# TrackDescriptor and TrackEvent slice packets and appends the serialized
+# trace to a single .pb file per writer. Constants: DEFAULT_EXPORT_DIR
+# "/tmp/perf_traces"; ROOT_TRACK_UUID 100 (parent track "Post-Training Run").
+# Track uuids: 1 = merged "Main"; 1000+i = "Main -- thread i" when merging
+# fails; 2000 "Rollout", 2001 "Reference", 2002 "Actor". Timestamps are span
+# times (perf_counter seconds) converted to integer nanoseconds.
 """Perfetto trace writer and helper functions."""
 
 from __future__ import annotations
@@ -41,6 +49,20 @@ def _add_trace_events(
     refer_inference_spans: list[Span],
     actor_train_groups: list[SpanGroup],
 ) -> None:
+  # [FUNCTION DOC]
+  # HELPER: Adds all packets for one step to builder (keyword-only args).
+  # Emits the root track descriptor with explicit child ordering. Tries to
+  # merge all global step groups (thread copies) into one tree with
+  # span.merge_span_group_trees; on ValueError logs a warning and does not
+  # merge. If the merge produced a SpanGroup, emits a single "Main" track
+  # (uuid 1, rank 1); else one track per global step group (uuid and rank
+  # 1000+i). Emits Rollout/Reference/Actor track descriptors (rank = uuid).
+  # Then emits begin/end slice events (sequence id 1): the main group tree(s)
+  # recursively (each group and nested group/span as its own slice on the
+  # same track), rollout spans on 2000, reference spans on 2001, actor train
+  # groups recursively on 2002.
+  # Exceptions: OverflowError if a span is unended (infinite end).
+  # Side effects: mutates builder.
   """Populates the TraceProtoBuilder with spans and groups.
 
   Args:
@@ -106,6 +128,9 @@ def _add_trace_events(
     packet.track_descriptor.sibling_order_rank = uuid
 
   def add_span(s: Span | SpanGroup, track_uuid: int):
+    # [FUNCTION DOC]
+    # HELPER: Adds a slice-begin packet (timestamp begin in ns, name) and a
+    # slice-end packet (timestamp end in ns) on track_uuid.
     # Slice Begin
     packet_begin = builder.add_packet()
     packet_begin.timestamp = int(s.begin * 1e9)
@@ -122,6 +147,9 @@ def _add_trace_events(
     packet_end.track_event.track_uuid = track_uuid
 
   def add_group(g: SpanGroup, track_uuid: int):
+    # [FUNCTION DOC]
+    # HELPER: Adds a slice for the group, then recursively for every child
+    # group and span, all on the same track.
     add_span(g, track_uuid)
     for inner in g.inner:
       if isinstance(inner, SpanGroup):
@@ -150,9 +178,20 @@ def _add_trace_events(
 
 
 class PerfettoTraceWriter:
+  # [CLASS DOC]
+  # Best-effort trace file writer: holds the target file path (None when
+  # initialization failed, which disables writing). Each log_trace call builds
+  # a fresh trace (including track descriptors) and appends it to the file.
   """A writer for Perfetto trace events."""
 
   def __init__(self, export_dir: str | None):
+    # [FUNCTION DOC]
+    # Input: export_dir (None or empty -> DEFAULT_EXPORT_DIR). Rejects "gs://"
+    # paths, creates the directory, chooses file name
+    # "perfetto_trace_<unix seconds>.pb", touches it in append mode and logs
+    # the path. Any exception (including the GCS rejection) is logged and
+    # leaves the path None; nothing propagates.
+    # Side effects: directory/file creation, logging.
     """Initializes the PerfettoTraceWriter.
 
     Args:
@@ -188,6 +227,9 @@ class PerfettoTraceWriter:
       self._trace_file_path = None
 
   def write(self, builder: TraceProtoBuilder) -> None:
+    # [FUNCTION DOC]
+    # Appends builder's serialized bytes to the trace file; no-op when the
+    # path is None; exceptions are logged, not raised.
     """Writes the built trace to the file."""
     if self._trace_file_path is None:
       return
@@ -210,6 +252,10 @@ class PerfettoTraceWriter:
       refer_inference_spans: list[Span],
       actor_train_groups: list[SpanGroup],
   ) -> None:
+    # [FUNCTION DOC]
+    # Builds a new TraceProtoBuilder, fills it with _add_trace_events from the
+    # given lists, and writes it. Exceptions from building (for example
+    # unended spans) propagate; write errors are logged.
     """Generates and writes Perfetto trace events to a file.
 
     Args:

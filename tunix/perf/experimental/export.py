@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Experimental (perf v2) metrics export: hands tracer timelines to a trace
+# writer on a single background worker thread (serializing writes). Produces
+# no aggregated metrics yet (always returns {}). Constants: MetricsT alias,
+# Timeline alias (experimental tracer Timeline), DEFAULT_TRACE_DIR
+# "/tmp/perf_traces".
 """Metrics export functions."""
 
 from __future__ import annotations
@@ -32,12 +38,20 @@ DEFAULT_TRACE_DIR = "/tmp/perf_traces"
 
 
 def log_metric_export_fn(timelines: Mapping[str, Timeline]) -> MetricsT:
+  # [FUNCTION DOC]
+  # Debug export function: logs the timelines mapping at info level and
+  # returns an empty metrics dict.
   """Logs the timelines."""
   logging.info("\n=== Exporting Timelines ===\n %s", timelines)
   return {}
 
 
 class PerfMetricsExport:
+  # [CLASS DOC]
+  # Export object usable as a context manager. State: whether writing is
+  # enabled, a writer (PerfettoTraceWriter when enabled, NoopTraceWriter
+  # otherwise), and a one-worker thread pool executor (None when disabled or
+  # after shutdown). Exiting the context shuts down and waits.
   """Perf metrics export class.
 
   A class for exporting timelines to a trace writer.
@@ -50,6 +64,11 @@ class PerfMetricsExport:
       enable_trace_writer: bool = True,
       trace_dir: str | None = None,
   ) -> PerfMetricsExport:
+    # [FUNCTION DOC]
+    # Alternate constructor: if the config has role_to_mesh, maps each role
+    # name (its enum value, else string form) to the flattened list of its
+    # mesh's devices; then constructs the class with the given writer flag
+    # and trace_dir.
     """Creates an instance from a ClusterConfig.
 
     Args:
@@ -81,6 +100,12 @@ class PerfMetricsExport:
       trace_dir: str | None = None,
       role_to_devices: Mapping[str, Any] | None = None,
   ):
+    # [FUNCTION DOC]
+    # Keyword-only inputs: enable_trace_writer, trace_dir (falsy -> default
+    # dir), role_to_devices (passed to the writer). When enabled, creates a
+    # PerfettoTraceWriter (may create directories) and a single-thread
+    # executor named with prefix "PerfExport"; otherwise a no-op writer and no
+    # executor.
     """Initializes the instance.
 
     Args:
@@ -108,6 +133,9 @@ class PerfMetricsExport:
       self._executor = None
 
   def _safe_write(self, timelines: Mapping[str, Timeline]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Calls the writer's write_timelines, logging (not raising) any
+    # exception. Runs on the worker thread.
     try:
       self._writer.write_timelines(timelines)
     except Exception:  # pylint: disable=broad-except
@@ -117,6 +145,10 @@ class PerfMetricsExport:
       self,
       timelines: Mapping[str, Timeline],
   ) -> MetricsT:
+    # [FUNCTION DOC]
+    # If writing is enabled, submits _safe_write(timelines) to the executor
+    # (asynchronously; caller should not mutate timelines afterwards), or warns
+    # if the executor was shut down. Always returns {}.
     """Exports timelines to a trace file.
 
     Args:
@@ -142,6 +174,9 @@ class PerfMetricsExport:
     return {}
 
   def shutdown(self, wait: bool = True) -> None:
+    # [FUNCTION DOC]
+    # Shuts down the executor (optionally waiting for pending writes), sets it
+    # to None and logs; idempotent.
     """Shuts down the background executor safely."""
     if self._executor is not None:
       self._executor.shutdown(wait=wait)
@@ -149,6 +184,8 @@ class PerfMetricsExport:
       logging.info("PerfMetricsExport background worker shut down.")
 
   def __enter__(self) -> Self:
+    # [FUNCTION DOC]
+    # Returns self.
     return self
 
   def __exit__(
@@ -157,4 +194,6 @@ class PerfMetricsExport:
       exc_value: BaseException | None,
       traceback: types.TracebackType | None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Calls shutdown(wait=True); does not suppress exceptions.
     self.shutdown(wait=True)

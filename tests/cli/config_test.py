@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for tunix.cli.config (the CLI hyperparameter/config loader). config.initialize takes an argv list
+# of (command name, base YAML file, then dotted key=value overrides) and returns an object exposing a
+# nested config dict plus helpers: create_optimizer, _create_learning_rate, obtain_training_config_dict,
+# parse_mesh_config, _parse_mesh_allocation_policy and obtain_reward_fn. Also covers
+# tunix.utils.mesh.create_mesh and config._dict_to_cli_args. Side effects: temporary directories/files,
+# working-directory changes (restored), and when run directly sets HF_TOKEN to "TestToken" if unset.
 import os
 import pathlib
 import tempfile
@@ -31,17 +38,25 @@ from tunix.utils import mesh as mesh_lib
 
 
 class ConfigTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test suite for CLI config parsing, validation and helper factories. TEST_ARGV is the default argv
+  # prefix (empty command name and "base_config.yaml").
   TEST_ARGV = [
       "",
       "base_config.yaml",
   ]
 
   def initialize_config(self, configs: list[str]):
+    # [FUNCTION DOC]
+    # HELPER: appends the given override strings to TEST_ARGV and returns config.initialize on the result.
     """Helper to build argv and initialize config."""
     argv = self.TEST_ARGV + configs
     return config.initialize(argv)
 
   def convert_nested_dict_to_list(self, data_dict: Dict[str, Any]) -> List[str]:
+    # [FUNCTION DOC]
+    # HELPER: flattens a nested dict into "key1.key2...=value" override strings (in insertion order) and
+    # returns the list.
     """Converts a potentially deeply nested dictionary to a list of strings.
 
     Each string in the list represents a path from the root to a non-dictionary
@@ -63,6 +78,10 @@ class ConfigTest(parameterized.TestCase):
       current_path: List[str],
       result_list: List[str],
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: depth-first traversal appending "dotted.path=value" for every non-dict leaf of current_dict to
+    # result_list, with current_path as the key prefix (keys converted to strings). Returns nothing; mutates
+    # result_list.
     """Helper function to recursively traverse the dictionary.
 
     Args:
@@ -80,6 +99,10 @@ class ConfigTest(parameterized.TestCase):
         result_list.append(f"{path_str}={value}")
 
   def run_test_peft_trainer(self, hp):
+    # [FUNCTION DOC]
+    # HELPER: smoke-constructs a PeftTrainer from a config object: builds a ToyTransformer seeded with
+    # model_config.rng_seed, the optimizer from optimizer_config and a TrainingConfig from training_config.
+    # Raises whatever construction raises.
     """Helper to run a test PeftTrainer."""
     config_dict = cast(Dict[str, Any], hp.config)
     rngs = nnx.Rngs(config_dict["model_config"]["rng_seed"])
@@ -95,12 +118,17 @@ class ConfigTest(parameterized.TestCase):
     peft_trainer.PeftTrainer(model, optimizer, training_config)
 
   def test_config_from_yaml(self):
+    # [FUNCTION DOC]
+    # Verifies initialize raises ValueError for a nonexistent YAML file and succeeds for base_config.yaml.
     non_existent_argv = ["", "nonexistent_config.yaml"]
     self.assertRaises(ValueError, config.initialize, non_existent_argv)
 
     self.initialize_config([])
 
   def test_override_training_config_simple(self):
+    # [FUNCTION DOC]
+    # Verifies simple overrides are parsed (max_steps 150, data_sharding_axis list ["fsdp","dp"]) and the
+    # result can build a PeftTrainer.
     argv = [
         "",
         "base_config.yaml",
@@ -119,6 +147,8 @@ class ConfigTest(parameterized.TestCase):
     self.run_test_peft_trainer(hp)
 
   def test_override_training_config_complex(self):
+    # [FUNCTION DOC]
+    # Verifies nested profiler_options overrides (with a temp log dir) produce a config that builds a PeftTrainer.
     with tempfile.TemporaryDirectory() as log_dir:
       argv = [
           "",
@@ -156,6 +186,9 @@ class ConfigTest(parameterized.TestCase):
       ),
   )
   def test_valid_configs(self, overrides):
+    # [FUNCTION DOC]
+    # Verifies initialize accepts valid model_config overrides (Kaggle or HF with intermediate_ckpt_dir, GCS
+    # source, MaxText source) without ValueError.
     prefix = "model_config."
     overrides = [f"{prefix}{item}" for item in overrides]
     argv = ["", "base_config.yaml"] + overrides
@@ -182,6 +215,11 @@ class ConfigTest(parameterized.TestCase):
       ),
   )
   def test_invalid_configs(self, overrides, expected_error):
+    # [FUNCTION DOC]
+    # Verifies initialize raises the expected error for invalid configs (empty intermediate_ckpt_dir or an
+    # invalid model_source).
+    # KNOWN ISSUE: these overrides lack the "model_config." prefix (and one uses "ckpt_source"), so they set
+    # top-level keys and the test may pass for a different reason than intended.
     argv = ["", "base_config.yaml"] + overrides
     with self.assertRaises(expected_error):
       config.initialize(argv)
@@ -199,6 +237,8 @@ class ConfigTest(parameterized.TestCase):
       ),
   )
   def test_create_optimizer_valid(self, overrides, expected_type):
+    # [FUNCTION DOC]
+    # Verifies create_optimizer with opt_type sgd and learning rate 0.01 returns an optax GradientTransformation.
     """Tests valid optimizer configurations."""
     hp = self.initialize_config(overrides)
     optimizer = hp.create_optimizer("optimizer_config")
@@ -219,6 +259,8 @@ class ConfigTest(parameterized.TestCase):
   def test_create_optimizer_invalid(
       self, overrides, expected_error, error_regex
   ):
+    # [FUNCTION DOC]
+    # Verifies an unknown opt_type raises AttributeError "module 'optax' has no attribute 'unknown'".
     """Tests invalid optimizer configurations."""
     with self.assertRaisesRegex(expected_error, error_regex):
       hp = self.initialize_config(overrides)
@@ -256,6 +298,9 @@ class ConfigTest(parameterized.TestCase):
       ),
   )
   def test_learning_rate_schedule_valid(self, overrides):
+    # [FUNCTION DOC]
+    # Verifies _create_learning_rate returns a callable schedule for constant, exponential decay and warmup
+    # cosine decay schedule configurations.
     hp = self.initialize_config(overrides)
     lr_schedule = hp._create_learning_rate(
         hp.config["optimizer_config"], "test_config_path"
@@ -310,6 +355,10 @@ class ConfigTest(parameterized.TestCase):
   def test_create_mesh_valid(
       self, mock_device_count_fn, raw_keys, mock_num_devices, expected
   ):
+    # [FUNCTION DOC]
+    # Verifies parse_mesh_config parses string tuples for shape and axis names, and create_mesh calls
+    # jax.make_mesh once with them and Auto axis types and returns its result; device_count is mocked and may
+    # exceed the mesh size.
     mock_device_count_fn.return_value = mock_num_devices
     hp = self.initialize_config(self.convert_nested_dict_to_list(raw_keys))
     axis_shapes, axis_names = hp.parse_mesh_config("model_config")
@@ -328,6 +377,9 @@ class ConfigTest(parameterized.TestCase):
     self.assertIs(mesh, expected_mesh)
 
   def test_create_mesh_with_assigned_devices(self):
+    # [FUNCTION DOC]
+    # Verifies create_mesh with an explicit device list builds jax.sharding.Mesh (patched with a fake) with
+    # devices reshaped to the mesh shape (2, 2) in the given order and axis names ("x", "y").
     raw_keys = {
         "model_config": {
             "mesh": {"shape": "(2, 2)", "axis_names": "('x', 'y')"}
@@ -338,8 +390,12 @@ class ConfigTest(parameterized.TestCase):
     assigned_devices = ["d0", "d1", "d2", "d3"]
 
     class FakeMesh:
+      # [CLASS DOC]
+      # HELPER: fake Mesh recording devices, axis_names and axis_types.
 
       def __init__(self, devices, axis_names, axis_types=None):
+        # [FUNCTION DOC]
+        # HELPER: stores the given devices, axis names and axis types.
         self.devices = devices
         self.axis_names = axis_names
         self.axis_types = axis_types
@@ -356,6 +412,8 @@ class ConfigTest(parameterized.TestCase):
     self.assertEqual(mesh.axis_names, ("x", "y"))
 
   def test_parse_mesh_allocation_policy_defaults_to_compact(self):
+    # [FUNCTION DOC]
+    # Verifies a mesh without allocation_policy parses to normalize_allocation_policy(None) (compact default).
     raw_keys = {
         "model_config": {
             "mesh": {"shape": "(2, 2)", "axis_names": "('x', 'y')"}
@@ -369,6 +427,8 @@ class ConfigTest(parameterized.TestCase):
     )
 
   def test_parse_mesh_allocation_policy_validates_explicit_value(self):
+    # [FUNCTION DOC]
+    # Verifies an explicit "performance" allocation_policy normalizes to "PERFORMANCE".
     raw_keys = {
         "model_config": {
             "mesh": {
@@ -386,6 +446,8 @@ class ConfigTest(parameterized.TestCase):
     )
 
   def test_parse_mesh_allocation_policy_rejects_invalid_value(self):
+    # [FUNCTION DOC]
+    # Verifies an invalid allocation_policy raises ValueError "allocation_policy must be one of".
     raw_keys = {
         "model_config": {
             "mesh": {
@@ -478,6 +540,10 @@ class ConfigTest(parameterized.TestCase):
       mock_num_devices,
       error_regex,
   ):
+    # [FUNCTION DOC]
+    # Verifies invalid mesh configs raise ValueError with specific messages: unparsable or non-tuple shape,
+    # non-integer shape elements, non-tuple or non-string axis names, length mismatch, and more devices
+    # required than available.
     mock_device_count_fn.return_value = mock_num_devices
     with self.assertRaisesRegex(ValueError, error_regex):
       nested_dict = self.convert_nested_dict_to_list(raw_keys)
@@ -515,6 +581,9 @@ class ConfigTest(parameterized.TestCase):
   def test_get_reward_fns(
       self, overrides, expected_reward_fn_len, expected_reward_fn_names
   ):
+    # [FUNCTION DOC]
+    # Verifies obtain_reward_fn loads reward functions from the listed module files: four named functions
+    # from gsm8k.py, or a single reward_fn from gsm8k_verl.py in verl-compatible mode.
     hp = self.initialize_config(overrides)
     reward_fns = hp.obtain_reward_fn()
     self.assertLen(reward_fns, expected_reward_fn_len)
@@ -522,6 +591,11 @@ class ConfigTest(parameterized.TestCase):
     self.assertCountEqual(actual_names, expected_reward_fn_names)
 
   def test_obtain_reward_fn_relative_path(self):
+    # [FUNCTION DOC]
+    # Verifies a project-relative reward function path is resolved against the project root (mocked to a temp
+    # layout) rather than the current working directory.
+    # KNOWN ISSUE: the temporary directory context exits before the directory is used, so it is deleted and
+    # then recreated by mkdir and never cleaned up.
     hp = self.initialize_config([])
 
     with tempfile.TemporaryDirectory() as tmp_dir_str:
@@ -550,6 +624,8 @@ class ConfigTest(parameterized.TestCase):
         os.chdir(original_cwd)
 
   def test_obtain_reward_fn_file_not_found(self):
+    # [FUNCTION DOC]
+    # Verifies a nonexistent reward module raises ImportError "Failed to execute module non_existent".
     hp = self.initialize_config(
         ["reward_functions=['tunix/cli/reward_fn/non_existent.py']"]
     )
@@ -559,6 +635,9 @@ class ConfigTest(parameterized.TestCase):
       hp.obtain_reward_fn()
 
   def test_obtain_reward_fn_absolute_path_outside_project(self):
+    # [FUNCTION DOC]
+    # Verifies an absolute reward module path outside the project root is loaded and its function works
+    # (returns value times 10).
     """Tests loading a reward function from an absolute FILE path outside the project root."""
     hp = self.initialize_config([])
     with tempfile.TemporaryDirectory() as tmp_dir_str:
@@ -582,6 +661,9 @@ class ConfigTest(parameterized.TestCase):
       self.assertEqual(reward_fns[0](5), 50)
 
   def test_model_config_inheritance(self):
+    # [FUNCTION DOC]
+    # Verifies actor/reference/rollout model configs inherit model_config fields unless explicitly overridden,
+    # in which case overrides win; the default model_config model_name is "llama-3.1-8b".
     # Test that actor_model_config inherits from model_config
     # Scenario 1: Override model_config.model_name, actor should inherit
     hp = self.initialize_config([
@@ -684,6 +766,11 @@ class ConfigTest(parameterized.TestCase):
       expected_error=None,
       error_regex=None,
   ):
+    # [FUNCTION DOC]
+    # Verifies perf_metrics_options validation: log_dir accepted for grpo_main, rejected for peft_main with
+    # ValueError, no options accepted for peft_main, and invalid custom export function paths (v1 and v2)
+    # raise ValueError. Inputs: main_command (argv[0]), overrides (with a "{log_dir}" placeholder filled
+    # by a temp dir), optional expected_error and error_regex.
     with tempfile.TemporaryDirectory() as log_dir:
       overrides = [o.format(log_dir=log_dir) for o in overrides]
       argv = [main_command, "base_config.yaml"] + overrides
@@ -694,6 +781,8 @@ class ConfigTest(parameterized.TestCase):
         config.initialize(argv)
 
   def test_dict_to_cli_args_with_none(self):
+    # [FUNCTION DOC]
+    # Verifies _dict_to_cli_args flattens nested dicts into "a.b=value" strings with None rendered as "null".
     d = {"a": 1, "b": None, "c": {"d": None, "e": 2}}
     expected = ["a=1", "b=null", "c.d=null", "c.e=2"]
     got = list(config._dict_to_cli_args(d))

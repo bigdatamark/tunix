@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Builders for perf metrics export functions (v1) for the GRPO RL workflow.
+# An export function takes a metrics.PerfSpanQuery over tracer timelines and
+# returns MetricsT entries named "perf/..." (each value paired with None as
+# aggregation function), optionally also writing a Perfetto trace.
+# Three layouts are supported, chosen from the role -> device id mapping:
+# colocated (rollout, actor, reference share devices), rollout on one mesh with
+# actor+reference on another, and fully disaggregated.
+# Expected trace structure (span/group names): on all timelines a
+# "global_step" group containing "mini_batch_step" groups containing
+# "micro_batch_steps" groups; device timelines hold "rollout" spans,
+# "refer_inference" spans (directly or inside "actor_training" groups) and
+# "actor_training" groups; the main thread holds "peft_train_step" spans inside
+# "actor_training" groups; the main thread global_step may contain a
+# "weight_sync" span.
+# Aliases: ClusterConfig, MetricsT, partial (functools.partial),
+# PerfSpanQuery, Span, SpanGroup, MetricsExportFn, PerfettoTraceWriter.
 """Helper functions for metrics export."""
 
 from __future__ import annotations
@@ -41,16 +58,25 @@ PerfettoTraceWriter = perfetto.PerfettoTraceWriter
 
 
 class _GrpoExtractSpansFn(Protocol):
+  # [CLASS DOC]
+  # HELPER: Typing protocol for span extraction callables: called with keyword
+  # query, returning (ok flag, global step groups, rollout spans, reference
+  # inference spans, actor train groups, actor train step spans).
 
   def __call__(
       self, query: PerfSpanQuery
   ) -> tuple[
       bool, list[SpanGroup], list[Span], list[Span], list[SpanGroup], list[Span]
   ]:
+    # [FUNCTION DOC]
+    # HELPER: Protocol signature; the default body returns (False, None x5).
     return (False, None, None, None, None, None)
 
 
 class PerfMetricsExport:
+  # [CLASS DOC]
+  # Namespace of static factory methods and the GRPO metric computations they
+  # bind. Not meant to be instantiated.
   """Provides helper functions to create metrics export functions.
 
   1. from role to devices mapping
@@ -77,6 +103,19 @@ class PerfMetricsExport:
       log_rollout_time_at_micro_batch_level: bool = False,
       log_actor_train_time_at_micro_batch_level: bool = False,
   ) -> MetricsExportFn:
+    # [FUNCTION DOC]
+    # Creates an export function from role ("rollout", "actor", "refer") to
+    # device timeline id lists. Chooses the metric function by list equality:
+    # all three equal -> colocated; rollout differs and actor equals refer ->
+    # rollout_1_actor_2_reference_2; rollout differs from actor and actor
+    # differs from refer -> fully disaggregated; otherwise ValueError
+    # ("Unsupported mesh configuration"). Logs the chosen layout. Binds
+    # _grpo_extract_spans_and_groups with the mapping and the two micro-batch
+    # logging flags, and returns a partial of the metric function taking
+    # (extract fn, trace_writer) so that the result only needs the query.
+    # Exceptions: KeyError if a role is missing.
+    # KNOWN ISSUE: rollout == actor != refer raises ValueError, and
+    # rollout == refer != actor is classified as fully disaggregated.
     """Creates a metrics export function based on the role to devices mapping.
 
     Args:
@@ -129,6 +168,14 @@ class PerfMetricsExport:
       log_rollout_time_at_micro_batch_level: bool = False,
       log_actor_train_time_at_micro_batch_level: bool = False,
   ) -> MetricsExportFn:
+    # [FUNCTION DOC]
+    # Creates an export function from an RL cluster config: reads the
+    # ROLLOUT, ACTOR and REFERENCE meshes, converts their flattened devices to
+    # timeline ids; if training_config.perf_metrics_options exists and
+    # enables the trace writer, creates a PerfettoTraceWriter with trace_dir
+    # (or None for the default directory), else no writer. Delegates to
+    # from_role_to_devices with the flags. Side effects: writer creation may
+    # create directories.
     """Creates a metrics export function based on the mesh topology in cluster config.
 
     This function extracts the device mappings from the `cluster_config` to
@@ -191,6 +238,8 @@ class PerfMetricsExport:
   def create_metrics_export_fn(
       cluster_config: ClusterConfig,
   ) -> MetricsExportFn:
+    # [FUNCTION DOC]
+    # Deprecated alias of from_cluster_config with default flags.
     return PerfMetricsExport.from_cluster_config(cluster_config)
 
   @staticmethod
@@ -199,6 +248,18 @@ class PerfMetricsExport:
       trace_writer: PerfettoTraceWriter | None,
       query: PerfSpanQuery,
   ) -> MetricsT:
+    # [FUNCTION DOC]
+    # HELPER: Metrics for the colocated layout. Calls extract_spans_fn(query=
+    # query); returns {} if not ok. ValueError if there are no global step
+    # groups. Uses the first (main thread) global step group; weight sync
+    # span = last "weight_sync" span in it, or a zero-length span at the group
+    # end if absent. Computes global step duration, weight sync duration,
+    # and per-item durations of rollout spans, reference inference spans,
+    # actor train groups and actor train step spans. Logs the trace via the
+    # writer if present. Output keys: perf/global_step_time,
+    # perf/weight_sync_time, and perf/sum/* and perf/mean/* for rollout_time,
+    # refer_inference_time, actor_train_time, actor_train_step_time (numpy
+    # sum/mean; mean of empty is NaN with a runtime warning).
     """GRPO workflow: rollout, actor and reference are colocated on the same mesh.
 
     Args:
@@ -280,6 +341,18 @@ class PerfMetricsExport:
       trace_writer: PerfettoTraceWriter | None,
       query: PerfSpanQuery,
   ) -> MetricsT:
+    # [FUNCTION DOC]
+    # HELPER: Metrics when rollout is on its own mesh and actor+reference share
+    # one. Same extraction and weight sync handling as colocated. Adds:
+    # rollout_idle_time = weight sync begin - end of the last rollout span;
+    # first_micro_batch_rollout_time = end of first rollout span - global step
+    # begin; between_micro_batch_gap_time = for consecutive pairs, begin of
+    # reference span i+1 minus end of actor train group i, plus a trailing 0.0.
+    # Output keys: as colocated plus perf/rollout_idle_time,
+    # perf/first_micro_batch_rollout_time and sum/mean of
+    # between_micro_batch_gap_time. Exceptions: IndexError if no rollout spans.
+    # KNOWN ISSUE: docstring lists a role_to_devices argument; the actual
+    # first argument is extract_spans_fn.
     """GRPO workflow: actor and reference are on the same mesh,rollout is on a different mesh.
 
     Args:
@@ -377,6 +450,19 @@ class PerfMetricsExport:
       trace_writer: PerfettoTraceWriter | None,
       query: PerfSpanQuery,
   ) -> MetricsT:
+    # [FUNCTION DOC]
+    # HELPER: Metrics for the fully disaggregated layout. Same extraction; if
+    # no weight_sync span exists, logs a warning and returns {}. Computes
+    # global step / weight sync durations, rollout idle time and first
+    # micro-batch rollout time as in the 2-mesh layout, plus refer_gap_time and
+    # actor_gap_time lists computed for consecutive pairs as (end of next -
+    # begin of previous), each with a trailing 0.0. Output keys: global step,
+    # weight sync, rollout idle, first micro batch rollout, and sum/mean of
+    # rollout_time, refer_inference_time, refer_gap_time, actor_train_time,
+    # actor_train_step_time, actor_gap_time.
+    # KNOWN ISSUE: the "gap" values are spans covering both items (next end -
+    # previous begin), not the idle gap between them; docstring lists a
+    # role_to_devices argument that does not exist.
     """GRPO workflow: rollout, actor and reference are all on different meshes.
 
     Args:
@@ -483,6 +569,27 @@ class PerfMetricsExport:
   ) -> tuple[
       bool, list[SpanGroup], list[Span], list[Span], list[SpanGroup], list[Span]
   ]:
+    # [FUNCTION DOC]
+    # HELPER: Extracts GRPO spans for the LAST global step.
+    # Inputs: role_to_devices; keyword-only flags for micro-batch logging and
+    #   the query.
+    # Behavior: host timelines = main thread id then other "thread-" ids
+    #   sorted; collect the last "global_step" group from each (main first).
+    #   None found -> warning and (False, [empty-named group], [], [], [], []).
+    #   Build a selector last global_step -> all mini_batch_step -> all
+    #   micro_batch_steps and evaluate it on the main thread and on the first
+    #   device id of rollout, refer and actor roles. If any device result is
+    #   empty -> warning and the same failure tuple. Collect: "rollout" spans
+    #   from rollout groups; "refer_inference" spans directly in refer groups
+    #   and inside their "actor_training" groups; "actor_training" groups from
+    #   actor groups; "peft_train_step" spans inside main thread
+    #   "actor_training" groups. If either logging flag is set, logs the number
+    #   of global steps on the main thread, then per-item actor train and/or
+    #   rollout durations.
+    # Output: (True, global step groups, rollout spans, refer spans, actor
+    #   train groups, actor train step spans). Exceptions: KeyError/IndexError
+    #   for missing roles or empty device lists; ValueError from query.get for
+    #   unknown timeline ids.
     """Extracts spans and span groups of the last global step for GRPO workflow."""
 
     # Get all global step groups from all host threads. The first

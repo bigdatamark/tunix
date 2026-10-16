@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.generate.sampler.Sampler (forked from the Flax Gemma sampler tests), using the toy
+# transformer and mock vocabulary from tunix.tests.test_common plus tiny Gemma4 configs. Covers dtype
+# selection, padded versus unpadded outputs, multimodal prompts with images, greedy/beam/top-p/top-k
+# sampling, logprobs, prefill compilation bucketing, replacing transformer (and LoRA) state, EOS handling,
+# forbidden tokens and Gemma4 decode-only-last-token consistency. No side effects beyond JIT compilation.
 
 # Forked from flax/examples/gemma/sampler_test.py
 
@@ -30,12 +36,19 @@ from tunix.tests import test_common as tc
 
 @dataclasses.dataclass(kw_only=True, frozen=True)
 class ModelConfigWithDtype(tc.ModelConfig):
+  # [CLASS DOC]
+  # HELPER: frozen, keyword-only dataclass extending the test ModelConfig with a dtype field defaulting to
+  # bfloat16, used to check that the sampler picks dtype from the model config.
   dtype: jax.numpy.dtype = jax.numpy.bfloat16
 
 
 class SamplerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test suite for the vanilla Tunix Sampler.
 
   def assertReasonableTensor(self, array, expected_shape=None):
+    # [FUNCTION DOC]
+    # HELPER: asserts array is not None and, if expected_shape is given, that its shape matches.
     self.assertIsNotNone(array)
     if expected_shape is not None:
       self.assertEqual(array.shape, expected_shape)
@@ -53,6 +66,9 @@ class SamplerTest(parameterized.TestCase):
       ),
   )
   def test_dtype(self, config_class, expected_dtype):
+    # [FUNCTION DOC]
+    # Verifies sampler.dtype is float32 when the model config has no dtype and bfloat16 when the config
+    # declares it.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=config_class(vocab_size=vocab.GetPieceSize()),
@@ -98,6 +114,12 @@ class SamplerTest(parameterized.TestCase):
       ),
   )
   def test_samples_padding_output(self, max_prompt_length, echo, return_logits):
+    # [FUNCTION DOC]
+    # Verifies pad_output True and False give identical texts for two prompts across max_prompt_length/echo/
+    # return_logits combinations; when logits are returned, unpadded logits and tokens equal the padded ones
+    # truncated after the last non-pad token, and without echo padded tokens have length max_generation_steps.
+    # KNOWN ISSUE: token equality and padded-length checks are nested under the return_logits condition, so
+    # they are skipped in cases without logits.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -152,6 +174,10 @@ class SamplerTest(parameterized.TestCase):
           )
 
   def test_multimodal_samples(self):
+    # [FUNCTION DOC]
+    # Verifies multimodal sampling: with a multimodal mock vocab, a toy transformer with a vision config and a
+    # dummy image processor, sampling two prompts containing image placeholders with echo and logits returns
+    # the exact expected token ids (prompt plus deterministic generation).
     vocab = tc.MockVocab(is_multimodal=True)
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(
@@ -161,8 +187,12 @@ class SamplerTest(parameterized.TestCase):
     )
 
     class DummyImageProcessor:
+      # [CLASS DOC]
+      # HELPER: fake image processor.
 
       def __call__(self, images):
+        # [FUNCTION DOC]
+        # HELPER: returns float32 ones of shape (number of images, 1, 32, 32, 3) regardless of image contents.
         # returns dummy processed images
         return np.ones((len(images), 1, 32, 32, 3), dtype=np.float32)
 
@@ -234,6 +264,10 @@ class SamplerTest(parameterized.TestCase):
       ),
   )
   def test_samples(self, max_prompt_length, echo):
+    # [FUNCTION DOC]
+    # Verifies greedy sampling returns logits of shape (13, vocab) with echo or (10, vocab) without for the
+    # first prompt; beam size 1 matches greedy text; beam size 2 runs; high-temperature top-p sampling differs
+    # from greedy and differs between default and seed 42; adding top_k 3 changes the output again.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -321,6 +355,9 @@ class SamplerTest(parameterized.TestCase):
     self.assertNotEqual(top_p_result_2.text, top_k_result.text)
 
   def test_logprobs(self):
+    # [FUNCTION DOC]
+    # Verifies return_logprobs gives one non-empty logprob sequence per prompt, of the same length as its
+    # tokens, for greedy, top-p and beam search sampling.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -376,6 +413,9 @@ class SamplerTest(parameterized.TestCase):
       self.assertLen(logprobs, tokens.shape[0])
 
   def test_prompt_padding_bucketization(self):
+    # [FUNCTION DOC]
+    # Verifies prefill compilation is cached by padded prompt-length bucket: zero compiled entries initially,
+    # one after short prompts, and two after prompts of 5 and 6 tokens (which share one longer bucket).
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -410,6 +450,9 @@ class SamplerTest(parameterized.TestCase):
     self.assertEqual(sampler._compiled_prefill_fn._cache_size(), 2)  # pytype: disable=attribute-error
 
   def test_state_update(self):
+    # [FUNCTION DOC]
+    # Verifies assigning new Param variables from a differently seeded model to transformer_state changes the
+    # generated logits (the closeness check is expected to fail).
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
@@ -442,6 +485,9 @@ class SamplerTest(parameterized.TestCase):
         np.testing.assert_allclose(orig, new, atol=1e-1, rtol=1e-1)
 
   def test_lora_state_update(self):
+    # [FUNCTION DOC]
+    # Verifies assigning perturbed (plus 0.1) LoRA params from another LoRA model to transformer_state changes
+    # the generated logits.
     vocab = tc.MockVocab()
     transformer = tc.get_lora_model(
         tc.ToyTransformer(
@@ -486,6 +532,9 @@ class SamplerTest(parameterized.TestCase):
         np.testing.assert_allclose(orig, new, atol=1e-1, rtol=1e-1)
 
   def test_invalid_state_update(self):
+    # [FUNCTION DOC]
+    # Verifies assigning Params from a model with a different number of layers raises ValueError mentioning
+    # "must have the same structure".
     vocab = tc.MockVocab()
 
     transformer = tc.ToyTransformer(
@@ -511,6 +560,9 @@ class SamplerTest(parameterized.TestCase):
       sampler.transformer_state = nnx.variables(new_transformer, nnx.Param)
 
   def test_invalid_lora_state_update(self):
+    # [FUNCTION DOC]
+    # Verifies assigning LoRA params from a LoRA model with a different number of layers raises ValueError
+    # mentioning "must have the same structure".
     vocab = tc.MockVocab()
 
     transformer = tc.get_lora_model(
@@ -544,6 +596,9 @@ class SamplerTest(parameterized.TestCase):
       sampler.transformer_state = nnx.variables(new_transformer, nnx.LoRAParam)
 
   def test_eos_tokens(self):
+    # [FUNCTION DOC]
+    # Verifies generation stops at any of the given eos_tokens (7 or 21), returning the expected truncated
+    # token sequences for seed 0 sampling.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -574,6 +629,9 @@ class SamplerTest(parameterized.TestCase):
     )
 
   def test_forbidden_token_ids(self):
+    # [FUNCTION DOC]
+    # Verifies forbidden_tokens (all ids from a quarter of the vocab upward plus EOS) never appear in a
+    # 100-step random generation, which therefore has full length.
     vocab = tc.MockVocab()
     transformer = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -609,6 +667,9 @@ class SamplerTest(parameterized.TestCase):
     self.assertNoCommonElements(result.tokens[0], forbidden_tokens)
 
   def test_gemma4_smoke_test(self):
+    # [FUNCTION DOC]
+    # Smoke test: sampling with a tiny two-layer Gemma4 (local sliding plus global attention, bfloat16) and a
+    # mock tokenizer whose DecodeIds is mocked completes without error.
     """Runs a sampling call with a dummy Gemma4 config.
 
     Useful to catch JAX compilation and model implementation errors early.
@@ -657,6 +718,9 @@ class SamplerTest(parameterized.TestCase):
     )
 
   def test_gemma4_decode_only_last_token_consistency(self):
+    # [FUNCTION DOC]
+    # Verifies a tiny Gemma4 sampler supports decode-only-last-token mode and that forcing the mode off yields
+    # identical generated tokens and logits within 1e-5.
     """Verifies that decode_only_last_token yields identical generated tokens and logits."""
     config = gemma4_model_lib.ModelConfig(
         num_layers=2,

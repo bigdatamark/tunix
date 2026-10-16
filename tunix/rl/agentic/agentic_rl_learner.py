@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Abstract base for agentic RL learners (e.g. GRPO) that train a policy from
+# multi-turn agent/environment rollouts collected asynchronously.
+# Architecture: the learner owns a dedicated asyncio event loop running forever on
+# a daemon thread (default executor sized max_concurrency + 1). Training
+# (train) runs on the caller's thread: it feeds batches of prompts into a
+# thread-safe prompt queue; a producer coroutine on the loop turns each prompt
+# into num_generations (agent, env) pairs, runs them through a RolloutOrchestrator
+# / TrajectoryCollectEngine in "Token" mode, groups finished trajectories by
+# group_id, converts groups into TrainExamples via the subclass's
+# _process_results (rewards + advantages), and pushes them into a data queue
+# consumed by the training loop, which updates the actor (and critic if present),
+# periodically evaluates, and at each full-batch boundary syncs weights to the
+# rollout model under a RolloutSyncLock and enqueues the next prompt batch.
+# off_policy_steps + 1 batches are prefetched, allowing rollouts to run ahead.
+# Also defines: type aliases ArrayLike, TrainingInputT (dict of str to list of str
+# or array), RewardFn, MetricFn; TrainExample (common.TrainExample plus an
+# optional policy_version array); AgenticRLConfig; type var TConfig.
+# Imports reward_manager and the agentic rewards module only for their
+# registration side effects.
 """Base class for Agentic RL Learners."""
 
 from __future__ import annotations
@@ -60,11 +80,26 @@ MetricFn = Callable[..., rl_cluster_lib.MetricsT]
 
 @flax.struct.dataclass(frozen=True)
 class TrainExample(common.TrainExample):
+  # [CLASS DOC]
+  # Frozen flax struct dataclass extending common.TrainExample with policy_version
+  # (numpy array or None), the policy version(s) that generated the sample, used for
+  # off-policy filtering.
   policy_version: np.ndarray | None = None
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class AgenticRLConfig(algo_config_lib.AlgorithmConfig):
+  # [CLASS DOC]
+  # Slotted keyword-only dataclass extending AlgorithmConfig. Fields (defaults):
+  # system_prompt (""), reward_manager name ("agentic-sequence-level", looked up in
+  # the function registry), max_response_length (1024 tokens per episode; must
+  # equal the rollout config max_tokens_to_generate), max_concurrency (32
+  # concurrent episodes), off_policy_steps (0), num_generations (1 samples per
+  # prompt, also the group size), num_iterations (1 optimization passes per
+  # batch), episode_timeout (1800.0 s), filter_statuses (set of TrajectoryStatus or
+  # None for the engine default), overlong_filter (False), use_rollout_logps (True:
+  # use rollout logprobs as old logprobs; requires return_logprobs in rollout
+  # config).
   """Base configuration for Agentic RL algorithms.
 
   Parameters:
@@ -98,9 +133,19 @@ TConfig = TypeVar("TConfig", bound=AgenticRLConfig)
 
 
 class AgenticRLLearner(abc.ABC, Generic[TConfig]):
+  # [CLASS DOC]
+  # Abstract generic learner parameterized by its config type. Subclasses must
+  # implement _process_results. Holds the RL cluster, reward manager, agent/env
+  # classes and kwargs, a background event loop, rollout sync lock, batch-size
+  # bookkeeping, policy_version counter, eval bookkeeping, and reward windows used
+  # for per-step log summaries (guarded by a threading lock).
   """Base class for Agentic RL Learners using asynchronous rollouts."""
 
   class _AsyncQueueIterator:
+    # [CLASS DOC]
+    # HELPER: Async iterator adapting a blocking queue.Queue: each __anext__ runs the
+    # blocking get in the loop's default executor and stops iteration on a None
+    # sentinel.
     """Async iterator that yields items from a sync queue."""
 
     def __init__(
@@ -108,13 +153,21 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         q: queue.Queue[TrainingInputT | None],
         loop: asyncio.AbstractEventLoop,
     ):
+      # [FUNCTION DOC]
+      # HELPER: Store the queue and event loop.
       self.q = q
       self.loop = loop
 
     def __aiter__(self):
+      # [FUNCTION DOC]
+      # HELPER: Return self (the object is its own async iterator).
       return self
 
     async def __anext__(self):
+      # [FUNCTION DOC]
+      # HELPER: Coroutine. Await queue.get in the executor; raise StopAsyncIteration if
+      # the item is None, otherwise return it. Occupies one executor thread while
+      # blocked.
       item = await self.loop.run_in_executor(None, self.q.get)
       if item is None:
         raise StopAsyncIteration
@@ -136,6 +189,30 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       ] = task_environment.TaskEnvironment,
       env_kwargs: Dict[str, Any] | None = None,
   ):
+    # [FUNCTION DOC]
+    # Construct the learner.
+    # Inputs: rl_cluster (RLCluster with actor trainer, rollout, tokenizer, configs),
+    # algo_config, reward_fns (single function, list or None, handed to the reward
+    # manager), chat_parser (optional BaseChatTemplateParser; when None the cluster
+    # applies the tokenizer's chat template), metric_fns (stored, default empty),
+    # agent_class (default ModelAgent) and agent_kwargs, env_class (default
+    # TaskEnvironment) and env_kwargs.
+    # Behavior: validates rollout configs; builds the reward manager from the
+    # registry by algo_config.reward_manager; marks the actor trainer (and critic
+    # trainer if the attribute exists) as externally managed; sets
+    # rl_cluster.global_steps from the actor trainer's restored global step; copies
+    # iter_steps; initializes eval counters (_last_eval_train_step -1 so eval runs at
+    # most once per optimizer step under gradient accumulation); decides
+    # should_sync_weights (actor and rollout models not sharing weights) and
+    # can_enable_async_rollout (actor and rollout meshes differ); reads rollout and
+    # compute-logps micro batch sizes (logps defaulting to 1); logs HBM usage; sets
+    # chat_parser, tokenizer, policy_version (= global steps), a RolloutSyncLock,
+    # _full_batch_size 0, _process_in_consumer False; starts a daemon thread that
+    # creates/gets an event loop, installs a ThreadPoolExecutor of max_concurrency + 1
+    # workers as its default executor, hands the loop back through a queue and runs it
+    # forever; records the global-step start time; creates reward windows and lock.
+    # Exceptions: ValueError from config validation; registry lookup errors.
+    # Side effects: mutates rl_cluster state; starts a thread that is never stopped.
     """Initializes the `AgenticRLLearner`.
 
     Args:
@@ -257,6 +334,12 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     self._rewards_window_lock = threading.Lock()
 
   def _validate_rollout_config(self):
+    # [FUNCTION DOC]
+    # HELPER: Check every rollout config (a single config treated as "train", or each
+    # value of a mode-keyed dict) against the algo config.
+    # Exceptions: ValueError if max_tokens_to_generate differs from
+    # max_response_length; if use_rollout_logps is set but return_logprobs is false;
+    # or if the cluster's rollout engine is "vllm" without rollout_vllm_server_mode.
     """Validates that the rollout config is properly aligned with the algo config."""
     rollout_config = self.rl_cluster.cluster_config.rollout_config
     if not isinstance(rollout_config, dict):
@@ -295,6 +378,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       expected_step: int | None = None,
       **kwargs,
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: Compute rewards via the reward manager and record them.
+    # Inputs: prompts, completions, mode (TRAIN/EVAL), expected_step (default 0),
+    # extra kwargs forwarded to the reward manager.
+    # Behavior: adds kwargs["mode"] = str(mode) (ValueError if "mode" was already
+    # present); calls the reward manager with prompts, completions and kwargs; buffers
+    # its "log_metrics" asynchronously at expected_step; appends the rewards to the
+    # train or eval window under the lock, trimming the train window to the most
+    # recent full_batch_size * num_generations values when full batch size is known.
+    # Outputs: the reward manager's "rewards" value (as returned, not converted).
+    # Exceptions: ValueError as above; KeyError if the manager result lacks keys.
+    # KNOWN ISSUE: docstring claims a JAX array return and RuntimeError cases that the
+    # code does not implement.
     """Computes the rewards for completions using the provided reward functions.
 
     Args:
@@ -358,6 +454,18 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       full_batch_iterator: Iterator[TrainingInputT],
       micro_batch_size: int,
   ) -> Iterator[TrainingInputT]:
+    # [FUNCTION DOC]
+    # HELPER: Generator re-batching dict batches into micro-batches.
+    # Inputs: iterator of dict batches; micro_batch_size.
+    # Behavior: keeps a per-key list buffer. Each incoming batch's values are added:
+    # numpy/JAX arrays are flattened element-wise, lists/tuples are extended,
+    # scalars/other values appended as one item. While the buffer length (measured
+    # by the first key) is at least micro_batch_size, yields a dict whose values are
+    # numpy arrays of the first micro_batch_size items per key, removing them.
+    # Leftover items smaller than one micro-batch are dropped at the end.
+    # KNOWN ISSUE: multi-dimensional arrays are flattened, so per-example rows of 2D
+    # fields are split into scalars and misaligned with other keys; keys of unequal
+    # lengths are not detected.
     """Re-batches large inputs into an iterator of micro-batches.
 
     Args:
@@ -370,6 +478,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     buffer = {}
 
     def get_buffer_len(buf: dict[str, list[Any]]) -> int:
+      # [FUNCTION DOC]
+      # HELPER: Length of the first value list in the buffer, or 0 if empty.
       if not buf:
         return 0
       return len(next(iter(buf.values())))
@@ -398,6 +508,15 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
   def _create_agent_env_pair(
       self, single_example: TrainingInputT, group_id: int, pair_index: int
   ) -> tuple[base_agent.ConversationAgentBase, base_environment.BaseTaskEnv]:
+    # [FUNCTION DOC]
+    # HELPER: Build one (agent, env) pair for an example.
+    # Inputs: single_example (dict for one prompt), group_id, pair_index.
+    # Behavior: instantiates agent_class with system_prompt from the config, overridden
+    # by any agent_kwargs entries; asserts env_kwargs contains neither "group_id" nor
+    # "pair_index"; instantiates env_class with the example as first positional
+    # argument plus group_id, pair_index and env_kwargs as keywords (ending up in the
+    # env's extra_kwargs for BaseTaskEnv subclasses).
+    # Outputs: (agent, env). Exceptions: AssertionError; constructor errors.
     """Constructs an (agent, environment) pair for a single input sample.
 
     This is used to set up a rollout for one generation within a group.
@@ -431,6 +550,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       env: Any = None,
       max_generation_steps: int | None = None,
   ) -> base_rollout.RolloutOutput:
+    # [FUNCTION DOC]
+    # HELPER: Model-call function given to the trajectory engine.
+    # Inputs: chat_lists (message list), env (optional), max_generation_steps.
+    # Behavior: if env is given, writes the current policy_version into env.task
+    # (mutating the task). If a chat_parser exists, renders the messages into a single
+    # prompt string as a first message with generation prompt. Builds perf tags from
+    # env.extra_kwargs: group id, step (group_id // full batch size, when known) and
+    # pair index. Calls rl_cluster.generate with the prompts, apply_chat_template
+    # true only when no chat parser is set, mode TRAIN (also used for eval
+    # rollouts), the tags and max_generation_steps.
+    # Outputs: RolloutOutput. Exceptions: propagates generation errors.
+    # KNOWN ISSUE: when a chat_parser is used, a single string (not a list) is passed
+    # as prompts; correctness relies on rl_cluster.generate accepting it.
     """Calls model generation."""
     if env:
       env.task["policy_version"] = self.policy_version
@@ -463,6 +595,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     return result
 
   def _build_orchestrator(self) -> rollout_orchestrator.RolloutOrchestrator:
+    # [FUNCTION DOC]
+    # HELPER: Create a RolloutOrchestrator using TrajectoryCollectEngine with
+    # engine kwargs: model_call = _model_call, tokenizer, chat_parser, timeout =
+    # episode_timeout, max_response_length, overlong_filter, filter_statuses,
+    # perf_v2 = cluster tracer; max_concurrency from config; shared rollout sync lock.
     """Builds and configures a RolloutOrchestrator for parallel rollouts."""
     engine_kwargs = dict(
         model_call=self._model_call,
@@ -488,6 +625,25 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       num_generations: int = 1,
       collect_mode: str = "Token",
   ):
+    # [FUNCTION DOC]
+    # HELPER: Async generator yielding groups of trajectory results.
+    # Inputs: orchestrator, prompt_iterator (sync iterable or async iterator of
+    # single-example dicts), num_generations (pairs per prompt), collect_mode
+    # (default "Token").
+    # Behavior: defines an async pair stream that starts group_id at
+    # global_steps * full_batch_size and, for each example, creates num_generations
+    # (agent, env) pairs concurrently in executor threads (each with a deep copy of
+    # the example), yields them, then increments group_id. Starts
+    # run_producers_from_stream as a background task with group size
+    # config.num_generations and grouping by env.extra_kwargs["group_id"], yields
+    # control once, then iterates orchestrator.yield_batches with batch size
+    # num_generations (from the config), yielding each non-empty group (a list of
+    # TrajectoryItems whose traj is the "Token"-mode dict).
+    # On exit (normal, GeneratorExit or cancellation) cancels the producer task if
+    # still running and schedules a fire-and-forget task awaiting its cancellation.
+    # KNOWN ISSUE: the docstring calls num_generations "episodes per pair";
+    # group_size and batch size use config.num_generations while pairs per prompt use
+    # the parameter, so differing values would break grouping.
     """Generates trajectory groups using the orchestrator pattern.
 
     Args:
@@ -502,6 +658,9 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     is_async_iterator = hasattr(prompt_iterator, "__aiter__")
 
     async def pairs_stream_generator():
+      # [FUNCTION DOC]
+      # HELPER: Async generator of (agent, env) pairs with per-prompt group ids; see
+      # the enclosing function.
       """Yield (agent, env) pairs with unique group_id per original prompt."""
       # TODO (tsbao): fix the group id when we can resume from mid global step
       # with mini-batch.
@@ -571,6 +730,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         producer_task.cancel()
 
         async def await_cancellation():
+          # [FUNCTION DOC]
+          # HELPER: Await the cancelled producer task, suppressing CancelledError.
           with contextlib.suppress(asyncio.CancelledError):
             await producer_task
 
@@ -582,6 +743,12 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       batch_results: list[Any],
       mode: rl_cluster_lib.Mode,
   ) -> List[TrainExample]:
+    # [FUNCTION DOC]
+    # HELPER: Convert a list of TrajectoryItems into TrainExamples.
+    # Behavior: expected step is first item's group_id // full batch size in TRAIN
+    # mode, or the cluster's global_steps otherwise; delegates to _process_results.
+    # Exceptions: IndexError on an empty list; ZeroDivisionError if full batch size
+    # is 0 in TRAIN mode.
     """Converts a group of trajectories into a list of `TrainExample`s.
 
     Args:
@@ -611,6 +778,10 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
       expected_step: int | None = None,
   ) -> List[TrainExample]:
+    # [FUNCTION DOC]
+    # Abstract. Turn trajectories of a group (or several groups) into TrainExamples:
+    # compute rewards, advantages and model inputs. Inputs: trajectories, mode
+    # (default TRAIN), expected_step. Base returns None.
     """Processes generation results, computes rewards and advantages."""
     pass
 
@@ -619,16 +790,22 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       training_input: TrainingInputT,
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
   ) -> TrainExample:
+    # [FUNCTION DOC]
+    # Not used by agentic learners; always raises NotImplementedError.
     """Unused in AgenticRLLearner."""
     raise NotImplementedError(
         "_generate_and_compute_advantage is not used in AgenticRLLearner"
     )
 
   def _num_iterations(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Return config.num_iterations.
     """Returns the number of iterations per batch."""
     return self.algo_config.num_iterations
 
   def _num_generations(self) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Return config.num_generations.
     """Returns the number of generations per prompt."""
     return self.algo_config.num_generations
 
@@ -638,11 +815,25 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       prompt_queue: queue.Queue[TrainingInputT | None],
       train_data_queue,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Coroutine running on the background loop; produces training data.
+    # Inputs: orchestrator, prompt_queue (blocking queue of full prompt batches,
+    # None = end), train_data_queue (data queue for the consumer).
+    # Behavior: wraps prompt_queue as an async iterator and splits each batch into
+    # single-example micro-batches (size 1). Iterates _orchestrator_producer in
+    # "Token" mode with config num_generations. For each group: if
+    # _process_in_consumer, puts the raw group into the data queue; otherwise converts
+    # it to TrainExamples and puts every example num_iterations times (repeated passes
+    # in order). Non-RuntimeError exceptions are logged with traceback and re-raised.
+    # Finally always puts None into train_data_queue (end signal) and None into
+    # prompt_queue (to unblock waiters).
     """Produces training examples from prompts in the dataset_iterator."""
     loop = asyncio.get_running_loop()
     async_queue_iter = self._AsyncQueueIterator(prompt_queue, loop)
 
     async def _iterate_micro_batches():
+      # [FUNCTION DOC]
+      # HELPER: Async generator yielding single-example dicts from queued batches.
       async for item in async_queue_iter:
         for prompt in self._create_micro_batch_iterator(iter([item]), 1):
           yield prompt
@@ -684,6 +875,10 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
   def _data_consumer_batch_generator(
       self, queue: queue_lib.AbstractDataQueue, batch_size: int
   ):
+    # [FUNCTION DOC]
+    # HELPER: Generator grouping queue items into lists of up to batch_size, reading
+    # with blocking get until a None sentinel; the final list may be shorter; returns
+    # when no items remain. The parameter name shadows the queue module locally.
     """Yields micro-batches from a queue until a None is received."""
     item_iterator = iter(lambda: queue.get(block=True), None)
     while True:
@@ -698,6 +893,48 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       eval_dataset: Iterable[TrainingInputT] | None = None,
       skip_jit: bool = False,
   ) -> None:
+    # [FUNCTION DOC]
+    # Main training loop (blocking; runs on the caller's thread).
+    # Inputs: train_dataset (iterable of full batches, dicts of equal-length
+    # columns), optional eval_dataset, skip_jit (forwarded to trainer updates).
+    # Behavior:
+    # 1. If resuming (global_steps > 0), skip that many batches; if the dataset runs
+    # out, log, close the cluster and return. If the dataset is empty, likewise.
+    # 2. full_batch_size = length of the first column of the first batch; derive
+    # mini_batch_size (config or full) and train_micro_batch_size (config or mini).
+    # Rollout micro batch size is forced to 1. If compute_logps micro batch size > 1
+    # it must equal train_micro_batch_size (else ValueError) and switches to
+    # "process in consumer" mode (raw groups are converted in the training loop).
+    # Checks the rollout, logps and mini batch sizes divide full_batch_size.
+    # 3. Builds eval prompts as single-example dicts; creates the data queue,
+    # orchestrator and prompt queue; prefetches off_policy_steps + 1 batches (None if
+    # the data runs out); starts _producer on the background loop.
+    # 4. Consumes items in groups of train_micro_batch_size (optionally sequence
+    # packed when max_seq_token_per_tpu is set). For each micro-batch: stop (putting
+    # None in the prompt queue) once max_steps is reached; increment iter steps;
+    # build the merged TrainExample (convert groups in consumer mode, else
+    # concatenate the TrainExamples along axis 0). If eval prompts exist and the
+    # actor's train_steps is a multiple of eval_every_n_steps and differs from the
+    # last eval step, run a full eval rollout on the loop (blocking) and pass the eval
+    # examples to the update. Split the merged example along the batch axis into
+    # chunks of train_micro_batch_size * num_generations sequences (only arrays whose
+    # leading dim equals the total are sliced). Call update_actor (and update_critic
+    # if present) num_iterations times in consumer mode, otherwise once.
+    # 5. After full_batch_size / train_micro_batch_size micro-batches (one global
+    # step): log a one-line summary (train reward mean, solve rate with threshold
+    # 0.1, count, mean abs advantage, mean completion length, time, best-effort
+    # trainer metrics such as loss, grad_norm, pg_loss, entropy, kl, log-ratio,
+    # clipfrac, and eval reward/solve when eval ran), buffer the step time metric;
+    # then either (weights not shared) acquire the weight-sync lock, sync weights
+    # (which increments global_steps inside the cluster), increment policy_version,
+    # enqueue the next prompt batch, and release the lock; or (shared weights)
+    # increment global_steps and enqueue the next batch. Export perf metrics and
+    # reset per-step counters.
+    # 6. Waits for the producer future (re-raising its exception) and closes the
+    # cluster.
+    # KNOWN ISSUE: the micro-batch count per global step uses full_batch_size //
+    # train_micro_batch_size, which assumes divisibility; in process-in-consumer mode
+    # the micro-batch summary uses only the last micro-batch's advantages and masks.
     """Main training loop for the AgenticRLLearner."""
     full_batch_iterator = iter(train_dataset)
 
@@ -862,6 +1099,10 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         eval_orchestrator = self._build_orchestrator()
 
         async def _eval_runner_async(current_eval_orchestrator):
+          # [FUNCTION DOC]
+          # HELPER: Coroutine collecting eval TrainExamples by running _orchestrator_producer
+          # over all eval prompts (EVAL mode conversion) and returning the concatenated
+          # list.
           eval_examples = []
           async for batch in self._orchestrator_producer(
               current_eval_orchestrator,
@@ -1081,6 +1322,12 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       prompt_queue: queue.Queue[TrainingInputT | None],
       batch,
   ):
+    # [FUNCTION DOC]
+    # HELPER: Enqueue a prompt batch or an end-of-data marker.
+    # Behavior: if max_steps is set and reached, puts None; else if the batch's size
+    # (length of its first column) differs from full_batch_size, logs a warning and
+    # puts None; else puts the batch.
+    # KNOWN ISSUE: the docstring says StopIteration is raised; it is not.
     """Puts a batch of prompts into the queue.
 
     If the batch size does not match the expected full batch size, a warning is
@@ -1117,6 +1364,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       self,
       train_micro_batch: List[TrainExample],
   ) -> List[TrainExample]:
+    # [FUNCTION DOC]
+    # HELPER: Keep examples whose policy_version is present and either -1 (unknown)
+    # or at most off_policy_steps behind the current policy_version (first element
+    # used). Logs a warning when all are dropped. Returns the kept list. Currently
+    # unused (call site commented out).
     """Filters out outdated off-policy examples."""
     filtered_train_micro_batch = []
     for train_example in train_micro_batch:

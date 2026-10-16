@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: String constants for the experimental (v2) span/event perf data
+# model. Tag keys: STEP "step", MINI_BATCH "mini_batch_step", MICRO_BATCH
+# "micro_batch_step", ROLE "role", GROUP_ID "group_id", PAIR_INDEX
+# "pair_index", NAME "NAME". Span names: DATA_LOADING "data_loading", ROLLOUT
+# "rollout", WEIGHT_SYNC "weight_sync", REFERENCE_INFERENCE
+# "reference_inference", OLD_ACTOR_INFERENCE "old_actor_inference",
+# ADVANTAGE_COMPUTATION "advantage_computation", PEFT_TRAIN "peft_train",
+# ENVIRONMENT "environment", QUEUE "queue". No logic.
+# KNOWN ISSUE: NAME's value is upper-case unlike every other tag key, and
+# MICRO_BATCH ("micro_batch_step") differs from the v1 group name
+# "micro_batch_steps".
 """Constants for performance metrics."""
 
 # Tags for Span / Event based data model.

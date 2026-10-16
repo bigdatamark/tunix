@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.common numerical helpers: KL divergence estimators
+# (kl, mse_kl, low_var_kl) with optional symmetric output clamping and fp32
+# upcasting, selective log-softmax, per-token log-prob computation through a
+# toy transformer (plain and sequence-packed), process_ids validation,
+# completion-mask construction (NumPy and JAX), pad_to_length, and
+# aggregate_loss across loss aggregation modes including validation of the
+# norm argument and fp32 output.
+# Side effects: at import, sets global JAX config jax_threefry_partitionable
+# False and jax_default_matmul_precision "highest" for reproducibility.
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from flax import nnx
@@ -25,6 +36,8 @@ jax.config.update("jax_threefry_partitionable", False)
 jax.config.update("jax_default_matmul_precision", "highest")
 
 class CommonTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for tunix.rl.common; no shared fixtures.
 
   @parameterized.named_parameters(
       (
@@ -71,6 +84,11 @@ class CommonTest(parameterized.TestCase):
       ),
   )
   def test_compute_kl_divergence(self, method, expected_value):
+    # [FUNCTION DOC]
+    # Verifies each KL method on uniform random (2, 2, 4) policy and
+    # reference log-probs from split PRNGKey(0) matches precomputed values
+    # (atol 1e-5, rtol 1e-2). For reference: kl is the plain log-ratio,
+    # mse_kl half its square, low_var_kl the k3 estimator.
     rng = jax.random.PRNGKey(0)
     k1, k2 = jax.random.split(rng)
     per_token_logps = jax.random.uniform(k1, shape=(2, 2, 4))
@@ -83,6 +101,10 @@ class CommonTest(parameterized.TestCase):
     )
 
   def test_selective_log_softmax(self):
+    # [FUNCTION DOC]
+    # Verifies selective_log_softmax gathers the log-softmax of each target
+    # id from (2, 4, 8) logits, matching precomputed values, and that the
+    # jitted version agrees with the eager one.
     rng = jax.random.PRNGKey(0)
     logits = jax.random.uniform(rng, shape=(2, 4, 8))
     input_ids = jax.random.randint(rng, shape=(2, 4), minval=0, maxval=8)
@@ -102,6 +124,12 @@ class CommonTest(parameterized.TestCase):
     )
 
   def test_get_per_token_logps(self):
+    # [FUNCTION DOC]
+    # Verifies get_per_token_logps on a toy transformer with
+    # logits_to_keep 2 returns (2, 2) log-probs matching precomputed values.
+    # KNOWN ISSUE: positions are all ones and the same positions array is
+    # passed to make_causal_attn_mask as if it were an input mask, which is
+    # not a realistic setup.
     rng = jax.random.PRNGKey(0)
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     input_tokens = jax.random.randint(rng, shape=(2, 4), minval=0, maxval=8)
@@ -118,6 +146,9 @@ class CommonTest(parameterized.TestCase):
     )
 
   def test_process_ids_raises_value_error(self):
+    # [FUNCTION DOC]
+    # Verifies process_ids raises ValueError when segment_ids are given
+    # (packed sequences) without segment_positions.
     prompt_tokens = jnp.array([[1, 2], [3, 4]])
     completion_tokens = jnp.array([[5, 6], [7, 8]])
     segment_ids = jnp.array([[1, 1, 2, 2], [1, 1, 2, 2]])
@@ -258,6 +289,13 @@ class CommonTest(parameterized.TestCase):
       segment_positions,
       expected_logps,
   ):
+    # [FUNCTION DOC]
+    # Verifies compute_per_token_logps on a split toy transformer (pad 0,
+    # eos -1) matches precomputed per-token log-probs for unpacked inputs,
+    # a packed batch with one segment per row (first position 0.0, the
+    # completion part equal to the unpacked values), and a packed batch with
+    # two segments per row; also verifies return_logits True yields logits
+    # of shape (batch, length, 256).
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     graphdef, state = nnx.split(model)
 
@@ -293,6 +331,9 @@ class CommonTest(parameterized.TestCase):
     )
 
   def test_np_make_completion_mask(self):
+    # [FUNCTION DOC]
+    # Verifies the NumPy completion mask is 1 up to and including the first
+    # occurrence of the default eos id (0) and 0 afterwards.
     completion_ids = np.array(
         [
             [1, 2, 3, 4],
@@ -312,6 +353,8 @@ class CommonTest(parameterized.TestCase):
     np.testing.assert_allclose(np_completion_mask, expected_value)
 
   def test_make_completion_mask(self):
+    # [FUNCTION DOC]
+    # Verifies the JAX completion mask matches the NumPy semantics above.
     completion_ids = jnp.array(
         [
             [1, 2, 3, 4],
@@ -331,6 +374,11 @@ class CommonTest(parameterized.TestCase):
     np.testing.assert_allclose(completion_mask, expected_value)
 
   def test_pad_to_length(self):
+    # [FUNCTION DOC]
+    # Verifies pad_to_length pads along axis 0 by default or a given axis,
+    # with pad_value (default 0), on the right by default or left when
+    # requested, and returns input unchanged when already at least the
+    # target length.
     x = jnp.ones((2, 4))
     padded_x = common.pad_to_length(x, target_length=5)
     self.assertEqual(padded_x.shape, (5, 4))
@@ -494,6 +542,16 @@ class CommonTest(parameterized.TestCase):
       kwargs,
       expected_loss,
   ):
+    # [FUNCTION DOC]
+    # Verifies aggregate_loss for each mode on (batch, length) losses and
+    # masks: token-mean = masked sum / mask count; sequence-mean-token-mean
+    # = mean over sequences with any valid token of per-sequence masked
+    # means; sequence-mean-token-scale = per-sequence masked sum divided by
+    # norm (default the sequence length), averaged over sequences with
+    # valid tokens; sequence-mean-token-sum-norm = total masked sum divided
+    # by norm (default the batch size); seq-mean-token-sum = mean over
+    # sequences with valid tokens of per-sequence masked sums. All-zero
+    # masks give 0.0.
     per_token_loss = jnp.array(per_token_loss_list)
     completion_mask = jnp.array(completion_mask_list)
     actual_loss = common.aggregate_loss(
@@ -502,6 +560,9 @@ class CommonTest(parameterized.TestCase):
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=1e-6)
 
   def test_invalid_mode(self):
+    # [FUNCTION DOC]
+    # Verifies an unknown aggregation mode raises ValueError "Unsupported
+    # loss aggregation mode".
     with self.assertRaisesRegex(
         ValueError, "Unsupported loss aggregation mode"
     ):
@@ -540,6 +601,9 @@ class CommonTest(parameterized.TestCase):
       ),
   )
   def test_invalid_norm(self, norm_val, loss_agg_mode):
+    # [FUNCTION DOC]
+    # Verifies zero, negative or non-numeric norm raises ValueError
+    # "Invalid 'norm' value" for both norm-using modes.
     with self.assertRaisesRegex(ValueError, "Invalid 'norm' value"):
       common.aggregate_loss(
           jnp.ones((2, 2)),
@@ -549,6 +613,9 @@ class CommonTest(parameterized.TestCase):
       )
 
   def test_compute_kl_divergence_bf16(self):
+    # [FUNCTION DOC]
+    # Verifies bfloat16 inputs produce a float32 low_var_kl result equal
+    # (rtol 1e-3) to computing on float32-cast inputs.
     per_token_logps = jnp.array([-10.0, -1.0, 0.0], dtype=jnp.bfloat16)
     ref_per_token_logps = jnp.array([-1.0, -10.0, 0.0], dtype=jnp.bfloat16)
 
@@ -569,6 +636,8 @@ class CommonTest(parameterized.TestCase):
       ("low_var_kl", "low_var_kl"),
   )
   def test_compute_kl_divergence_output_clamp_default_is_no_op(self, method):
+    # [FUNCTION DOC]
+    # Verifies omitting clamp_value and passing None give identical results.
     rng = jax.random.PRNGKey(0)
     k1, k2 = jax.random.split(rng)
     per_token_logps = jax.random.uniform(k1, shape=(2, 2, 4))
@@ -590,6 +659,9 @@ class CommonTest(parameterized.TestCase):
       ("low_var_kl", "low_var_kl"),
   )
   def test_compute_kl_divergence_output_clamp_caps_outliers(self, method):
+    # [FUNCTION DOC]
+    # Verifies with clamp_value 10 every output of each method lies within
+    # [-10, 10] even for extreme log-prob differences of 100.
     per_token_logps = jnp.array([-50.0, 0.0, 50.0], dtype=jnp.float32)
     ref_per_token_logps = jnp.array([50.0, 0.0, -50.0], dtype=jnp.float32)
     clamp = 10.0
@@ -603,6 +675,8 @@ class CommonTest(parameterized.TestCase):
     self.assertTrue(bool(jnp.all(kl <= clamp)))
 
   def test_compute_kl_divergence_output_clamp_passes_through_in_range(self):
+    # [FUNCTION DOC]
+    # Verifies a large clamp leaves in-range kl values bit-identical.
     per_token_logps = jnp.array([0.1, 0.2, 0.3], dtype=jnp.float32)
     ref_per_token_logps = jnp.array([0.4, 0.5, 0.6], dtype=jnp.float32)
     unclamped = common.compute_kl_divergence(
@@ -617,6 +691,9 @@ class CommonTest(parameterized.TestCase):
     np.testing.assert_array_equal(clamped, unclamped)
 
   def test_compute_kl_divergence_output_clamp_symmetric(self):
+    # [FUNCTION DOC]
+    # Verifies the kl method clamps symmetrically: a log-ratio of +200
+    # becomes 5.0 and -200 becomes -5.0 with clamp_value 5.
     per_token_logps = jnp.array([100.0], dtype=jnp.float32)
     ref_per_token_logps = jnp.array([-100.0], dtype=jnp.float32)
     pos = common.compute_kl_divergence(
@@ -635,6 +712,9 @@ class CommonTest(parameterized.TestCase):
     np.testing.assert_array_equal(neg, jnp.array([-5.0]))
 
   def test_aggregate_loss_bf16(self):
+    # [FUNCTION DOC]
+    # Verifies bfloat16 per-token loss aggregates (token-mean) to a float32
+    # result of 1.5 for losses 1, 2, 3 with the last masked out.
     per_token_loss = jnp.array([1.0, 2.0, 3.0], dtype=jnp.bfloat16)
     completion_mask = jnp.array([1, 1, 0], dtype=jnp.int32)
 

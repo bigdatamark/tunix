@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Utility functions shared by the tunix samplers (native, vLLM, SGLang-JAX).
+# Groups:
+# 1. Decoding helpers: attention mask construction for prefill/decode,
+#    position computation from masks, power-of-two rounding, padding of numpy
+#    arrays, locating first/last pad and EOS tokens (JAX and numpy variants),
+#    extraction of fixed-length outputs from token/logit buffers, sampling-mode
+#    conflict checks, extraction of log-probs from vLLM outputs.
+# 2. Mapping-based weight transfer (transfer_state_with_mappings): maps a
+#    trainer nnx State into an inference engine State using a key-mapping dict
+#    (with wildcards and scanned-layer support), transposes, hook functions,
+#    shape alignment (reshape, zero-pad head dim, repeat KV heads, MoE layout),
+#    dtype casting, tied lm_head syncing and final resharding.
+# 3. Direct structural weight transfer (transfer_state_directly), mainly for
+#    MaxText to MaxText-on-vLLM: unwraps containers, intersects trees, unstacks
+#    scanned layers, fuses MoE wi_0/wi_1 into wi, aligns shapes per axis with
+#    jitted repeat/zero-pad, and reshards (optionally in chunks while deleting
+#    old destination buffers to save HBM).
+# 4. resolve_parallelism_sizes and verify_state_closeness.
+# Defines two exceptions (ShapeMismatchError, MappingError, both ValueError
+# subclasses) and the constant _MOE_MLP_WEIGHTS = {wi, wi_0, wi_1}.
 
 """Utility functions for sampler."""
 
@@ -34,6 +55,16 @@ import numpy as np
 def compute_attention_masks(
     time_step: int, seq_len: int, input_mask: jax.Array
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Builds the decode-step attention mask.
+  # Inputs: time_step (current decoding index, may be traced), seq_len (cache
+  # size / mask width), input_mask [B, L] where True marks padding positions.
+  # Behavior: a position j is blocked if j > time_step. The pad mask is sliced
+  # to a window of min(L, seq_len) columns starting at max(time_step - seq_len
+  # + 1, 0), placed into a [B, seq_len] array of False (extra columns False),
+  # and OR-ed with the causal block. Returns the negation reshaped to
+  # [B, 1, seq_len]: True where attention is allowed (non-pad, not in future).
+  # No side effects.
   """Computes causal attention mask."""
   batch_size = input_mask.shape[0]
   batch_time_step = jnp.full((batch_size, 1), time_step, dtype=jnp.uint32)
@@ -59,6 +90,11 @@ def compute_attention_masks(
 
 
 def make_causal_attn_mask(input_mask: jax.Array, cache_size: int) -> jax.Array:
+  # [FUNCTION DOC]
+  # Builds the prefill attention mask of shape [B, T, cache_size] from input_mask
+  # [B, T] (True for valid tokens): a query at i may attend to key j if j <= i
+  # and token j is valid; columns T..cache_size-1 are padded with False.
+  # Raises AssertionError if cache_size < T.
   """Create causal attention mask for prefill.
 
   The causal attention mask during prefill phase is having shape
@@ -84,6 +120,11 @@ def make_causal_attn_mask(input_mask: jax.Array, cache_size: int) -> jax.Array:
 
 
 def next_power_of_2(x: int) -> int:
+  # [FUNCTION DOC]
+  # Returns the smallest power of two that is at least x (1 for x equal to 0),
+  # computed via ceil of log2 using jnp floats and converted to a Python int.
+  # KNOWN ISSUE: float32 log2 can misround for very large x; negative x is not
+  # handled.
   """Returns the next power of 2 that is not smaller than x."""
   if x == 0:
     return 1
@@ -97,6 +138,11 @@ def pad_to_length(
     left=False,
     axis: int = 0,
 ) -> np.ndarray:
+  # [FUNCTION DOC]
+  # Pads numpy array x along axis to target_length with pad_value (array dtype
+  # preserved), on the left if left is True else the right. Returns x itself
+  # (not a copy) when its length is already at least target_length; no
+  # truncation.
   """Pads a numpy array to a specified target length along a given axis.
 
   Args:
@@ -126,6 +172,10 @@ def pad_to_length(
 
 
 def find_first_non_pad_idx(ids, pad_id):
+  # [FUNCTION DOC]
+  # JAX-traceable: returns the index of the first element of the 1-D array ids
+  # that differs from pad_id, or 0 if all elements are pad. Raises
+  # AssertionError if ids is not 1-D.
   """Finds the index of the first non-pad token."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
   mask = ids != pad_id
@@ -139,6 +189,10 @@ def find_first_non_pad_idx(ids, pad_id):
 
 
 def find_first_eos_idx(ids, eos_id: int | jax.Array):
+  # [FUNCTION DOC]
+  # JAX-traceable: returns the index of the first element of 1-D ids contained
+  # in eos_id (an int, converted to a one-element array, or an array of ids), or
+  # the length of ids if none. Raises AssertionError if ids is not 1-D.
   """Finds the index of the first EOS token."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
   if isinstance(eos_id, int):
@@ -150,6 +204,9 @@ def find_first_eos_idx(ids, eos_id: int | jax.Array):
 
 
 def np_find_first_non_pad_idx(ids: np.ndarray, pad_id: int) -> int:
+  # [FUNCTION DOC]
+  # Numpy (host) version of find_first_non_pad_idx: first index whose value
+  # differs from pad_id as a Python int, 0 if none. AssertionError if not 1-D.
   """Numpy version of find_first_non_pad_idx. Works on CPU arrays."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
   mask = ids != pad_id
@@ -159,6 +216,9 @@ def np_find_first_non_pad_idx(ids: np.ndarray, pad_id: int) -> int:
 def np_find_first_eos_idx(
     ids: np.ndarray, eos_id: int | jax.Array,
 ) -> int:
+  # [FUNCTION DOC]
+  # Numpy (host) version of find_first_eos_idx: first index whose value is in
+  # eos_id (int or array), else len(ids). AssertionError if not 1-D.
   """Numpy version of find_first_eos_idx. Works on CPU arrays."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
   if isinstance(eos_id, int):
@@ -168,6 +228,11 @@ def np_find_first_eos_idx(
 
 
 def find_last_non_pad_idx(ids, pad_id):
+  # [FUNCTION DOC]
+  # JAX-traceable: returns the index of the last non-pad element of 1-D ids, or
+  # the array length if all elements are pad. AssertionError if not 1-D.
+  # KNOWN ISSUE: returning the length (an out-of-range index) for an all-pad
+  # array differs from the first-non-pad helper, which returns 0.
   """Finds the index of the last non-pad token."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
   mask = ids != pad_id
@@ -201,6 +266,12 @@ def padded_fill_tokens_and_logits(
     max_prompt_length: int,
     max_total_length: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+  # [FUNCTION DOC]
+  # Jitted (return_logits, echo, pad_value, max_prompt_length, max_total_length
+  # static) batched wrapper: vmaps single_padded_fill_tokens_and_logits over the
+  # batch axis of token_buffers [B, L] and logits_buffers [B, L, V] (or None)
+  # with the other arguments broadcast. Returns (lengths [B], tokens
+  # [B, max_total_length], logits [B, max_total_length, V] or None).
   """Truncates the token_buffers and logits_buffers to the valid output.
 
   For the token_buffers, find the valid output tokens from the start_idx to the
@@ -247,6 +318,17 @@ def single_padded_fill_tokens_and_logits(
     max_prompt_length: int,
     max_total_length: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+  # [FUNCTION DOC]
+  # Extracts one row's valid output into a fixed-length array (traceable).
+  # start = first non-pad index if echo, else max_prompt_length; end = first
+  # EOS index within the generated region (from max_prompt_length on) plus
+  # max_prompt_length (row length if no EOS); length = end - start.
+  # Tokens: right-pad the buffer with max_total_length pad values, take a
+  # max_total_length window from start, replace positions at or beyond length
+  # with pad_value. Logits (when return_logits; asserts the buffer is not None):
+  # same window over the zero-padded [L, V] buffer, zeroing positions beyond
+  # length. Returns (length as array, tokens, logits or None). The EOS token
+  # itself is excluded.
   """Generates tokens and logits from the input token_buffer and logits_buffer."""
   start_idx = (
       find_first_non_pad_idx(token_buffer, pad_value)
@@ -283,6 +365,12 @@ def single_padded_fill_tokens_and_logits(
 
 
 def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:
+  # [FUNCTION DOC]
+  # Computes position ids from a boolean valid-token mask [..., L]: the
+  # inclusive cumulative count of valid tokens minus one, clamped so leading
+  # pad positions get 0 (each position where the count is at least 1 is
+  # decremented). Pad tokens after the first valid token repeat the previous
+  # position.
   """Computes the `positions` from the `input_mask`.
 
   Args:
@@ -304,6 +392,12 @@ def check_sampling_mode_conflict(
     ],  # pass in as list to modify in place
     new_sampling_mode: str,
 ) -> None:
+  # [FUNCTION DOC]
+  # HELPER: sets a single-element list holding the current sampling mode. If
+  # the element is already non-None raises ValueError describing the conflict;
+  # otherwise stores new_sampling_mode in it (in-place side effect).
+  # KNOWN ISSUE: the error text says top_p takes precedence, but in practice any
+  # combination of beam_size and top_p raises.
   """Checks if the new sampling mode conflicts with the original sampling mode."""
 
   if original_sampling_mode[0] is not None:
@@ -322,6 +416,13 @@ def get_logprobs_from_vllm_output(
     token_ids: List[int],
     logprobs: List[Optional[Dict[int, Any]]],
 ) -> List[float]:
+  # [FUNCTION DOC]
+  # Extracts the log-prob of each sampled token from vLLM output.
+  # Inputs: token_ids list and logprobs, a list (per position) of dicts mapping
+  # token id to an object with a logprob attribute. Returns an empty list (and
+  # debug log) if logprobs is empty or its first entry is None. Asserts equal
+  # lengths (AssertionError). Returns the list of logprob values of the sampled
+  # tokens; raises ValueError if a sampled id is missing from its position dict.
   """Extracts the log probs from the vLLM output."""
   if not logprobs or logprobs[0] is None:
     logging.debug('Logprobs are missing')
@@ -348,6 +449,26 @@ def build_flat_dict(
     flat_state: Iterator[tuple[tuple[str, ...], nnx.State]],
     mappings: Dict[str, tuple[str, tuple[int, ...]]],
 ):
+  # [FUNCTION DOC]
+  # Builds, from the TARGET flat state and a mapping dict, a dict keyed by the
+  # concrete source key.
+  # Inputs: flat_state, iterable of (key tuple, target Variable) pairs;
+  # mappings, dict from source key pattern (dot path, may contain asterisk
+  # segments) to (target pattern, sharding spec).
+  # Each target pattern is compiled to an anchored regex: if it contains a pipe
+  # or parentheses it is used verbatim as a regex; otherwise it is regex-escaped
+  # with each dot-asterisk replaced by a dot followed by a digit-capturing
+  # group. For each target path (keys joined with dots) the first matching
+  # pattern wins; asterisk segments of the source pattern are filled in order
+  # with the captured groups to form the concrete source key.
+  # If the sharding spec contains layer (scanned parameter), entries are
+  # accumulated as lists of (layer number from first capture or 0, value) and
+  # (layer number, path), later sorted by layer number and stripped to values
+  # list, paths list, sharding. Otherwise the entry is (value, path, sharding),
+  # later entries overwriting earlier ones. Unmatched target paths are logged in
+  # one warning.
+  # Returns dict source key to (target Variable or list, target path or list,
+  # sharding).
   """Build a new flat dictionary from the flat state using the provided mappings.
 
   Args:
@@ -441,18 +562,27 @@ def build_flat_dict(
 
 
 class ShapeMismatchError(ValueError):
+  # [CLASS DOC]
+  # Exception (ValueError subclass) raised when a source weight shape cannot be
+  # aligned to the target shape.
   """Raised when source and target shapes are incompatible."""
 
   pass
 
 
 class MappingError(ValueError):
+  # [CLASS DOC]
+  # Exception (ValueError subclass) for invalid or missing key mappings.
+  # KNOWN ISSUE: defined but never raised in this module.
   """Raised when key mappings are invalid or missing."""
 
   pass
 
 
 def _get_layer_axis_from_sharding_spec(sharding_spec) -> Optional[int]:
+  # [FUNCTION DOC]
+  # HELPER: returns the index of the first entry equal to layer in a list/tuple
+  # sharding spec, else None (also None for non-sequence specs).
   """Returns index of the 'layer' axis in sharding_spec, or None if not found."""
   if isinstance(sharding_spec, (list, tuple)):
     for i, spec in enumerate(sharding_spec):
@@ -465,6 +595,18 @@ def _unroll_scanned_layers(
     src_state: Any,
     src_to_tgt_map: Dict,
 ) -> Dict[Tuple[str, str], Tuple[Any, Any]]:
+  # [FUNCTION DOC]
+  # HELPER: pairs source leaves with target parameters, splitting scanned
+  # source tensors per layer.
+  # Iterates src_state.flat_state(); skips keys containing rng (debug log) and
+  # keys absent from src_to_tgt_map (error log, skipped). If the sharding spec
+  # has a layer axis, slices the source value along that axis for each layer i
+  # and maps (source key, i-th target path) to (slice, i-th target param);
+  # otherwise maps (source key, target path) to (value, target param).
+  # Returns that dict.
+  # KNOWN ISSUE: the layer axis is the position of layer in the TARGET sharding
+  # spec but is used to index the SOURCE array, which assumes both layouts put
+  # the layer axis at the same index.
   """Unroll scanned layers from source state and map to target keys.
 
   Args:
@@ -518,6 +660,15 @@ def _apply_transpose(
     transpose_keys: Optional[Dict[str, Tuple[int, ...]]],
     rollout_engine: Optional[str],
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: transposes val if transpose_keys configures this source key.
+  # Returns val unchanged when transpose_keys is empty. Lookup order: the last
+  # dotted component (if it lacks lora), then the full key (if it lacks lora),
+  # then any pattern containing asterisk (escaped, asterisks become wildcard)
+  # matching the full key. If found, returns val transposed by that axes tuple.
+  # Otherwise, for rollout engine sglang_jax and keys containing lora, the first
+  # transpose key that matches as a raw regex prefix causes val to get a new
+  # leading axis and be transposed with that permutation. Else returns val.
   """Apply transpose operation if configured for this key."""
   if not transpose_keys:
     return val
@@ -558,6 +709,38 @@ def _align_shape(
     rollout_engine: Optional[str] = None,
     **kwargs,
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: aligns a source array to a target shape for mapping-based transfer.
+  # Returns val if shapes are equal. Rank mismatch cases (by source key regex):
+  # - layers.*.attn.q/k/v_bias: if sizes match, reshape to (tgt[0], size/tgt[0]);
+  #   else assert val size equals num_kv_heads*head_dim, tgt[0] divisible by
+  #   num_kv_heads and tgt[1] equals head_dim, reshape to (num_kv_heads,
+  #   head_dim), then continue to per-dimension repeat.
+  # - per_layer_input_embedding or per_layer_model_projection.w with 3-D source,
+  #   2-D target and equal sizes: reshape.
+  # - layers.*.attn.q/k/v/o_proj: reshape if sizes match; else (3-D source, 2-D
+  #   target asserted) compute the head dim rounded up to a multiple of 128 and
+  #   the repeat count, form an intermediate 3-D target (for o_proj
+  #   head dim is axis -2, else axis -1), and set a flag to reshape at the end.
+  # - layers.*.moe.gating_einsum (4-D [experts, 2, expert_dim, embed]): split
+  #   gate/up, chunk expert_dim into tp_size shards, zero-pad each chunk to a
+  #   multiple of 128, interleave gate and up per shard, flatten and transpose
+  #   to [experts, embed, padded dim]; returned directly.
+  # - otherwise ShapeMismatchError.
+  # Same-rank case for layers.*.attn.k/v_bias: asserts target first dim is a
+  # larger multiple, reshapes to (num_kv_heads, head_dim), repeats rows and
+  # reshapes to target; returned.
+  # Then requires the key to look like an attention weight (q/k/v/o proj or
+  # bias, or key/query/value/output), else ShapeMismatchError. For each
+  # dimension: larger target on the head dimension (last for non-o_proj,
+  # second to last for o_proj) is zero-padded at the end; larger target on other
+  # dims is repeated (ShapeMismatchError if not divisible); a smaller target
+  # raises ShapeMismatchError. Applies repeats then padding, reshapes to the
+  # final target if flagged (asserting equal size), logs and returns.
+  # kwargs used: num_kv_heads, head_dim, tp_size (KeyError if needed and absent).
+  # KNOWN ISSUE: the docstring says the 1-D KV bias handling is specific to
+  # sglang_jax, but the code applies it for any rollout engine (rollout_engine is
+  # unused).
   """Align source value shape to target shape through padding or repeating.
 
   This function attempts to align the shape of a source JAX array (`val`) to a
@@ -763,6 +946,9 @@ def _align_shape(
 def _apply_dtype_cast(
     val: jax.Array | np.ndarray, tgt_dtype: jnp.dtype, src_key: str
 ) -> jax.Array | np.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: returns val cast to tgt_dtype if dtypes differ (logging a warning
+  # only the first time overall), else val unchanged.
   if val.dtype != tgt_dtype:
     logging.log_first_n(
         logging.WARNING,
@@ -780,6 +966,18 @@ def _sync_tied_lm_head_if_needed(
     tgt_flat_list: List[Tuple[Tuple[str, ...], Any]],
     transferred_target_keys: set[str],
 ) -> None:
+  # [FUNCTION DOC]
+  # HELPER: keeps a materialized lm_head equal to the embedding when tied.
+  # Returns early if any transferred target key ends with lm_head. Otherwise
+  # scans target leaves: the last path ending in embedding or
+  # embed_tokens.weight is the embedding, the last ending in lm_head or
+  # lm_head.weight is the head. If both exist, both have a value attribute and
+  # equal shapes, assigns the embedding value to the head (side effect on the
+  # target Variable).
+  # KNOWN ISSUE: transferred_target_keys holds target paths that may be lists
+  # for scanned params; and any path ending in embedding (e.g. a per-layer or
+  # vision embedding) can be picked instead of the token embedding, depending on
+  # iteration order.
   """Mirrors embed weights into lm_head when the target implies a tied head.
 
   Some JAX/vLLM state layouts materialize `lm_head` as a separate destination
@@ -825,6 +1023,28 @@ def transfer_state_with_mappings(
     rollout_engine=None,
     **kwargs,
 ):
+  # [FUNCTION DOC]
+  # Transfers weights from src_state into dst_state (both nnx States) using key
+  # mappings.
+  # Steps: flatten target; if reshard_fn, record each target leaf's current
+  # sharding; build source-to-target map (build_flat_dict); pair source leaves
+  # with targets, unrolling scanned layers. For each pair: transpose
+  # (_apply_transpose), apply the hook function registered under the source key
+  # if any, align shape (_align_shape with kwargs such as num_kv_heads, head_dim,
+  # tp_size), cast dtype, assign to the target Variable's value, and record the
+  # target key. Then sync a tied lm_head, free the pair dict and run gc.collect.
+  # If reshard_fn: build a flat dict of target values and reshard them to the
+  # recorded shardings, either in chunks (reshard_chunk_size kwarg) or in one
+  # reshard_fn call (deleting old buffers first when delete_dst_buffers), then
+  # assert every target key was resharded and assign the new values.
+  # Returns dst_state.from_flat_path of the updated flat list (the target
+  # Variables were also mutated in place).
+  # Raises ShapeMismatchError, AssertionError, or errors from hooks/reshard.
+  # KNOWN ISSUE: for target leaves without a value attribute, the resharded value
+  # is assigned to a loop variable only and is lost.
+  # KNOWN ISSUE: buffer deletion is effectively a no-op here because the spec
+  # dict holds sharding objects (not arrays) and the deletion helper skips
+  # objects without a delete method.
   """Transfer state using mappings, with optional transpose and shard logic.
 
   Args:
@@ -934,6 +1154,9 @@ def _shapes_are_repeatable(
     candidate_shape: tuple[int, ...],
     tgt_shape: tuple[int, ...],
 ) -> bool:
+  # [FUNCTION DOC]
+  # HELPER: True if both shapes have equal rank and each candidate dimension is
+  # at most and divides the corresponding target dimension.
   """Returns True if candidate_shape can be repeated to match tgt_shape."""
   if len(candidate_shape) != len(tgt_shape):
     return False
@@ -950,6 +1173,17 @@ def _unstack_scanned_param(
     key_path: str,
     scan_axis: Optional[int] = None,
 ) -> Tuple[jax.Array | np.ndarray, ...]:
+  # [FUNCTION DOC]
+  # HELPER: splits a scanned source array into per-layer slices.
+  # Returns a one-element tuple with src_val when either value lacks shape or
+  # shapes are equal. If the source has exactly one more dimension than the
+  # target: when scan_axis is None, picks the first axis whose removal yields a
+  # shape repeatable to the target; moves the scan axis to the front and
+  # unstacks it (jax.unstack, jnp.unstack, or a list comprehension fallback),
+  # returning a sequence of slices; unstack errors are logged at debug and the
+  # original is returned. If no axis is found, logs a warning. Otherwise returns
+  # a one-element tuple of the original.
+  # KNOWN ISSUE: the oldest-JAX fallback returns a list rather than a tuple.
   """Unstacks a scanned parameter by moving the scan axis to 0.
 
   This helper unstacks a scanned array at the specified scan_axis. When scan_axis
@@ -1028,6 +1262,10 @@ def _partition_size(
     partition: Optional[str | Tuple[str, ...]],
     mesh: jax.sharding.Mesh,
 ) -> int:
+  # [FUNCTION DOC]
+  # HELPER: number of devices a partition spec entry spans: 1 for None,
+  # otherwise the product of mesh sizes of the named axis or axes (KeyError for
+  # unknown axis names).
   """Total mesh-axis size used to shard a single tensor axis."""
   if partition is None:
     return 1
@@ -1042,6 +1280,9 @@ def _spec_at_axis(
     sharding: Optional[jax.sharding.Sharding],
     axis: int,
 ) -> Optional[str | Tuple[str, ...]]:
+  # [FUNCTION DOC]
+  # HELPER: returns the partition spec entry at axis for a NamedSharding (None
+  # when the spec is shorter or the sharding is not a NamedSharding).
   """Returns the PartitionSpec entry at the given axis, or None if absent."""
   if not isinstance(sharding, jax.sharding.NamedSharding):
     return None
@@ -1050,6 +1291,9 @@ def _spec_at_axis(
 
 
 def _get_n_shards(arr: jax.Array | np.ndarray, axis: int) -> int:
+  # [FUNCTION DOC]
+  # HELPER: number of shards along an axis of an array with NamedSharding, else
+  # 1.
   """Returns the number of shards for a given axis of an array."""
   sharding = getattr(arr, 'sharding', None)
   if isinstance(sharding, jax.sharding.NamedSharding):
@@ -1059,6 +1303,13 @@ def _get_n_shards(arr: jax.Array | np.ndarray, axis: int) -> int:
 
 @functools.partial(jax.jit, static_argnames=('pad_specs',))
 def _jit_zero_pad_axes(arr, pad_specs):
+  # [FUNCTION DOC]
+  # HELPER (jitted, pad_specs static): per-shard tail zero-padding on several
+  # axes. For each (axis, n_shards, per_shard_extra) with positive extra:
+  # reshape the axis into (n_shards, size/n_shards), zero-pad the inner chunk
+  # by per_shard_extra at its end, and merge back so the axis grows by
+  # n_shards * per_shard_extra. This keeps each shard's real data at the start
+  # of its shard. Assumes the axis size is divisible by n_shards.
   """Shard-aware tail-pad on multiple axes within a single JIT.
 
   `pad_specs` is a tuple of `(axis, n_shards, per_shard_extra)`; entries
@@ -1087,6 +1338,9 @@ def _jit_zero_pad_axes(arr, pad_specs):
 
 @functools.partial(jax.jit, static_argnames=('repeats',))
 def _jit_repeat_axes(arr, repeats):
+  # [FUNCTION DOC]
+  # HELPER (jitted, repeats static): applies element repetition (jnp.repeat)
+  # for each (axis, count) pair in order and returns the result.
   """Apply `jnp.repeat` on multiple axes within a single JIT.
 
   `repeats` is a tuple of `(axis, count)`. One trace covers every
@@ -1104,6 +1358,19 @@ def _align_per_axis(
     tgt_sharding: Optional[jax.sharding.Sharding],
     key_path: str,
 ) -> jax.Array | np.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: aligns an array to a target shape using a single mode.
+  # Returns arr when it has no shape or already matches. Raises
+  # ShapeMismatchError on rank mismatch or when any target dim is smaller.
+  # If the last path component is one of the MoE MLP weights (wi, wi_0, wi_1):
+  # zero-pads each mismatched axis; with a NamedSharding target, padding is per
+  # shard (n_shards from the target spec on that axis), raising ValueError if
+  # the target, source or extra size is not divisible by n_shards; otherwise
+  # global tail padding. Uses the jitted pad helper.
+  # Otherwise repeats each mismatched axis by target/source (ShapeMismatchError
+  # if not an integer multiple) using the jitted repeat helper.
+  # KNOWN ISSUE: the docstring lists wo among MoE weights that get zero-padded,
+  # but _MOE_MLP_WEIGHTS does not contain wo, so wo is repeated instead.
   """Aligns `arr` to `tgt_shape` via either pure-repeat or pure-zero_pad.
 
   Each tensor needs exactly one transform mode in practice:
@@ -1183,6 +1450,13 @@ def _interleave_moe_weights(
     n_shards: int,
     axis: Optional[int] = None,
 ) -> jax.Array | np.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: builds a fused MoE wi tensor from wi_0 and wi_1 with per-shard
+  # interleaving. axis defaults to the last target axis. Each input's axis is
+  # split into (n_shards, chunk) and each chunk zero-padded to
+  # (target size / 2) / n_shards; the two are concatenated along the chunk
+  # axis (so each shard holds its wi_0 chunk followed by its wi_1 chunk) and
+  # reshaped to tgt_shape. Raises on reshape failures if sizes do not divide.
   """Interleaves wi_0 and wi_1 per-shard into a single tensor."""
   if axis is None:
     axis = len(tgt_shape) - 1
@@ -1190,6 +1464,9 @@ def _interleave_moe_weights(
   target_half_dim = tgt_shape[axis] // 2
 
   def _pad_and_chunk(arr):
+    # [FUNCTION DOC]
+    # HELPER: reshapes arr's fused axis into (n_shards, chunk) and zero-pads the
+    # chunk dimension at its end to the per-shard target half size.
     current_total_size = arr.shape[axis]
     chunk_size = current_total_size // n_shards
     target_chunk_size = target_half_dim // n_shards
@@ -1220,6 +1497,10 @@ def _align_to_model_shape(
     tgt_val: jax.Array | np.ndarray,
     key_path: str,
 ) -> jax.Array | np.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: returns src_val unchanged if either value lacks shape or shapes
+  # match; otherwise aligns it to the target's shape using the target's sharding
+  # via _align_per_axis.
   """Aligns src_val to tgt_val's shape via per-axis repeat / zero-pad.
 
   Thin wrapper around `_align_per_axis` that pulls the target's sharding off
@@ -1241,6 +1522,13 @@ def _bulk_align_and_unstack(
     per_layer_tgt_val: jax.Array | np.ndarray,
     key_path: str,
 ) -> Tuple[jax.Array | np.ndarray, ...]:
+  # [FUNCTION DOC]
+  # HELPER: aligns a full scanned tensor in one bulk operation, then unstacks.
+  # The scanned target shape is the per-layer target shape with the source's
+  # layer count inserted at scan_axis; the scanned target sharding inserts None
+  # at scan_axis. If already matching, unstacks directly; otherwise aligns via
+  # _align_per_axis then unstacks along scan_axis. Returns a tuple of per-layer
+  # arrays.
   """Applies per-axis alignment on a scanned tensor, then unstacks.
 
   Operates on the FULL scanned tensor (one bulk repeat / zero-pad per axis,
@@ -1286,6 +1574,10 @@ def _scanned_sharding_from_per_layer(
     per_layer_sharding: Optional[jax.sharding.Sharding],
     scan_axis: int,
 ) -> Optional[jax.sharding.NamedSharding]:
+  # [FUNCTION DOC]
+  # HELPER: returns a NamedSharding equal to the given per-layer one with an
+  # unsharded entry inserted at scan_axis (same mesh and memory kind), or None
+  # for non-NamedSharding input.
   """Builds a scanned `NamedSharding` from a per-layer one by inserting
   `PartitionSpec(None)` at `scan_axis`. Returns None if input isn't a
   NamedSharding."""
@@ -1311,6 +1603,13 @@ def _jit_fuse_and_unstack_moe(
     scan_padded_axis: int,
     tgt_padded_axis: int,
 ) -> Tuple[jax.Array | np.ndarray, ...]:
+  # [FUNCTION DOC]
+  # HELPER (jitted; all args except wi_0 and wi_1 static): fuses scanned
+  # wi_0/wi_1 into wi and splits per layer. Sets the fused axis size (at
+  # scan_padded_axis) to the per-layer target's size at tgt_padded_axis, calls
+  # _interleave_moe_weights on the scanned tensors with that axis, and unstacks
+  # along scan_axis. num_layers is unused except for cache keying. Returns a
+  # sequence of per-layer arrays.
   """Fuses wi_0/wi_1 along the padded axis, then unstacks along scan_axis.
 
   By combining concat and unstack under jax.jit, XLA fuses both ops and
@@ -1344,6 +1643,13 @@ def _fuse_moe_weights(
     src_flat: Dict[Tuple[str, ...], jax.Array | np.ndarray],
     tgt_flat: Dict[Tuple[str, ...], jax.Array | np.ndarray],
 ) -> Dict[Tuple[str, ...], jax.Array | np.ndarray]:
+  # [FUNCTION DOC]
+  # HELPER: for each target key ending in wi whose sibling wi_0 and wi_1 keys
+  # exist in the source (same prefix), removes them from a copy of the source
+  # dict and inserts the interleaved fused tensor under the wi key. The fused
+  # axis is the last axis where wi_0 and the target differ (last axis if none);
+  # the shard count comes from the target's sharding on that axis. Logs each
+  # fusion. Returns the new dict (input dict not mutated).
   """Fuses unscanned wi_0/wi_1 into wi for unscanned-fused targets.
 
   Only catches the case where source and target share the same prefix (e.g.
@@ -1394,6 +1700,13 @@ def _fuse_moe_weights(
 def _collect_src_buffer_ids(
     src_flat: Mapping[Tuple[str, ...], jax.Array | np.ndarray | nnx.Variable],
 ) -> Optional[set[int]]:
+  # [FUNCTION DOC]
+  # HELPER: returns the set of device buffer pointers of every addressable
+  # shard of every source array (unwrapping Variables). Returns None if the
+  # backend does not support unsafe buffer pointers (JaxRuntimeError
+  # mentioning PjRt-compatible backend only, e.g. Pathways); other
+  # JaxRuntimeErrors are re-raised; other exceptions are ignored per shard.
+  # Used to avoid deleting target buffers that alias source data.
   """Collects physical device buffer pointers for arrays in src_flat.
 
   Used to detect when a target jax.Array shares its underlying buffer with a
@@ -1425,6 +1738,13 @@ def _delete_target_buffers(
     spec_flat: Mapping[Tuple[str, ...], jax.Array | np.ndarray | nnx.Variable],
     src_flat: Mapping[Tuple[str, ...], jax.Array | np.ndarray | nnx.Variable],
 ) -> None:
+  # [FUNCTION DOC]
+  # HELPER: deletes (frees device memory of) each target array in spec_flat
+  # that has a delete method and is not already deleted, unless one of its
+  # shards shares a buffer pointer with a source shard (check skipped when
+  # pointers are unavailable). Side effect: target arrays become unusable.
+  # KNOWN ISSUE: the target pointer lookup is not wrapped in the same error
+  # handling as the source collection.
   """Deletes target arrays in spec_flat that don't alias any source shard."""
   # This will be a set() of IDs, or None if we are on Pathways
   src_buffer_ids = _collect_src_buffer_ids(src_flat)
@@ -1449,6 +1769,12 @@ def _delete_target_buffers(
 def _snapshot_dst_sharding(
     arr: jax.Array | np.ndarray,
 ) -> jax.sharding.Sharding:
+  # [FUNCTION DOC]
+  # HELPER: returns a destination sharding for an array or sharding leaf.
+  # NamedSharding/SingleDeviceSharding inputs are returned as-is; otherwise
+  # asserts the object has a sharding attribute and returns it if it is one of
+  # those types, else rebuilds a NamedSharding from its mesh, spec and memory
+  # kind. Called before deletion so the sharding remains accessible.
   """Snapshots a destination sharding leaf for reshard_fn's target tree.
 
   Captured *before* any potential `.delete()` on `arr` so the caller never
@@ -1478,6 +1804,14 @@ def _reshard_in_chunks(
     chunk_size: int,
     delete_spec_buffers: bool = False,
 ) -> Dict[Tuple[str, ...], jax.Array | np.ndarray]:
+  # [FUNCTION DOC]
+  # HELPER: reshards a flat dict in sequential groups of chunk_size keys.
+  # For each chunk: pops source values from src_flat (side effect: the caller's
+  # dict is emptied), snapshots destination shardings from spec_flat,
+  # optionally deletes the chunk's destination buffers (non-aliasing ones),
+  # unflattens, calls reshard_fn(source=..., target=...), blocks until ready,
+  # and merges the flattened result. Returns the flat resharded dict.
+  # Raises KeyError if a source key is missing from spec_flat.
   """Reshards a flat weight dict in sequential chunks to reduce peak HBM pressure.
 
   Instead of issuing one large jax.device_put for the entire model, this helper
@@ -1543,6 +1877,21 @@ def transfer_state_directly(
     delete_dst_buffers: bool = False,
     reshard_chunk_size: Optional[int] = None,
 ) -> None:
+  # [FUNCTION DOC]
+  # Copies weights from src_state into dst_state by structural matching (no key
+  # mappings), then updates dst_state in place with nnx.update; returns None.
+  # Steps: if the source is a Mapping with a base entry, use it (MaxText
+  # TrainState); repeatedly unwrap model entries of the target (vLLM wrappers).
+  # Convert both to pure nested dicts of arrays. Intersect trees (see nested
+  # helper): only target leaves with a resolvable source are kept. Reshard:
+  # chunked via _reshard_in_chunks when reshard_chunk_size is set (deleting
+  # destination buffers per chunk if requested), else snapshot destination
+  # shardings, optionally delete destination buffers, and call
+  # reshard_fn(source, target shardings) once. Finally nnx.update the target.
+  # Side effects: device memory of old destination buffers may be freed;
+  # dst_state is mutated.
+  # KNOWN ISSUE: the docstring says key mismatches are logged, but target keys
+  # without a source match are dropped silently.
   """Transfers state directly by matching structure, stripping wrappers.
 
   This handles the logic for syncing weights where no explicit mapping is provided,
@@ -1571,6 +1920,8 @@ def transfer_state_directly(
       original single-call reshard behavior is preserved.
   """
   def safe_has_key(obj: Mapping[str, Any], key: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: key membership for dicts, attribute existence for other objects.
     if isinstance(obj, dict):
       return key in obj
 
@@ -1593,6 +1944,11 @@ def transfer_state_directly(
   # Helper: Convert Target Spec to Pure Dict (Strip NNX Params)
   # JAX needs a spec tree of pure NamedShardings, not Param(NamedSharding).
   def to_pure_spec(node: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: recursively converts a state into a pure nested dict: calls
+    # to_pure_dict when available, recurses into mappings, unwraps nnx Variables
+    # (their raw value) and objects with a value attribute; other leaves are
+    # returned unchanged.
     # Unwrap NNX containers
     if hasattr(node, 'to_pure_dict'):
       node = node.to_pure_dict()
@@ -1613,6 +1969,18 @@ def transfer_state_directly(
       src: Mapping[str, Any],
       tgt_spec: Mapping[str, Any],
   ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: returns (source subset, target subset) as nested dicts with the
+    # same keys, aligned for resharding. Non-mapping inputs are returned as-is.
+    # Flattens both, fuses same-prefix wi_0/wi_1 into wi, then for each target
+    # key: (1) exact source key: cast to target dtype and align shape; (2) a
+    # path component layers_N: try source keys with that component replaced by
+    # layers or removed; if found, cast and unstack (aligning the full scanned
+    # tensor first if per-layer shapes differ), cached per (source key, target
+    # shape), take slice N and align; (3) target ending in wi with scanned
+    # source wi_0/wi_1 under layers: fuse and unstack once via the jitted helper
+    # (cached), take slice N and align. Unmatched target keys are skipped.
+    # Uses scan_axis from the enclosing function.
     """Optimized intersection (Handle KVCache/RNG mismatches and Scanned Layers).
 
     Uses flat dictionary traversal for efficiency.
@@ -1827,6 +2195,14 @@ def resolve_parallelism_sizes(
     data_parallel_size: int = -1,
     expert_parallel_size: int = 1,
 ) -> tuple[int, int, int]:
+  # [FUNCTION DOC]
+  # Resolves (tensor, data, expert) parallel sizes from the mesh device count
+  # N. Raises ValueError if N is not divisible by expert_parallel_size. If both
+  # tp and dp are -1: tp = N / ep, dp = 1. If only tp is -1: tp = N / (dp*ep).
+  # If only dp is -1: dp = N / (tp*ep). Integer division throughout; explicit
+  # values are returned unchanged.
+  # KNOWN ISSUE: no check that tp*dp*ep equals N, and non-dividing sizes are
+  # silently floored.
   """Resolves tensor, data, and expert parallelism sizes from the mesh.
 
   Any size passed as -1 is inferred from the total number of mesh devices and
@@ -1866,6 +2242,12 @@ def resolve_parallelism_sizes(
 
 
 def verify_state_closeness(golden_state, state, atol=1e-2):
+  # [FUNCTION DOC]
+  # Compares two nnx States leaf by leaf (keyed by dotted paths). Returns False
+  # (logging missing/extra keys) when key sets differ. Otherwise for each key
+  # logs and records a mismatch if shapes differ or values are not allclose
+  # within atol (logging the first 10 values of each). Returns True only if all
+  # match. Values are read via the value attribute of the flat-state leaves.
   """Check if the golden NNX state is close to the other NNX state.
 
   Args:

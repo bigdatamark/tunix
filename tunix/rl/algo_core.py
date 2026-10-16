@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Core numerical pieces of the RL algorithms, registered by name in the
+# default function registry at import time (side effect): advantage
+# estimators "gae", "grpo", "rloo", "drgrpo"; policy losses "ppo" and "grpo";
+# value loss "ppo". Also masked statistics helpers (mean, variance,
+# whitening) and token entropy from logits. Loss functions receive the
+# model being trained and a TrainExample and return a scalar loss plus an
+# aux dict of scalar diagnostics.
 """Algorithm core implementations for RL and Agentic RL learners."""
 
 import functools
@@ -38,6 +46,16 @@ def compute_gae_advantages(
     gamma: float,
     gae_lambda: float,
 ) -> tuple[jax.Array, jax.Array]:
+  # [FUNCTION DOC]
+  # Registered as advantage estimator "gae"; jitted. Inputs: rewards, values and
+  # completion_mask (all batch by T), gamma, gae_lambda. Runs a reverse scan
+  # over time carrying (next GAE, next value), both starting at zero. At step
+  # t: delta = reward + gamma times next value minus value;
+  # gae = delta + gamma times lambda times next GAE; at masked-out positions
+  # both carried quantities pass through unchanged (so padding is skipped).
+  # Advantages are the per-step GAE values; returns = advantages + values
+  # (computed before normalization). Advantages are then whitened over valid
+  # tokens with masked_whiten. Returns (advantages, returns), each batch by T.
   """Compute advantages using Generalized Advantage Estimation (GAE).
 
   Computing GAE is a two-step process:
@@ -77,6 +95,9 @@ def compute_gae_advantages(
   batch_size = values.shape[0]
 
   def gae_step(state_t_plus_1, xs):
+    # [FUNCTION DOC]
+    # HELPER: Scan body for one time step as described above; returns the new
+    # carry (gae_t, next_values) and gae_t as the step output.
     # Unpack state and inputs.
     gae_t_plus_1, next_values = state_t_plus_1
     rewards_t, values_t, mask_t = xs
@@ -117,6 +138,10 @@ def masked_whiten(
     x: jax.Array,
     completion_mask: jax.Array,
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: Jitted. Computes the masked mean and the Bessel-corrected masked
+  # variance of x and returns (x - mean) times reciprocal sqrt(var + 1e-8),
+  # applied to every element including masked ones.
   """Normalize the input array."""
   x_mean = masked_mean(x, completion_mask)
   x_var = masked_var(
@@ -132,6 +157,12 @@ def masked_whiten(
 def masked_mean(
     x: jax.Array, mask: jax.Array, axis: int | None = None
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: Jitted with static axis. Casts mask to x's dtype and returns
+  # sum(x times mask) divided by (sum(mask) + 1e-8) along axis (all elements
+  # when None).
+  # KNOWN ISSUE: when x is boolean (as passed for clip fractions), the mask is
+  # cast to bool and the result relies on implicit integer promotion.
   """Compute the mean of a masked array."""
   cast_mask = mask.astype(x.dtype)
   return jnp.sum(x * cast_mask, axis=axis) / (
@@ -145,6 +176,12 @@ def masked_var(
     mask: jax.Array,
     mean: jax.Array | None = None,
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: Jitted. Masked variance: uses the given mean or computes the masked
+  # mean, takes the masked mean of squared deviations, and multiplies by the
+  # Bessel correction n / (n - 1) where n is the mask sum. Returns a scalar.
+  # KNOWN ISSUE: with exactly one valid element the correction divides by zero
+  # (inf/NaN); with zero valid elements it becomes zero times a negative ratio.
   """Compute the variance of a masked array."""
   cast_mask = mask.astype(x.dtype)
   if mean is None:
@@ -158,6 +195,12 @@ def masked_var(
 
 
 def compute_entropy_from_logits(logits: jax.Array) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: Inputs: logits (batch, seq, vocab). Computes log-softmax, then
+  # probabilities (softmax of the log-probs, equal to softmax of logits), and
+  # returns the negative sum of p times log p over the vocab: per-token
+  # entropy, batch by seq.
+  # KNOWN ISSUE: the docstring calls the last dimension emb_dim; it is vocab.
   """Computes the entropy of a distribution given its logits.
 
   Args:
@@ -186,6 +229,24 @@ def ppo_policy_loss_fn(
     eos_id,
     **kwargs,
 ):
+  # [FUNCTION DOC]
+  # Registered as policy loss "ppo". Inputs: model, train_example (needs
+  # completion ids/mask, prompt ids, per-token advantages, old logps; optional
+  # packing fields), algo_config (epsilon_low, epsilon_high, entropy_coef,
+  # optional epsilon_c, optional kl_coef, kl_clamp_value), pad_id, eos_id,
+  # ignored kwargs. Computes current per-token logps and logits with
+  # gradients. ratio = exp(logp - old logp). Standard clipped loss per token is
+  # the max of -ratio times A and -clip(ratio, 1 - eps_low, 1 + eps_high)
+  # times A. Dual clip (when epsilon_c set): for negative advantages the loss
+  # is the min of that and -epsilon_c times A; pg_clipfrac_lower is the masked
+  # fraction where this lower clip binds. Policy loss is the masked token mean.
+  # If entropy_coef is non-zero, subtracts entropy_coef times masked mean
+  # entropy (aux "loss/entropy"). If config has kl_coef > 0 and reference
+  # logps exist, adds kl_coef times masked mean "kl"-method KL (aux "kl").
+  # Returns (loss, aux) where aux also has pg_clipfrac (fraction of tokens
+  # where the clipped term is larger) and pg_clipfrac_lower.
+  # KNOWN ISSUE: PPOConfig has no kl_coef field, so the KL loss branch is never
+  # active for PPO (KL is applied in rewards instead).
   """PPO policy loss function."""
   epsilon_low = algo_config.epsilon_low
   epsilon_high = algo_config.epsilon_high
@@ -276,6 +337,19 @@ def ppo_value_loss_fn(
     pad_id: int,
     eos_id: int,
 ):
+  # [FUNCTION DOC]
+  # Registered as value loss "ppo". Inputs: critic model, train_example (needs
+  # old_values and returns), clip_range_value, pad_id, eos_id. Computes value
+  # predictions over prompt+completion with gradients and slices them to the
+  # positions preceding each completion token (packed mode: full length minus
+  # one, then left padded by one zero). Clipped prediction = old values plus
+  # the prediction offset clipped to plus/minus clip_range_value. Per-token
+  # loss is the max of squared errors of the raw and clipped predictions
+  # against returns; vf_loss = 0.5 times masked token mean. Returns (vf_loss,
+  # aux) with vf_loss, vpred_mean, vf_clipfrac (fraction where the clipped
+  # error is larger) and return_mean.
+  # KNOWN ISSUE: clip_range_value is typed optional but None would fail in the
+  # arithmetic.
   """Computes the value loss for PPO."""
 
   prompt_ids, completion_ids, completion_mask = (
@@ -347,6 +421,33 @@ def grpo_loss_fn(
     eos_id,
     **kwargs,
 ):
+  # [FUNCTION DOC]
+  # Registered as policy loss "grpo" (used by GRPO, DAPO, Dr. GRPO, GSPO).
+  # Inputs: model, train_example, algo_config (beta, epsilon, loss_algo,
+  # optional epsilon_high and epsilon_c, loss_agg_mode, temperature,
+  # kl_loss_mode, kl_clamp_value), pad_id, eos_id, ignored kwargs. Steps:
+  # 1) Current per-token logps and logits with gradients at the configured
+  # temperature (packing supported); cast to float32. Old logps default to
+  # the detached current logps when absent (ratio 1).
+  # 2) log-ratio = logp - old logp; ppo_kl diagnostic = masked mean of its
+  # negation; clip the log-ratio to [-20, 20].
+  # 3) If loss_algo is "gspo-token": replace by the per-sequence masked mean
+  # log-ratio (detached) plus logp minus detached logp (so the gradient is
+  # per token), then cap at 10.
+  # 4) ratio = exp(log-ratio). Advantages broadcast to tokens if 1-D.
+  # Per-token loss = max(-A ratio, -A clip(ratio, 1 - epsilon,
+  # 1 + epsilon_high)) where epsilon_high defaults to epsilon. Dual clip for
+  # negative advantages as in PPO when epsilon_c is set.
+  # 5) Optionally multiply per-token loss by sampler_is_weights.
+  # 6) Aggregate with common.aggregate_loss and loss_agg_mode.
+  # 7) If reference logps exist, compute KL (kl_loss_mode, clamp), log the
+  # token-mean KL as "kl", aggregate it as "kl_loss", and add beta times it
+  # to the loss when beta is non-zero and not None.
+  # 8) Entropy of logits aggregated the same way (logged only).
+  # Returns (loss, aux) with kl, kl_loss, pg_loss, pg_clipfrac, ppo_kl,
+  # pg_clipfrac_lower, importance-ratio mean/max/min, mean absolute log-ratio,
+  # unclipped/clipped pg loss means, advantage abs-mean/max/min and non-zero
+  # fraction, sampler IS weight mean/min (1.0 when absent), entropy.
   """GRPO loss function.
 
   The loss aims to maximize the expected advantage of the chosen actions while
@@ -547,6 +648,12 @@ def grpo_loss_fn(
 
 @function_registry.register_advantage_estimator("grpo")
 def compute_advantages(rewards: np.ndarray, num_generations: int) -> np.ndarray:
+  # [FUNCTION DOC]
+  # Registered as advantage estimator "grpo". Input rewards (1-D, grouped in
+  # consecutive blocks of num_generations) and num_generations. Per group
+  # computes mean and sample std (ddof 1), repeats them per member, and returns
+  # (reward - mean) / (std + 1e-6). Raises if the length is not divisible by
+  # num_generations; with num_generations 1 the std is NaN.
   """Compute group relative advantages.
 
   Args:
@@ -570,6 +677,11 @@ def compute_advantages(rewards: np.ndarray, num_generations: int) -> np.ndarray:
 def compute_rloo_advantages(
     rewards: jax.Array, num_generations: int
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Registered as advantage estimator "rloo". Returns zeros if num_generations
+  # is below 2. Otherwise, per group, baseline for each member is the mean of
+  # the other members' rewards (group sum minus own reward, divided by G - 1);
+  # returns reward minus baseline, flattened to 1-D.
   """Compute RLOO (REINFORCE Leave-One-Out) advantages.
 
   RLOO computes a baseline for each completion by averaging the rewards of all
@@ -604,6 +716,9 @@ def compute_rloo_advantages(
 def compute_drgrpo_advantages(
     rewards: jax.Array, num_generations: int
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Registered as advantage estimator "drgrpo". Returns rewards minus their
+  # group mean (repeated per member), without dividing by the std.
   """Group relative advantages -- done right.
 
   Args:

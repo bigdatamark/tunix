@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Weight-mapping specification used to transfer Gemma4 NNX weights into the
+# vLLM JAX backend (Hugging Face naming).
+# - Sharding / MappingEntry type aliases: a sharding is a tuple of mesh axis
+#   names or None per dimension; an entry is (HF key, sharding).
+# - TO_HF_MAPPINGS: NNX dotted parameter path pattern ('*' = layer index)
+#   -> (HF parameter name pattern, target sharding on the 'model' axis).
+#   Covers embeddings, attention q/k/v/o einsums and QK norms, all RMSNorms,
+#   dense MLP, layer skip scalar, MoE router/expert weights and norms, and the
+#   per-layer-input embedding/projection/gate weights.
+# - LORA_TO_HF_MAPPINGS: empty (no LoRA mapping support).
+# - TO_HF_TRANSPOSE_KEYS: q/k/v einsum weights are transposed with axes
+#   (1, 0, 2), i.e. [N, D, H] -> [D, N, H].
+# - preprocess_src_state: splits fused kv_einsum weights into separate
+#   k_einsum / v_einsum entries before mapping.
+# - VLLM_JAX_MAPPING: dict bundling the above under keys 'to_hf_mappings',
+#   'lora_to_hf_mappings', 'to_hf_transpose_keys', 'preprocess_src_state'.
 """vLLM JAX backend mappings for Gemma4 models."""
 
 from __future__ import annotations
@@ -149,6 +166,21 @@ TO_HF_TRANSPOSE_KEYS = {
 }
 
 def preprocess_src_state(src_state: Any) -> Any:
+  # [FUNCTION DOC]
+  # Splits fused KV weights in an NNX State.
+  # Input: src_state (anything; only objects with a flat_state method are
+  # processed, others are returned unchanged).
+  # Behavior: iterates over (key path, param) pairs of the flat state; for each
+  # path whose dotted form contains 'attn.kv_einsum.w', takes the value
+  # (param.value if present) [2, K, D, H] and emits two entries with the last
+  # two path elements replaced by ('k_einsum', 'w') with val[0] and
+  # ('v_einsum', 'w') with val[1]; wrapped in a new nnx.Param if the original
+  # had a value attribute, raw arrays otherwise. Other entries are kept. Builds
+  # a new state via src_state.from_flat_path.
+  # Output: the new (or unchanged) state. No mutation of the input.
+  # KNOWN ISSUE: the split weights are always wrapped as nnx.Param, discarding
+  # the original variable type and its metadata (e.g. sharding annotations);
+  # a fused qkv_einsum (MHA layout) is not split and has no mapping entry.
   if hasattr(src_state, 'flat_state'):
     flat_state = list(src_state.flat_state())
     new_flat_state = []

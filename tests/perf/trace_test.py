@@ -1,5 +1,16 @@
 # Copyright 2025 Google LLC
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.trace (perf v1 tracer): PerfTracer records host
+# spans per thread timeline and device spans per device timeline using
+# time.perf_counter (mocked with scripted values); span(..., devices=...)
+# yields an object whose device_end(waitlist) waits for arrays
+# (block_until_ready, possibly asynchronously via _async_wait) and ends the
+# device span then; a device span begins at the later of its host begin and
+# the previous device span's end; span_group creates nested groups mirrored
+# on all timelines; nested plain spans raise ValueError; NoopTracer exposes
+# the same public interface. Module aliases Timeline, DeviceTimeline,
+# ThreadTimeline, NoopTracer, PerfTracer, patch and Mock for brevity.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -31,15 +42,26 @@ Mock = mock.Mock
 
 
 def mock_array():
+  # [FUNCTION DOC]
+  # HELPER: returns a Mock spec'd on a local class with a no-op
+  # block_until_ready, standing in for a JAX array waitlist.
   class JaxArray:
+    # [CLASS DOC]
+    # HELPER: minimal JAX-array-like spec with block_until_ready.
 
     def block_until_ready(self):
+      # [FUNCTION DOC]
+      # HELPER: no-op.
       pass
 
   return Mock(spec=JaxArray)
 
 
 def timeline_tostring(timeline: Timeline) -> str:
+  # [FUNCTION DOC]
+  # HELPER: renders a timeline as '<id>: born=<t> stack=<stack>' plus the span
+  # tree text from span.span_group_tostring relative to born; thread timeline
+  # ids starting with 'thread-' are normalized to 'thread'.
   # ignore thread id diffs.
   timeline_id = (
       timeline.id if not timeline.id.startswith("thread-") else "thread"
@@ -52,6 +74,8 @@ def timeline_tostring(timeline: Timeline) -> str:
 
 
 def timelines_tostring(tracer: PerfTracer) -> list[str]:
+  # [FUNCTION DOC]
+  # HELPER: returns the rendered strings of all tracer timelines in order.
   return [
       timeline_tostring(timeline)
       for timeline in tracer._get_timelines().values()
@@ -59,9 +83,14 @@ def timelines_tostring(tracer: PerfTracer) -> list[str]:
 
 
 class TracerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for PerfTracer and timelines.
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_host_ok(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies a host-only span 'x' is recorded on the thread timeline from 2 to
+    # 3 under root (born 0). Input: patched perf_counter.
     mock_perf_counter.side_effect = [0.0, 2.0, 3.0]
 
     tracer = PerfTracer()
@@ -80,6 +109,9 @@ class TracerTest(parameterized.TestCase):
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_device_ok(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies a device span on 'tpu0' blocks on the waitlist once and records
+    # host (2,3) on the thread timeline and (2,5) on the tpu0 timeline.
     mock_perf_counter.side_effect = [0.0, 2.0, 3.0, 5.0]
     waitlist = mock_array()
 
@@ -109,6 +141,9 @@ class TracerTest(parameterized.TestCase):
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_device_multi_ok(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies with tracer devices tpu0 and tpu1 only the targeted tpu0 gets the
+    # span, while tpu1 has an empty root.
     mock_perf_counter.side_effect = [0.0, 2.0, 3.0, 5.0]
     waitlist = mock_array()
 
@@ -139,6 +174,9 @@ class TracerTest(parameterized.TestCase):
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_device_span_begin_algorithm(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies a second device span starts at the previous device end (5) rather
+    # than its host begin (4).
     mock_perf_counter.side_effect = [0.0, 2.0, 3.0, 5.0, 4.0, 6.0, 7.0]
     waitlist = mock_array()
 
@@ -172,6 +210,9 @@ class TracerTest(parameterized.TestCase):
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_device_all_matcher(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies devices=tracer.all_devices targets every device, blocking once per
+    # device.
     mock_perf_counter.side_effect = [0.0, 2.0, 3.0, 5.0, 5.0]
     waitlist = mock_array()
 
@@ -206,6 +247,9 @@ class TracerTest(parameterized.TestCase):
 
   @mock.patch.object(time, "perf_counter", autospec=True)
   def test_span_group_ok(self, mock_perf_counter):
+    # [FUNCTION DOC]
+    # Verifies nested span groups appear on thread and device timelines, with
+    # device spans only on their target devices and groups mirrored on all.
     mock_perf_counter.side_effect = [
         0.0,
         1.0,
@@ -267,6 +311,8 @@ class TracerTest(parameterized.TestCase):
     )
 
   def test_nested_span_raise_exception(self):
+    # [FUNCTION DOC]
+    # Verifies opening a span inside another span raises ValueError.
     tracer = PerfTracer()
     with tracer.span("outer"):
       with self.assertRaises(ValueError):
@@ -274,6 +320,8 @@ class TracerTest(parameterized.TestCase):
           pass
 
   def test_noop_interface_is_same(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer and PerfTracer expose identical public attribute names.
     noop_public_attrs = [
         name for name in dir(NoopTracer()) if not name.startswith("_")
     ]
@@ -283,6 +331,9 @@ class TracerTest(parameterized.TestCase):
     self.assertEqual(noop_public_attrs, perf_public_attrs)
 
   def test_device_span_with_explicit_group(self):
+    # [FUNCTION DOC]
+    # Verifies DeviceTimeline.device_span with explicit group attaches to that
+    # group, while without group it attaches to the innermost open group.
     timeline = DeviceTimeline("tpu0", 0.0)
 
     # Create nested structure: group1 > group2
@@ -311,6 +362,11 @@ class TracerTest(parameterized.TestCase):
   def test_device_span_async_parent_capture(
       self, mock_perf_counter, mock_async_wait
   ):
+    # [FUNCTION DOC]
+    # Verifies an asynchronously completed device span is attached to the group
+    # active when it began (GroupA), not the group active when it completed
+    # (GroupB). _async_wait is patched to capture the success callback, which is
+    # invoked manually inside GroupB.
     mock_perf_counter.side_effect = [
         0.0,  # 1. __init__ (born)
         1.0,  # 2. span_group("GroupA") begin
@@ -326,6 +382,9 @@ class TracerTest(parameterized.TestCase):
     captured_success_callback = []
 
     def fake_async_wait(waitlist, success, failure):
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait recording the success callback and returning an
+      # autospec'd Thread mock.
       del waitlist, failure  # Unused
       captured_success_callback.append(success)
       return mock.create_autospec(threading.Thread, instance=True)

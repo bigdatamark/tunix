@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.experimental.timeline (perf v2): Span (name,
+# begin, id, end defaulting to infinity, ended/duration, tags with add_tag
+# warning on overwrite, repr with tags), Timeline (stack-based
+# start_span/stop_span with parent ids, cur_step as dict id -> span,
+# commit_step moving completed spans into committed_steps and purging
+# uncompleted ones with a warning, all_steps, repr), AsyncTimeline (span()
+# records a span completed when its waitlist is ready, via _async_wait
+# running jax.block_until_ready in a thread; the async span's parent is the
+# innermost open span; failures are logged, not raised; wait_pending_spans
+# joins and clears threads) and BatchAsyncTimelines (broadcasts span()).
 import threading
 import time
 from unittest import mock
@@ -21,8 +32,13 @@ from tunix.perf.experimental import timeline
 
 
 class SpanTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for timeline.Span.
 
   def test_span(self):
+    # [FUNCTION DOC]
+    # Verifies a new Span has the given name/begin, infinite end, ended False
+    # and infinite duration.
     s = timeline.Span(name="test", begin=1.0, id=0)
     self.assertEqual(s.name, "test")
     self.assertEqual(s.begin, 1.0)
@@ -31,6 +47,8 @@ class SpanTest(absltest.TestCase):
     self.assertEqual(s.duration, float("inf"))
 
   def test_span_with_tags(self):
+    # [FUNCTION DOC]
+    # Verifies tags passed at construction are stored and shown in repr.
     tags_dict = {constants.STEP: 1, "custom_tag": "value"}
     s = timeline.Span(name="test_tags", begin=1.0, id=0, tags=tags_dict)
     self.assertEqual(s.tags, tags_dict)
@@ -38,6 +56,8 @@ class SpanTest(absltest.TestCase):
     self.assertIn("step", repr(s))
 
   def test_add_tag(self):
+    # [FUNCTION DOC]
+    # Verifies add_tag inserts tags (constants.STEP is the key 'step').
     s = timeline.Span(name="test_add_tag", begin=1.0, id=0)
     s.add_tag("foo", "bar")
     self.assertEqual(s.tags, {"foo": "bar"})
@@ -45,6 +65,9 @@ class SpanTest(absltest.TestCase):
     self.assertEqual(s.tags, {"foo": "bar", "step": 100})
 
   def test_add_tag_overwrite_warning(self):
+    # [FUNCTION DOC]
+    # Verifies overwriting a tag replaces the value and logs a WARNING naming
+    # old and new values.
     s = timeline.Span(name="test_add_tag_overwrite", begin=1.0, id=0)
     s.add_tag("foo", "bar")
     with self.assertLogs(level="WARNING") as cm:
@@ -60,8 +83,14 @@ class SpanTest(absltest.TestCase):
 
 
 class TimelineTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for synchronous timeline.Timeline behaviour.
 
   def test_commit_step(self):
+    # [FUNCTION DOC]
+    # Verifies commit_step keeps the completed span, purges the open one with a
+    # 'Purging uncompleted span' warning, clears cur_step, and all_steps lists
+    # committed steps plus the (empty) current step.
     t = timeline.Timeline("test_tl", 0.0)
 
     # Start and stop a span
@@ -97,6 +126,9 @@ class TimelineTest(absltest.TestCase):
       self.assertEqual(t.all_steps[1], {})
 
   def test_basic_span_lifecycle(self):
+    # [FUNCTION DOC]
+    # Verifies start_span returns span id 0 with no parent and stop_span sets
+    # end and ended.
     t = timeline.Timeline("test_tl", 100.0)
     s = t.start_span("span1", 101.0)
     with self.subTest("Span started"):
@@ -112,6 +144,9 @@ class TimelineTest(absltest.TestCase):
       self.assertEqual(s.end, 102.0)
 
   def test_nested_spans(self):
+    # [FUNCTION DOC]
+    # Verifies nested spans get parent_id of the enclosing span and stop_span
+    # ends the innermost span first.
     t = timeline.Timeline("test_tl", 0.0)
     s1 = t.start_span("root", 1.0)
     s2 = t.start_span("child", 2.0)
@@ -125,6 +160,9 @@ class TimelineTest(absltest.TestCase):
     self.assertEqual(s1.end, 4.0)
 
   def test_stop_span_error_cases(self):
+    # [FUNCTION DOC]
+    # Verifies stop_span raises ValueError when no span is open, and when the end
+    # time precedes the span's begin.
     t = timeline.Timeline("test_tl", 0.0)
     with self.assertRaisesRegex(ValueError, "no more spans to end"):
       t.stop_span(1.0)
@@ -135,6 +173,9 @@ class TimelineTest(absltest.TestCase):
       t.stop_span(1.0)
 
   def test_nested_timeline_with_tags_repr(self):
+    # [FUNCTION DOC]
+    # Verifies the exact repr: header with id and born, 'Current Step -0:' and
+    # one line per span with times relative to born, parent and tags.
     born = 1000.0
     t = timeline.Timeline("test_tl", born)
 
@@ -167,22 +208,35 @@ class TimelineTest(absltest.TestCase):
 
 
 class AsyncTimelineTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for AsyncTimeline with timeline._async_wait patched (by default
+  # calling success immediately and returning a Thread mock).
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture starting the _async_wait patch with immediate success.
+    # Side effect: patches the module attribute until tearDown.
     self.patcher = mock.patch.object(timeline, "_async_wait")
     self.mock_async_wait = self.patcher.start()
 
     # Setup mock behavior for _async_wait to immediately succeed by default
     def default_wait(waitlist, success, failure):
+      # [FUNCTION DOC]
+      # HELPER: fake wait invoking success at once; returns an autospec'd Thread.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
     self.mock_async_wait.side_effect = default_wait
 
   def tearDown(self):
+    # [FUNCTION DOC]
+    # HELPER: stops the _async_wait patch.
     self.patcher.stop()
 
   def test_span_success(self):
+    # [FUNCTION DOC]
+    # Verifies span() with a waitlist calls _async_wait once and records an
+    # ended span with the given name and begin.
     t = timeline.AsyncTimeline("dev", 0.0)
     waitlist = ["thing"]
 
@@ -196,6 +250,8 @@ class AsyncTimelineTest(absltest.TestCase):
     self.assertTrue(s.ended)  # Ended because mock calls success immediately
 
   def test_span_with_no_waitlist(self):
+    # [FUNCTION DOC]
+    # Verifies an empty waitlist records an ended span without _async_wait.
     t = timeline.AsyncTimeline("dev", 0.0)
     t.span("immediate", 1.0, [])
     self.mock_async_wait.assert_not_called()
@@ -203,12 +259,17 @@ class AsyncTimelineTest(absltest.TestCase):
     self.assertTrue(t.cur_step[0].ended)
 
   def test_delayed_completion(self):
+    # [FUNCTION DOC]
+    # Verifies a span is recorded only when the success callback fires, with end
+    # taken from time.perf_counter at that moment (patched to 5.0).
     t = timeline.AsyncTimeline("dev", 0.0)
 
     # Capture callbacks
     callbacks = {}
 
     def capture_wait(waitlist, success, failure):
+      # [FUNCTION DOC]
+      # HELPER: fake wait capturing success/failure callbacks without calling them.
       callbacks["success"] = success
       callbacks["failure"] = failure
       return mock.create_autospec(threading.Thread, instance=True)
@@ -227,6 +288,8 @@ class AsyncTimelineTest(absltest.TestCase):
     self.assertEqual(s.end, 5.0)
 
   def test_nested_async_span_parent(self):
+    # [FUNCTION DOC]
+    # Verifies an async span's parent_id is the innermost open sync span.
     t = timeline.AsyncTimeline("dev", 0.0)
 
     # Start sync spans to populate the stack with multiple items
@@ -251,9 +314,15 @@ class AsyncTimelineTest(absltest.TestCase):
     self.assertNotEqual(async_s.parent_id, s1.id)
 
   def test_failure(self):
+    # [FUNCTION DOC]
+    # Verifies a failure callback logs via logging.error with the format
+    # "Timeline span '%s' (id=%d) failed: %s", name, id, error and exc_info,
+    # without raising.
     t = timeline.AsyncTimeline("dev", 0.0)
 
     def fail_wait(waitlist, success, failure):
+      # [FUNCTION DOC]
+      # HELPER: fake wait invoking failure with RuntimeError('failed').
       failure(RuntimeError("failed"))
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -274,6 +343,8 @@ class AsyncTimelineTest(absltest.TestCase):
       self.assertIsInstance(kwargs["exc_info"], RuntimeError)
 
   def test_wait_pending_spans_clears_threads(self):
+    # [FUNCTION DOC]
+    # Verifies wait_pending_spans clears the tracked waiter threads.
     t = timeline.AsyncTimeline("test_tl", 0.0)
     t.span("s1", 1.0, ["wait"])
     t.span("s2", 2.0, ["wait"])
@@ -283,6 +354,10 @@ class AsyncTimelineTest(absltest.TestCase):
     self.assertLen(t._threads, 0)
 
   def test_async_wait_helper(self):
+    # [FUNCTION DOC]
+    # Verifies the real _async_wait starts a thread that calls
+    # jax.block_until_ready(waitlist) (patched) then success, not failure.
+    # Temporarily stops the fixture patch and restarts it afterwards.
     # Temporarily unpatch _async_wait to test the real implementation
     self.patcher.stop()
     try:
@@ -309,8 +384,13 @@ class AsyncTimelineTest(absltest.TestCase):
 
 
 class BatchAsyncTimelinesTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for BatchAsyncTimelines.
 
   def test_span_broadcast(self):
+    # [FUNCTION DOC]
+    # Verifies span() is forwarded with identical args and tags to every
+    # contained AsyncTimeline.
     t1 = mock.create_autospec(timeline.AsyncTimeline, instance=True)
     t2 = mock.create_autospec(timeline.AsyncTimeline, instance=True)
     batch = timeline.BatchAsyncTimelines([t1, t2])

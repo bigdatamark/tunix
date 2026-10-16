@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Tests for tunix.cli.grpo_main.GrpoPipeline: dispatch between standard "grpo" and "agentic_grpo"
+# training modes, raw dataset loading via a data module, overriding nullable config values from CLI args
+# and from T_-prefixed environment variables, rollout KV cache size computation, agentic GRPO algorithm
+# config construction, and per-role mesh creation with explicit or shared meshes and allocation policies.
+# Pipelines are built from a minimal YAML (1x1 meshes, HF tokenizer, vanilla rollout, prompt length 256,
+# generation 512) plus test-specific YAML. Side effects: temporary YAML files (deleted after construction)
+# and temporary HF_TOKEN environment patching; heavy operations are mocked.
 
 """Tests that grpo_main dispatches correctly for both training modes.
 
@@ -35,6 +43,11 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _make_pipeline(extra_yaml: str) -> grpo_main.GrpoPipeline:
+  # [FUNCTION DOC]
+  # HELPER: writes the minimal base YAML followed by extra_yaml to a temporary file, constructs
+  # GrpoPipeline with argv ["", path] while HF_TOKEN is patched to "fake", deletes the file and returns the
+  # pipeline. Raises whatever pipeline construction raises.
+  # KNOWN ISSUE: the temporary file is not deleted if construction raises.
   """Write a minimal valid YAML and instantiate GrpoPipeline against it."""
   base = """
 model_config:
@@ -119,6 +132,9 @@ train_fraction: 1.0
 def _make_pipeline_with_cli_args(
     extra_yaml: str, cli_args: list[str]
 ) -> grpo_main.GrpoPipeline:
+  # [FUNCTION DOC]
+  # HELPER: same as the YAML pipeline helper but appends cli_args (dotted key=value overrides) to argv.
+  # KNOWN ISSUE: the base YAML is duplicated from the other helper, and the temp file leaks on exceptions.
   """Write a minimal valid YAML and instantiate GrpoPipeline with CLI args."""
   base = """
 model_config:
@@ -205,8 +221,13 @@ train_fraction: 1.0
 
 
 class DispatchTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests training-mode dispatch, data loading and nullable config overrides.
 
   def test_agentic_data_module_receives_data_config_for_raw_dataset(self):
+    # [FUNCTION DOC]
+    # Verifies that in agentic mode _load_raw_dataset gets the data module (mocked, exposing batch_fn), calls
+    # _get_dataset exactly once with only the tokenizer, and returns (dataset, module batch_fn).
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -259,6 +280,8 @@ vllm_config:
     )
 
   def test_agentic_nullable_string_can_be_overridden_from_cli(self):
+    # [FUNCTION DOC]
+    # Verifies a null agent_class_path in YAML can be set to a string via a CLI override.
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -302,6 +325,8 @@ vllm_config:
     )
 
   def test_agentic_nullable_dict_can_be_overridden_from_cli(self):
+    # [FUNCTION DOC]
+    # Verifies a null kubernetes_config in YAML can be populated as a dict via dotted CLI overrides.
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -351,6 +376,8 @@ vllm_config:
     )
 
   def test_agentic_nullable_string_can_be_overridden_from_env(self):
+    # [FUNCTION DOC]
+    # Verifies a null agent_class_path can be set from the T_AGENT_CLASS_PATH environment variable.
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -395,6 +422,9 @@ vllm_config:
     )
 
   def test_standard_grpo_dispatches_to_standard(self):
+    # [FUNCTION DOC]
+    # Verifies a config without training_mode defaults to "grpo" and run_grpo_trainer calls _run with
+    # mode "grpo".
     extra = """
 grpo_config:
   num_generations: 2
@@ -414,6 +444,8 @@ verl_compatible: false
       mock_run.assert_called_once_with(mode="grpo")
 
   def test_agentic_grpo_dispatches_to_agentic(self):
+    # [FUNCTION DOC]
+    # Verifies training_mode "agentic_grpo" makes run_grpo_trainer call _run with mode "agentic_grpo".
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -454,6 +486,10 @@ vllm_config:
       mock_run.assert_called_once_with(mode="agentic_grpo")
 
   def test_unknown_mode_raises(self):
+    # [FUNCTION DOC]
+    # Verifies an unsupported training_mode set after construction makes run_grpo_trainer raise ValueError
+    # "Unsupported training_mode 'bad_mode'" once setup steps (Kubernetes, tokenizer, chat parser, dataset
+    # loading, parameter computation, post_init_dataset, RL cluster creation) are mocked.
     # Build pipeline with standard config then manually set bad mode
     extra = """
 grpo_config:
@@ -508,8 +544,12 @@ verl_compatible: false
 
 
 class RolloutConfigTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests the rollout config KV cache size formula.
 
   def _make_agentic_pipeline(self, max_turns):
+    # [FUNCTION DOC]
+    # HELPER: builds an agentic GRPO pipeline with the given max_turns (other agentic settings fixed).
     extra = f"""
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -545,17 +585,25 @@ vllm_config:
     return _make_pipeline(extra)
 
   def test_single_turn_kv_cache(self):
+    # [FUNCTION DOC]
+    # Verifies single-turn agentic rollout kv_cache_size equals max prompt (256) plus max response (512) plus
+    # 256 extra.
     p = self._make_agentic_pipeline(max_turns=1)
     cfg = p.create_rollout_config()
     # max_prompt=256, max_response=512, single-turn → +256
     self.assertEqual(cfg.kv_cache_size, 256 + 512 + 256)
 
   def test_multi_turn_kv_cache(self):
+    # [FUNCTION DOC]
+    # Verifies a 20-turn agentic rollout gets the same kv_cache_size (256 + 512 + 256), i.e. turns do not
+    # change the formula.
     p = self._make_agentic_pipeline(max_turns=20)
     cfg = p.create_rollout_config()
     self.assertEqual(cfg.kv_cache_size, 256 + 512 + 256)
 
   def test_standard_grpo_kv_cache(self):
+    # [FUNCTION DOC]
+    # Verifies standard GRPO rollout kv_cache_size is also 256 + 512 + 256.
     extra = """
 grpo_config:
   num_generations: 2
@@ -579,8 +627,13 @@ verl_compatible: false
 
 
 class AgenticConfigTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests construction of the agentic GRPO algorithm config.
 
   def _base_extra(self, agentic_overrides="", system_prompt='""'):
+    # [FUNCTION DOC]
+    # HELPER: returns agentic YAML text with beta 0.001, the given system_prompt YAML literal (default empty
+    # string) and agentic_overrides text inserted (indented) into agentic_grpo_config.
     return f"""
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -615,6 +668,8 @@ vllm_config:
 """
 
   def test_episode_timeout_computed(self):
+    # [FUNCTION DOC]
+    # Verifies episode_timeout equals per_turn_timeout_secs (300) times max_turns (20).
     p = _make_pipeline(
         self._base_extra("max_turns: 20\n  per_turn_timeout_secs: 300")
     )
@@ -622,17 +677,23 @@ vllm_config:
     self.assertEqual(algo.episode_timeout, 300 * 20)
 
   def test_max_response_length_from_rollout(self):
+    # [FUNCTION DOC]
+    # Verifies max_response_length is taken from rollout_config.total_generation_steps (512).
     p = _make_pipeline(self._base_extra("max_turns: 1"))
     algo = p._create_agentic_grpo_config()
     # rollout_config.total_generation_steps = 512
     self.assertEqual(algo.max_response_length, 512)
 
   def test_num_generations_passed_through(self):
+    # [FUNCTION DOC]
+    # Verifies num_generations is passed through (2).
     p = _make_pipeline(self._base_extra("max_turns: 1"))
     algo = p._create_agentic_grpo_config()
     self.assertEqual(algo.num_generations, 2)
 
   def test_cli_empty_system_prompt_stays_empty_string(self):
+    # [FUNCTION DOC]
+    # Verifies a CLI override of system_prompt to an empty quoted string yields "" rather than null.
     p = _make_pipeline_with_cli_args(
         self._base_extra("max_turns: 1", system_prompt='"base"'),
         ['agentic_grpo_config.system_prompt=""'],
@@ -641,8 +702,16 @@ vllm_config:
 
 
 class SplitMeshConfigTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests creation of per-role device meshes.
 
   def test_split_mesh_uses_explicit_role_meshes(self):
+    # [FUNCTION DOC]
+    # Verifies create_role_to_mesh with actor mesh (2,1), reference sharing the actor mesh, and rollout mesh
+    # (1,2) over four fake devices assigns devices 0,1 to the actor and 2,3 to the rollout with the requested
+    # shapes, and returns the identical mesh object for reference and actor. jax.devices and Mesh are patched.
+    # KNOWN ISSUE: mesh overrides are applied only if the role configs are omegaconf DictConfig; otherwise
+    # they are silently skipped.
     extra = """
 training_mode: "agentic_grpo"
 data_module: "tunix.cli.recipes.deepscaler_data"
@@ -691,8 +760,12 @@ vllm_config:
       }
 
     class FakeDevice:
+      # [CLASS DOC]
+      # HELPER: fake TPU device with id, coords, process index 0, slice index 0 and kind "TPU v5e".
 
       def __init__(self, device_id, coords):
+        # [FUNCTION DOC]
+        # HELPER: stores device id and coords and fixed process/slice/kind attributes.
         self.id = device_id
         self.coords = coords
         self.process_index = 0
@@ -707,8 +780,12 @@ vllm_config:
     ]
 
     class FakeMesh:
+      # [CLASS DOC]
+      # HELPER: fake Mesh recording devices, axis_names and axis_types.
 
       def __init__(self, devices, axis_names, axis_types=None):
+        # [FUNCTION DOC]
+        # HELPER: stores the given devices, axis names and axis types.
         self.devices = devices
         self.axis_names = axis_names
         self.axis_types = axis_types
@@ -755,6 +832,10 @@ vllm_config:
     )
 
   def test_create_role_to_mesh_passes_configured_allocation_policy(self):
+    # [FUNCTION DOC]
+    # Verifies create_role_to_mesh calls mesh_lib.allocate_named_mesh_device_slices once with
+    # [("actor_model_config", 2), ("rollout_model_config", 2)], the device list and allocation_policy
+    # "PERFORMANCE" when both role meshes configure that policy (create_mesh is mocked).
     extra = """
 training_mode: "agentic_grpo"
 verl_compatible: false
