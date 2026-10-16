@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Abstract RL learner: the generic training loop shared by GRPO, PPO and
+# their variants. It handles batching (full batch, mini batch, micro batch
+# and rollout/logps service batch sizes), prompt repetition per generation,
+# producer/consumer data preparation on a background thread with a bounded
+# queue (optionally overlapping rollout with training when actor and
+# rollout use different meshes), optional sequence packing, periodic
+# evaluation, actor/critic updates via the RL cluster, weight sync to the
+# rollout engine, and reward computation through a registered reward
+# manager. Type aliases: TrainingInputT (dict of column name to list of
+# strings or arrays; must contain "prompts"), RewardFn, MetricFn, TConfig.
 """Abstract RL learner class."""
 
 from __future__ import annotations
@@ -52,6 +63,16 @@ TConfig = TypeVar("TConfig", bound=algo_config_lib.AlgorithmConfig)
 
 class RLLearner(abc.ABC, Generic[TConfig]):
   """Base class that should be extended by specific RL algorithms."""
+  # [CLASS DOC]
+  # Generic abstract base over an AlgorithmConfig type. Subclasses implement
+  # _generate_and_compute_advantage, _compute_trajectory_ids, _num_iterations
+  # and _num_generations. State: rl_cluster, algo_config, reward_manager,
+  # metric_fns, optional data-shuffle PRNG key, training config, iteration
+  # counters (_iter_steps for train micro batches, _eval_iter_steps), flags
+  # should_sync_weights and can_enable_async_rollout, a single-thread
+  # executor for data preparation, the restored trainer iteration
+  # (_last_iter_step) used to fast-forward data, and rollout / compute-logps
+  # micro batch sizes.
 
   def __init__(
       self,
@@ -61,6 +82,20 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       metric_fns: Sequence[MetricFn] | None = None,
       data_shuffle_seed: int | None = None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: rl_cluster, algo_config, reward_fns, optional metric_fns, optional
+    # data_shuffle_seed. Looks up the reward manager class by
+    # algo_config.reward_manager and instantiates it with reward_fns and the
+    # config (errors from lookup or empty reward lists propagate). Stores
+    # metric_fns (empty list if None). Marks the actor trainer, and the critic
+    # trainer if the cluster has that attribute, as externally managed. Creates
+    # a PRNG key from data_shuffle_seed if given. Sets the cluster's
+    # global_steps from the actor trainer's restored checkpoint step. Resets
+    # iteration counters. Weight sync is needed unless the actor and rollout
+    # models share identical weight objects. Async rollout is enabled when the
+    # actor and rollout meshes differ. Creates a one-worker thread pool, reads
+    # the trainer's restored iteration count, the configured rollout and
+    # compute-logps micro batch sizes, and logs HBM usage.
     """Initializes the `RLLearner`.
 
     Args:
@@ -145,20 +180,32 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       training_input: TrainingInputT,
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
   ) -> common.TrainExample:
+    # [FUNCTION DOC]
+    # Abstract. Given a merged, already-repeated training input and a mode,
+    # performs rollout and returns a TrainExample (batch matches the input).
     pass
 
   @abstractmethod
   def _compute_trajectory_ids(
       self, example: TrainingInputT, steps: int
   ) -> List[str]:
+    # [FUNCTION DOC]
+    # Abstract. Returns one trajectory id string per row of the (repeated)
+    # example given the number of previously processed micro batches.
     pass
 
   @abstractmethod
   def _num_iterations(self) -> int:
+    # [FUNCTION DOC]
+    # Abstract. Returns how many times each produced example is trained on
+    # (batch repeat, mu).
     pass
 
   @abstractmethod
   def _num_generations(self) -> int:
+    # [FUNCTION DOC]
+    # Abstract. Returns how many completions are sampled per prompt (sample
+    # repeat, G).
     pass
 
   def _compute_rewards(
@@ -169,6 +216,14 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       step: int | None = None,
       **kwargs,
   ) -> np.ndarray:
+    # [FUNCTION DOC]
+    # Inputs: prompts, completions, mode, optional step, extra kwargs. Raises
+    # ValueError if kwargs already contains "mode"; adds the string form of
+    # mode to kwargs. Calls the reward manager. Buffers its log metrics, via
+    # buffer_metrics_async with the step when given, else buffer_metrics.
+    # Returns the "rewards" array (one value per completion).
+    # KNOWN ISSUE: the docstring says it raises RuntimeError itself; those
+    # errors come from the reward manager.
     """Computes the rewards for completions using the provided reward functions.
 
     Args:
@@ -213,6 +268,12 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       micro_batch_sizes: list[int],
       mode: rl_cluster_lib.Mode,
   ) -> list[common.TrainExample]:
+    # [FUNCTION DOC]
+    # Returns [] for no micro batches. Otherwise merges them with
+    # merge_micro_batches, runs _generate_and_compute_advantage once on the
+    # merged batch, and slices the resulting TrainExample along the batch
+    # dimension back into consecutive pieces of the given sizes. Returns the
+    # list of pieces.
     """Merges, repeats, and computes advantages for a buffer of examples.
 
     This function takes a buffer of micro-batches, merges them, repeats the
@@ -260,6 +321,31 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       async_loading: bool = False,
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
   ) -> None:
+    # [FUNCTION DOC]
+    # Producer loop (runs on the executor thread for training, inline for eval).
+    # Inputs: iterator of micro batches, proceed_num_steps (stop after this many
+    # micro batches; -1 means until exhaustion), sample_repeat, batch_repeat,
+    # service_target_batch_size, data_queue, async_loading, mode.
+    # Loop: in TRAIN mode, first fast-forwards the iterator until _iter_steps
+    # reaches the restored iteration count. Fetches a micro batch inside perf
+    # spans; records its repeated size; repeats every column sample_repeat
+    # times along axis 0 (each row repeated consecutively); computes trajectory
+    # ids (with train or eval counter), adds them under "trajectory_ids" (assert
+    # the key was absent) and buffers each id as a metric. When the accumulated
+    # un-repeated sample count reaches service_target_batch_size, processes the
+    # buffered micro batches and resets the buffer; produced examples are
+    # enqueued immediately when async_loading (and also kept pending if
+    # batch_repeat > 1), or kept pending otherwise. Increments the train or eval
+    # counter. When proceed_num_steps micro batches were consumed, processes the
+    # tail and returns. On StopIteration: re-raises if proceed_num_steps > 0,
+    # else processes the tail and returns. Always puts None into the queue at
+    # the end as an end-of-data sentinel.
+    # Tail handling: processes remaining micro batches; in EVAL or non-async
+    # mode enqueues all pending examples repeat times (1 for eval, else
+    # batch_repeat); in async mode enqueues the tail once and then the pending
+    # examples batch_repeat minus 1 more times.
+    # Each enqueue puts one-element lists; with a shuffle key, each repeat uses
+    # a fresh split of the key (mutating it) to permute the order.
     """Orchestrates the data preparation pipeline.
 
     This method is designed to efficiently process data in micro-batches while
@@ -319,6 +405,10 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     def enqueue_examples(
         examples: list[common.TrainExample], repeats: int
     ) -> None:
+      # [FUNCTION DOC]
+      # HELPER: Enqueues each example as a one-element list, repeats times; no-op
+      # when repeats is not positive or the list is empty. When a shuffle key is
+      # set, splits it per repeat and enqueues in a random permutation order.
       """Wrap each TrainExample as [TrainExample] and put it into the queue, repeated `repeats`."""
       if repeats <= 0 or not examples:
         return
@@ -335,6 +425,9 @@ class RLLearner(abc.ABC, Generic[TConfig]):
             data_queue.put([example])
 
     def _enqueue_or_buffer_examples(produced: list[common.TrainExample]):
+      # [FUNCTION DOC]
+      # HELPER: For a non-empty list: enqueues once immediately when async_loading;
+      # appends to the pending list when not async or batch_repeat > 1.
       """Enqueues produced examples or adds them to a temporary buffer."""
       if not produced:
         return
@@ -344,6 +437,12 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         pending_examples.extend(produced)
 
     def _process_and_enqueue_tail():
+      # [FUNCTION DOC]
+      # HELPER: Processes and clears remaining micro batches and enqueues them
+      # along with pending examples per the tail rules described above; clears
+      # the pending list.
+      # KNOWN ISSUE: accumulated_samples_num is not reset here (it is a local of
+      # the enclosing function and the function returns right after).
       """Processes any remaining micro-batches and enqueues them."""
       tail_examples = self._process_accumulated_batches(
           micro_batches=micro_batches,
@@ -481,6 +580,15 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       full_batch_iterator: Iterator[TrainingInputT],
       micro_batch_size: int,
   ) -> Iterator[TrainingInputT]:
+    # [FUNCTION DOC]
+    # Generator re-batching an iterator of large dict batches into dicts of
+    # exactly micro_batch_size rows. Buffers values per key (arrays are
+    # flattened to 1-D element lists, lists/tuples extended, other values
+    # appended as one element) and yields dicts of NumPy arrays whenever the first key has at least
+    # micro_batch_size buffered elements. Leftover rows smaller
+    # than a micro batch are dropped at the end.
+    # KNOWN ISSUE: multi-dimensional array columns are flattened, mixing rows
+    # and elements; buffer length is measured only on the first key.
     """Re-batches large inputs into an iterator of micro-batches.
 
     Args:
@@ -493,6 +601,9 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     buffer = {}
 
     def get_buffer_len(buf: dict[str, list[Any]]) -> int:
+      # [FUNCTION DOC]
+      # HELPER: Returns 0 for an empty buffer, else the length of the first key's
+      # list.
       if not buf:
         return 0
       return len(next(iter(buf.values())))
@@ -524,6 +635,21 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       eval_ds: Iterable[TrainingInputT] | None = None,
       skip_jit: bool = False,
   ) -> None:
+    # [FUNCTION DOC]
+    # Main loop. Peeks the first batch to get the full batch size and chains it
+    # back. mini batch size defaults to full batch size; train micro batch size
+    # defaults to mini batch size; rollout and compute-logps micro batch sizes
+    # default to train micro batch size. Raises ValueError unless the rollout,
+    # compute-logps and mini batch sizes divide the full batch size. Gradient
+    # accumulation steps default to 1. Service target batch size = LCM of
+    # rollout and compute-logps micro sizes. Uses the full-batch iterator
+    # directly when the micro size equals the full size, else a re-batching
+    # iterator. Repeats global steps: run _run_global_step; then sync weights
+    # to the rollout (in perf spans) if needed, otherwise increment global
+    # steps manually; buffer exported perf metrics; stop when the actor
+    # trainer's train_steps reaches max_steps or data is exhausted
+    # (StopIteration). Finally closes the cluster. Raises StopIteration from
+    # next if the dataset is empty.
     """Main entry point for the training loop."""
     full_batch_iterator = iter(train_ds)
     first_item = next(full_batch_iterator)
@@ -640,6 +766,10 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       eval_ds: Iterable[TrainingInputT] | None,
       skip_jit: bool,
   ) -> None:
+    # [FUNCTION DOC]
+    # Runs full batch size divided by mini batch size mini-batch steps; after
+    # each, sets _iter_steps to the actor trainer's iteration count (assumes the
+    # trainer never resets it).
     """Run one global step."""
     for _ in range(full_batch_size // mini_batch_size):
       initial_steps = self._iter_steps
@@ -668,6 +798,8 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       eval_ds: Iterable[TrainingInputT] | None,
       skip_jit: bool,
   ) -> None:
+    # [FUNCTION DOC]
+    # Runs _run_all_micro_batch_steps inside a "micro_batch_steps" perf group.
     """Run one mini batch step."""
     with self.rl_cluster.perf.span_group("micro_batch_steps"):
       self._run_all_micro_batch_steps(
@@ -688,6 +820,20 @@ class RLLearner(abc.ABC, Generic[TConfig]):
       eval_ds: Iterable[TrainingInputT] | None,
       skip_jit: bool,
   ) -> None:
+    # [FUNCTION DOC]
+    # Creates a bounded train queue (grad_acc_steps times num_iterations plus 1)
+    # and an unbounded eval queue. Submits _prepare_data for grad_acc_steps
+    # micro batches to the executor. Consumes queue items until the None
+    # sentinel, optionally through pack_sequences when max_seq_token_per_tpu
+    # is set. For each item: records dequeue time when async; if eval data is
+    # given, none is loaded yet, and train_steps is a multiple of
+    # eval_every_n_steps, prepares the whole eval set synchronously and takes
+    # the first queued item as the eval batch; calls rl_cluster.update_actor and,
+    # if a critic trainer exists, update_critic. Finally waits on the future,
+    # re-raising producer exceptions (including StopIteration at data end).
+    # KNOWN ISSUE: only the first eval item is used and the remaining eval items
+    # stay in a queue that is discarded; eval_every_n_steps of 0 raises
+    # ZeroDivisionError.
     """Run all micro batch steps."""
 
     # reserve 1 for None and the other for repeated interable
@@ -711,6 +857,9 @@ class RLLearner(abc.ABC, Generic[TConfig]):
     )
 
     def queue_iterator():
+      # [FUNCTION DOC]
+      # HELPER: Generator yielding items from the train queue (blocking) until the
+      # None sentinel is received.
       while True:
         item = train_data_queue.get(block=True)
         if item is None:

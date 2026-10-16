@@ -13,6 +13,14 @@
 # limitations under the License.
 
 # Mostly forked from https://github.com/google-deepmind/gemma/blob/2a892cd9462618ce8bf8f0b5830466498858beb4/gemma/gm/nn/gemma4/_moe.py
+# [MODULE DOC]
+# Token-choice top-k mixture-of-experts layer for Gemma 4 (MoERagged), forked
+# from google-deepmind/gemma. Each token is routed to num_experts_per_tok
+# experts; tokens are sorted by expert so all experts run as two
+# jax.lax.ragged_dot grouped matmuls (gated-GELU expert FFN), then outputs
+# are unsorted and combined with renormalized router probabilities.
+# Private helpers handle renormalization, dispatch (sorting) and collection
+# (unsorting). No side effects.
 
 from flax import nnx
 import jax
@@ -20,6 +28,11 @@ import jax.numpy as jnp
 
 
 def _renormalization_factor(router_probs: jax.Array, choices: jax.Array):
+  # [FUNCTION DOC]
+  # HELPER: given router_probs [..., E] and chosen expert ids choices [..., k],
+  # returns the sum of probabilities of the chosen experts ([..., 1]), or 1.0
+  # where that sum is not positive; dividing by it renormalizes the chosen
+  # probabilities to sum to 1.
   """Computes the renormalization factor for routing weights."""
   indicator = jax.nn.one_hot(
       choices, router_probs.shape[-1], dtype=router_probs.dtype
@@ -34,6 +47,16 @@ def _expert_dispatch(
     expert_choices: jax.Array,
     expert_weights: jax.Array,
 ):
+  # [FUNCTION DOC]
+  # HELPER: sorts token copies by expert.
+  # Inputs: x [G, S, D] (flattened internally to [G*S, D]), expert_choices
+  # [G, S, k] int, expert_weights [G, S, E] (renormalized probabilities).
+  # Behavior: flattens the choices to G*S*k entries, argsorts them by expert id
+  # (xs_order) and computes the inverse permutation; gathers the token row for
+  # each sorted entry; counts tokens per expert from one-hot choices; computes
+  # combine weights [G, S, k] = probability of each chosen expert.
+  # Output tuple: (tokens_per_expert [E] int32, sorted_xs [G*S*k, D],
+  # reverse permutation [G*S*k], combine weights [G, S, k]).
   """Sorts tokens by expert for each expert choice."""
   num_groups, group_size, k = expert_choices.shape
   x = x.reshape((-1, x.shape[-1]))
@@ -70,6 +93,10 @@ def _expert_collect(
     xs_reverse_argsort: jax.Array,
     xs_combine_weights: jax.Array,
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # HELPER: applies the inverse permutation to sorted expert outputs
+  # [G*S*k, D] to restore (token, choice) order and reshapes to [G, S, k, D]
+  # (shape taken from xs_combine_weights). Weights are not applied here.
   """Unshuffles tokens back to their original token order and reshapes."""
   num_groups, group_size, k = xs_combine_weights.shape
   xs = sorted_xs[xs_reverse_argsort]
@@ -78,6 +105,12 @@ def _expert_collect(
 
 
 class MoERagged(nnx.Module):
+  # [CLASS DOC]
+  # Mixture-of-experts FFN. Parameters: router_logits [D, E] (router weight,
+  # unsharded), gating_einsum [E, 2, F, D] (stacked gate and up projections,
+  # sharding exp_weight_edf), linear [E, F, D] (down projection, sharding
+  # exp_weight_efd), per_expert_scale [E] (ones) and router_scale [D] (ones).
+  # D = embed_dim, F = expert_dim, E = num_experts.
   """Mixture of Experts using ragged_dot."""
 
   def __init__(
@@ -86,6 +119,10 @@ class MoERagged(nnx.Module):
       *,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Reads embed_dim, expert_dim, num_experts and num_experts_per_tok from the
+    # Gemma 4 config and creates the parameters (normal init in
+    # config.param_dtype for the weights).
     self.config = config
     self.features = config.embed_dim
     self.hidden_dim = config.expert_dim
@@ -117,6 +154,12 @@ class MoERagged(nnx.Module):
     )
 
   def _router(self, router_logits: jax.Array):
+    # [FUNCTION DOC]
+    # HELPER: in float32, computes softmax probabilities over experts and the
+    # top-k expert indices (jax.lax.approx_max_k on the logits), and returns
+    # (probabilities renormalized over the chosen experts [G, S, E], choices
+    # [G, S, k]).
+    # KNOWN ISSUE: approx_max_k may return an approximate top-k on TPU.
     router_logits = router_logits.astype(jnp.float32)
     router_probs = jax.nn.softmax(router_logits, axis=-1)
     _, choices = jax.lax.approx_max_k(
@@ -132,6 +175,13 @@ class MoERagged(nnx.Module):
       expert_choices: jax.Array,
       expert_weights: jax.Array,
   ):
+    # [FUNCTION DOC]
+    # HELPER: runs the experts. Dispatches tokens, reshapes gating weights to
+    # [E, D, 2F], computes ragged_dot(sorted_xs, gate) in config.dtype, splits
+    # into gate and up halves, activation = gelu(gate) * up, down projects with
+    # ragged_dot over linear, multiplies each row by its expert's
+    # per_expert_scale, unsorts to [G, S, k, D] and sums over k weighted by the
+    # combine weights. Returns [G, S, D].
     (
         xs_tokens_per_expert,
         sorted_xs,
@@ -185,6 +235,11 @@ class MoERagged(nnx.Module):
     return out
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # Input x [G, S, D] (batch, sequence, features). Router input =
+    # RMS-normalized x (no learned scale, eps 1e-6) times D^-0.5 times
+    # router_scale; logits = router_input @ router_logits [G, S, E]; route with
+    # _router; return the expert mixture from _run_ffw_and_routing ([G, S, D]).
     var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
     router_input = x * jax.lax.rsqrt(var + 1e-06).astype(x.dtype)
 

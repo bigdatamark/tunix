@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loads Gemma 4 weights from Hugging Face safetensors (keys optionally
+# prefixed with 'model.language_model.') into the NNX model.Gemma4 through
+# the generic safetensors_loader. Provides the per-layer-type aware regex
+# key mapping (global layers may have different head size / kv heads), a
+# stateful q/k/v preprocess function, and create_model_from_safe_tensors.
 """Loads Gemma 4 parameters from safetensors files."""
 
 from __future__ import annotations
@@ -25,6 +31,25 @@ from tunix.models.gemma4 import model as model_lib
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: builds {HF key regex: (NNX target path, transform)} where the
+  # transform is None or (axis permutation or None, reshape shape or None).
+  # Layer indices are classified as global or local using the configured (or
+  # default) attention pattern, and q/k/v/o regexes are generated separately
+  # for each group (alternations of the layer indices) so global layers use
+  # global_key_size and num_global_kv_heads in their reshape targets.
+  # Mappings: embed_tokens -> embedder.input_embedding;
+  # embed_tokens_per_layer reshaped to [vocab, num_layers, P];
+  # per_layer_model_projection transposed and reshaped to [D, num_layers, P];
+  # per_layer_projection_norm; q/k/v_proj -> temporary 'tmp.layers.N.attn.*'
+  # (transposed, reshaped to [D, heads, head_dim]); o_proj ->
+  # attn_vec_einsum.w ([N, H, D]); mlp gate/up/down (transposed); the various
+  # layer norms (input, post_attention, pre/post_feedforward, *_1 dense and *_2
+  # MoE variants, q_norm/k_norm, post_per_layer_input_norm); layer_scalar ->
+  # skip_scale; norm -> final_norm; per_layer_input_gate / per_layer_projection
+  # (transposed); MoE router proj (transposed), per_expert_scale, router scale,
+  # experts gate_up_proj reshaped to [E, 2, F, D] and experts down_proj
+  # permuted (0, 2, 1).
   """Mapping of torch_keys to (nnx_keys, (permute_rule, reshape_rule))."""
   pattern = (
       cfg.attention_pattern
@@ -250,6 +275,10 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
 
 
 def _make_preprocess_fn(cfg: model_lib.ModelConfig):
+  # [FUNCTION DOC]
+  # HELPER: builds the stateful preprocess closure that converts temporary
+  # q/k/v tensors into q_einsum.w, k_einsum.w (k_eq_v global layers) or
+  # kv_einsum.w ([2, K, D, H]). The pending dict persists across calls.
   """Creates a tensor preprocessing function for Gemma 4 safetensors."""
   q_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.q$")
   k_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.k$")
@@ -258,6 +287,9 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
   pending: dict[str, dict[str, jnp.ndarray]] = {}
 
   def _to_ndh(q: jnp.ndarray, head_dim: int) -> jnp.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: returns a query weight as [N, D, head_dim], accepting [N, D, H],
+    # [D, N, H] or [N, H, D]; raises ValueError otherwise.
     if q.shape == (cfg.num_heads, cfg.embed_dim, head_dim):
       return q
     if q.shape == (cfg.embed_dim, cfg.num_heads, head_dim):
@@ -267,6 +299,15 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     raise ValueError(f"Unexpected q shape: {q.shape}")
 
   def _to_kdh(x: jnp.ndarray, head_dim: int, num_kv_heads: int) -> jnp.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: returns a key/value weight as [num_kv_heads, D, head_dim].
+    # 2D inputs: [K*H, D] is reshaped to [K, H, D] and transposed; [D, K*H] is
+    # reshaped to [D, K, H] and transposed; other 2D shapes raise ValueError.
+    # 3D inputs: locates the axes equal to D and head_dim, treats the remaining
+    # axis as heads, transposes to [heads, D, H] and keeps the first num_kv_heads
+    # heads. Raises ValueError if D or head_dim is not among the dims.
+    # KNOWN ISSUE: axis detection is ambiguous when D equals head_dim or the head
+    # count equals either; slicing to num_kv_heads silently truncates extra heads.
     # 2D shape handling (Heads * HeadDim, Hidden) or (Hidden, Heads * HeadDim)
     if x.ndim == 2:
       if x.shape == (num_kv_heads * head_dim, cfg.embed_dim):
@@ -293,6 +334,16 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     )
 
   def preprocess(tensors: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
+    # [FUNCTION DOC]
+    # Copies the input dict and moves temporary q/k/v entries into pending.
+    # Then for each pending layer determines its attention type (pattern by
+    # layer index), effective head_dim and kv head count (global overrides),
+    # writes q_einsum.w as soon as q is available, and either k_einsum.w when
+    # k_eq_v applies (global layer with k_eq_v_global) or kv_einsum.w =
+    # stack([k, v]) once both are present. Returns the new dict. Side effect:
+    # mutates the closure pending dict.
+    # KNOWN ISSUE: layers are never removed from pending (only their slots), and
+    # for k_eq_v layers any v tensor is left in pending and ignored.
     out = dict(tensors)
 
     for key in list(out):
@@ -363,6 +414,11 @@ def create_model_from_safe_tensors(
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ):
+  # [FUNCTION DOC]
+  # Public entry point: loads safetensors from file_dir into a model.Gemma4
+  # built from config (optionally sharded on mesh and cast to dtype), using the
+  # key mapping above and a fresh preprocess function; mode is forwarded to
+  # safetensors_loader.load_and_create_model. Returns the populated model.
   return safetensors_loader.load_and_create_model(
       file_dir=file_dir,
       model_class=model_lib.Gemma4,

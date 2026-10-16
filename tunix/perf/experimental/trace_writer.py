@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Trace writers for the experimental (perf v2) tracer. TraceWriter is the
+# abstract interface (write_timelines); NoopTraceWriter ignores input;
+# PerfettoTraceWriter converts all committed spans of all timelines into a
+# Perfetto protobuf trace and rewrites one file
+# "perfetto_trace_v2_<unix seconds>.pb" in the trace directory (local or
+# remote via etils epath) on every call.
+# Track layout: parent tracks "Host - Main threads" (uuid 100000), "Host -
+# Rollout threads" (100001) and one per device role cluster (100002 and up);
+# each timeline gets its own track (uuid 100000 * (k + 2) for the k-th
+# timeline seen) under its parent, and when its spans overlap, child lane
+# tracks (timeline uuid + lane + 1) so that each lane is overlap-free.
+# Span display names are enriched from tags (see _create_span_name).
 """Trace writer implementations and helper functions."""
 
 from __future__ import annotations
@@ -40,6 +53,13 @@ _UUID_OFFSET = 100_000  # Offset for lane UUIDs.
 
 
 def _create_span_name(name: str, tags: Mapping[str, Any]) -> str:
+  # [FUNCTION DOC]
+  # HELPER: Builds a display name "name (k=v, ...)" from tags, or just name
+  # when no parts apply. Parts in order: "step=" if the step tag exists; for
+  # peft_train spans "role=", "mini_batch=", "micro_batch=" when present; for
+  # rollout, reference_inference, old_actor_inference, advantage_computation
+  # and environment spans "group_id="; for rollout and environment spans
+  # "pair_index="; for queue spans "name=" (the queued span's name).
   """Creates a descriptive name for the span based on its tags."""
   parts = []
   if perf_constants.STEP in tags:
@@ -79,6 +99,11 @@ def _create_span_name(name: str, tags: Mapping[str, Any]) -> str:
 def _assign_lanes(
     spans: Iterable[timeline.Span],
 ) -> tuple[Mapping[int, int], int]:
+  # [FUNCTION DOC]
+  # HELPER: Greedy interval lane assignment: sort spans by (begin, id); place
+  # each in the first lane whose last end is <= its begin (updating that lane's
+  # end), else open a new lane. Output: (span id -> lane index, lane count).
+  # Note nested spans (child inside parent) also go to separate lanes.
   """Assigns lanes to spans to handle overlaps.
 
   Perfetto requires spans on the same track to be strictly nested (no arbitrary
@@ -114,22 +139,33 @@ def _assign_lanes(
 
 
 class TraceWriter(abc.ABC):
+  # [CLASS DOC]
+  # Abstract base class for trace writers with one abstract method.
   """An abstract base class for writing traces."""
 
   @abc.abstractmethod
   def write_timelines(self, timelines: Mapping[str, Timeline]) -> None:
+    # [FUNCTION DOC]
+    # Abstract: write the given id -> timeline mapping to the trace.
     """Writes timelines to the trace."""
 
 
 class NoopTraceWriter(TraceWriter):
+  # [CLASS DOC]
+  # Trace writer that discards everything.
   """A no-op trace writer that does nothing."""
 
   def write_timelines(self, timelines: Mapping[str, Timeline]) -> None:
+    # [FUNCTION DOC]
+    # Does nothing.
     del self, timelines  # Unused.
 
 
 @dataclasses.dataclass
 class TrackInfo:
+  # [CLASS DOC]
+  # Dataclass describing a parent track: display name and optional Perfetto
+  # uuid.
   """Information about a track.
 
   Attributes:
@@ -142,6 +178,11 @@ class TrackInfo:
 
 
 class PerfettoTraceWriter(TraceWriter):
+  # [CLASS DOC]
+  # Perfetto writer. State: trace dir, role -> device list mapping, parent
+  # track infos keyed by track key, timeline id -> track key, timeline id ->
+  # uuid, and the trace file path (None if initialization failed, which
+  # disables writing). Not thread-safe; callers serialize writes.
   """A writer for Perfetto trace events."""
 
   def __init__(
@@ -149,6 +190,11 @@ class PerfettoTraceWriter(TraceWriter):
       trace_dir: str,
       role_to_devices: Mapping[str, Any] | None = None,
   ):
+    # [FUNCTION DOC]
+    # Stores the trace dir and a copy of role_to_devices (empty if None);
+    # creates the directory (parents allowed) and sets the file path
+    # "perfetto_trace_v2_<unix seconds>.pb", logging it. Any exception is
+    # logged and leaves the path None (best effort, never raises).
     """Initializes the instance.
 
     Args:
@@ -186,6 +232,13 @@ class PerfettoTraceWriter(TraceWriter):
       self._trace_file_path = None
 
   def _get_device_track_name(self, tl_id: str) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Track name for a device or queue timeline: None for host
+    # timelines. Strips the "_queue" suffix, then collects (in mapping order,
+    # without duplicates) every role whose device list contains a device whose
+    # timeline id equals it. Returns the roles converted from snake_case to
+    # CamelCase, comma-joined, followed by " Cluster"; None when no role
+    # matches. Exceptions: ValueError for unsupported device entries.
     """Gets a formatted track name for a device timeline.
 
     Args:
@@ -220,6 +273,9 @@ class PerfettoTraceWriter(TraceWriter):
     return None
 
   def write(self, builder: TraceProtoBuilder) -> None:
+    # [FUNCTION DOC]
+    # Overwrites the trace file with builder's serialized bytes; no-op without
+    # a path; exceptions are logged, not raised.
     """Writes the built trace to the file."""
     if self._trace_file_path is None:
       return
@@ -239,6 +295,16 @@ class PerfettoTraceWriter(TraceWriter):
   def _init_tracks(
       self, timelines: Mapping[str, Timeline]
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: For each timeline id (sorted) not yet assigned to a parent track
+    # and having at least one non-empty committed step: host timelines whose
+    # committed spans are all "rollout" go under "host_rollout", other host
+    # timelines under "host_main" (creating/refreshing those track infos);
+    # device/queue timelines go under their role cluster track (created with
+    # uuid 100000 + 2 + current number of track infos) or, if no role matches,
+    # a warning is logged and the timeline gets no parent.
+    # KNOWN ISSUE: the classification is made once; a host timeline first seen
+    # with only rollout spans stays under the rollout track forever.
     """Initializes track info for timelines.
 
     Args:
@@ -283,6 +349,21 @@ class PerfettoTraceWriter(TraceWriter):
           logging.warning("Failed to get track name for timeline ID: %s", tl_id)
 
   def write_timelines(self, timelines: Mapping[str, Timeline]) -> None:
+    # [FUNCTION DOC]
+    # Writes the full trace. Returns early if timelines is empty or no
+    # timeline has a non-empty committed step. Builds a TraceProtoBuilder:
+    # initializes tracks; emits descriptors for all parent tracks; for each
+    # timeline (sorted id) with committed spans, assigns/reuses its uuid,
+    # emits its descriptor (with parent when known), assigns lanes over ALL
+    # committed spans (emitting lane descriptors with empty names when more
+    # than one lane), and creates slice-begin events (timestamp in ns relative
+    # to the timeline's born time, enriched name) and slice-end events for
+    # ended spans. All events are sorted by timestamp with ends before begins
+    # at equal timestamps, emitted with sequence id 1, then written (file
+    # overwritten).
+    # Side effects: file write; mutates track/uuid bookkeeping.
+    # KNOWN ISSUE: every call reprocesses all historical steps, so cost grows
+    # with run length.
     """Writes timelines to the trace file."""
     if not timelines:
       return

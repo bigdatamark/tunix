@@ -331,6 +331,18 @@ class PPOLearnerTest(parameterized.TestCase):
       epsilon_c,
       entropy_coef,
   ):
+    # [FUNCTION DOC]
+    # Trains PPO for 10 steps (sgd 1e-3 for actor and critic, eval every 2
+    # steps) with either a reward model (toy transformer with score head)
+    # or two reward fns, and either a single rollout config or distinct
+    # train/eval configs; optional dual-clip epsilon_c and entropy_coef.
+    # Verifies: weight sync and async rollout are disabled; all actor
+    # params and all non-output critic params changed; learner, actor and
+    # critic iteration counts are 10 and eval iterations 2; reward metrics
+    # (score mean, reward mean, reward KL penalty) logged once per global
+    # step; actor loss and pg_clipfrac (plus pg_clipfrac_lower with dual
+    # clip) logged every train step and train_steps / eval_every_n_steps
+    # times in eval; critic loss, vpred_mean and vf_clipfrac likewise.
     vocab = tc.MockVocab()
     model = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
@@ -582,6 +594,15 @@ class PPOLearnerTest(parameterized.TestCase):
       expected_inference_worker_logps_fn_call_at_step,
       expected_rollout_worker_logps_fn_call_at_step,
   ):
+    # [FUNCTION DOC]
+    # Wraps the learner's generate-and-advantage function, the rollout's
+    # per-token logps function and the inference worker's reference logps
+    # function to record the actor trainer's iter_steps at each call, trains
+    # on 8 single-prompt batches (max_steps 10, no eval) and verifies the
+    # recorded steps: with num_iterations k, generation and log-prob calls
+    # happen every k steps; with beta 0 the reference logps fn is never
+    # called. Also verifies actor and critic params changed.
+    # Gradient-accumulation cases are skipped (tracked bug b/446969561).
     # TODO(b/446969561): Re-enable these test cases. Due to the change in
     # cl/810188417, the current test case will fail.
     if name in (
@@ -598,7 +619,12 @@ class PPOLearnerTest(parameterized.TestCase):
     inference_worker_logps_fn_call_at_step = []
 
     def wrap_fn(fn, fn_call_at_step, trainer):
+      # [FUNCTION DOC]
+      # HELPER: returns a wrapper around fn that appends trainer.iter_steps
+      # to fn_call_at_step before delegating with the same arguments.
       def wrapper(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: records the current step then returns fn's result.
         fn_call_at_step.append(trainer.iter_steps)
         return fn(*args, **kwargs)
 

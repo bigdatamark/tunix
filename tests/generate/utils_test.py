@@ -12,6 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# [MODULE DOC]
+# Unit tests for tunix.generate.utils: attention mask helpers (compute_attention_masks,
+# make_causal_attn_mask), index helpers (next_power_of_2, find_first_non_pad_idx, find_first_eos_idx,
+# find_last_non_pad_idx), vLLM logprob extraction (get_logprobs_from_vllm_output), weight transfer between
+# trainer and rollout states (transfer_state_with_mappings with key mappings, transposes, hook functions,
+# padding, reshapes, scanned and interleaved-scanned layers, tied lm_head; transfer_state_directly with key
+# intersection, unwrapping, dtype casting, KV head repetition, MoE weight fusion and padding, and deleting
+# destination buffers), verify_state_closeness, attention weight head/dim alignment helpers, and
+# resolve_parallelism_sizes. Uses lightweight mock state/param classes and small meshes over local devices.
+# No side effects beyond device allocations and mocks.
 
 from absl.testing import parameterized
 from absl.testing import absltest
@@ -31,14 +41,23 @@ Mesh = sharding.Mesh
 
 
 class MockState:
+  # [CLASS DOC]
+  # HELPER: minimal stand-in for an nnx State keyed by dotted path strings.
 
   def __init__(self, params):
+    # [FUNCTION DOC]
+    # HELPER: stores a dict mapping dotted path strings to parameters.
     self.params = params
 
   def flat_state(self):
+    # [FUNCTION DOC]
+    # HELPER: returns a list of (tuple of path parts split on ".", value) pairs.
     return [(tuple(k.split(".")), v) for k, v in self.params.items()]
 
   def from_flat_path(self, flat_path):
+    # [FUNCTION DOC]
+    # HELPER: builds a new MockState from (key tuple, value) pairs, joining keys with "." and wrapping values
+    # lacking a "value" attribute in MockParam.
     new_params = {}
     for keys, param in flat_path:
       new_params[".".join(keys)] = (
@@ -48,47 +67,76 @@ class MockState:
 
 
 class MockParam:
+  # [CLASS DOC]
+  # HELPER: minimal stand-in for an nnx Variable wrapping an array in "value" and forwarding shape, dtype,
+  # ndim, sharding, indexing and array conversion to it.
 
   def __init__(self, value):
+    # [FUNCTION DOC]
+    # HELPER: stores the wrapped array.
     self.value = value
 
   @property
   def shape(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the wrapped array's shape.
     return self.value.shape
 
   @property
   def dtype(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the wrapped array's dtype.
     return self.value.dtype
 
   @property
   def ndim(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the wrapped array's number of dimensions.
     return self.value.ndim
 
   @property
   def sharding(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the wrapped array's sharding.
     return self.value.sharding
 
   def __getitem__(self, item):
+    # [FUNCTION DOC]
+    # HELPER: indexes into the wrapped array.
     return self.value[item]
 
   def __array__(self, dtype=None):
+    # [FUNCTION DOC]
+    # HELPER: numpy conversion of the wrapped array with an optional dtype.
     return np.asarray(self.value, dtype=dtype)
 
   def __jax_array__(self):
+    # [FUNCTION DOC]
+    # HELPER: JAX conversion hook returning the wrapped array.
     return self.value
 
 
 class Logprob:
+  # [CLASS DOC]
+  # HELPER: stand-in for a vLLM Logprob record with logprob, rank and decoded_token.
 
   def __init__(self, logprob, rank=None, decoded_token=None):
+    # [FUNCTION DOC]
+    # HELPER: stores logprob, optional rank and optional decoded_token.
     self.logprob = logprob
     self.rank = rank
     self.decoded_token = decoded_token
 
 
 class UtilsTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test suite for tunix.generate.utils helpers and state transfer functions.
 
   def test_compute_attention_mask(self):
+    # [FUNCTION DOC]
+    # Verifies compute_attention_masks(time_step, seq_len, input_mask) returns, after squeezing axis 1, a
+    # boolean mask that is the input mask shifted/padded to seq_len with the current step attended, both when
+    # the sequence length exceeds and when it equals the time step (sliding into a smaller cache).
     # Check that the input mask is correctly applied when total sampling steps
     # is lower than the max cache length.
     input_mask = jnp.array([[1, 1, 0, 0, 0], [1, 1, 0, 1, 0]], dtype=jnp.bool_)
@@ -113,6 +161,9 @@ class UtilsTest(parameterized.TestCase):
     self.assertTrue((attn_mask.squeeze(1) == expected_attn_mask).all())
 
   def test_make_causal_attn_mask(self):
+    # [FUNCTION DOC]
+    # Verifies make_causal_attn_mask(input_mask, 5) yields a [batch, seq, 5] mask combining causality with
+    # the padding mask (padded columns never attended), padding cache columns beyond the sequence with zeros.
     input_mask = jnp.array([[0, 1, 1, 0], [1, 1, 1, 0]])
     attn_mask = utils.make_causal_attn_mask(input_mask, 5)
     expected = jnp.array([
@@ -132,6 +183,8 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(attn_mask, expected)
 
   def test_next_power_of_2(self):
+    # [FUNCTION DOC]
+    # Verifies next_power_of_2 returns 1 for 0 and the smallest power of two at least n otherwise.
     self.assertEqual(utils.next_power_of_2(0), 1)
     self.assertEqual(utils.next_power_of_2(2), 2)
     self.assertEqual(utils.next_power_of_2(3), 4)
@@ -139,6 +192,8 @@ class UtilsTest(parameterized.TestCase):
     self.assertEqual(utils.next_power_of_2(5), 8)
 
   def test_find_first_non_pad_idx(self):
+    # [FUNCTION DOC]
+    # Verifies find_first_non_pad_idx returns the index of the first non-pad (non-zero) token.
     data = [
         ([1, 2, 3, 4, 5, 6], 0),
         ([0, 0, 1, 2, 3, 4], 2),
@@ -150,6 +205,8 @@ class UtilsTest(parameterized.TestCase):
       )
 
   def test_find_first_eos_idx(self):
+    # [FUNCTION DOC]
+    # Verifies find_first_eos_idx returns the first index of the eos id (-1), or the length if absent.
     data = [
         ([1, 2, 3, 4, 5, -1], 5),
         ([1, 2, -1, 4, -1, 0], 2),
@@ -159,6 +216,8 @@ class UtilsTest(parameterized.TestCase):
       self.assertEqual(utils.find_first_eos_idx(jnp.array(ids), -1), expected)
 
   def test_find_last_non_pad_idx(self):
+    # [FUNCTION DOC]
+    # Verifies find_last_non_pad_idx returns the index of the last non-pad token.
     data = [
         ([1, 2, 3, 4, 5, 6], 5),
         ([1, 2, 3, 0, 0, 0], 2),
@@ -168,6 +227,9 @@ class UtilsTest(parameterized.TestCase):
       self.assertEqual(utils.find_last_non_pad_idx(jnp.array(ids), 0), expected)
 
   def test_logprobs_basic_extraction(self):
+    # [FUNCTION DOC]
+    # Verifies get_logprobs_from_vllm_output picks, per position, the logprob of the generated token id from
+    # each per-position dict of Logprob objects.
     token_ids = [271, 567, 15166]
     logprobs = [
         {271: Logprob(-1.71), 198: Logprob(-0.52)},
@@ -181,6 +243,8 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_logprobs_extraction_with_missing_token(self):
+    # [FUNCTION DOC]
+    # Verifies a ValueError when a generated token id is missing from its position's logprob dict.
     token_ids = [100, 200]
     logprobs = [{101: Logprob(-0.5)}, {200: Logprob(-1.2)}]
     with self.assertRaises(ValueError):
@@ -192,12 +256,20 @@ class UtilsTest(parameterized.TestCase):
       ("list_of_none_logprobs", [1], [None]),
   )
   def test_logprobs_empty_cases(self, token_ids, logprobs):
+    # [FUNCTION DOC]
+    # Verifies an empty list is returned when logprobs is None, empty, or a list of None.
     self.assertEqual(
         utils.get_logprobs_from_vllm_output(token_ids, logprobs),
         [],
     )
 
   def test_transfer_state_with_mappings_tranpose_and_sharding_device(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_with_mappings with explicit key mappings, a transpose rule for keys ending in
+    # "weight" (axes swapped), and a hook function (multiply by 2) keyed by the source name: each source
+    # (2, 8) weight lands transposed in its mapped (8, 2) target, the hooked one doubled, and results carry the
+    # target's NamedSharding after resharding with reshard.reshard_pytree. Requires an even number of devices
+    # of at least 2 (skipped otherwise); mesh axes ("data", "model").
     device_count = len(jax.devices())
     if device_count < 2 or device_count % 2 != 0:
       self.skipTest("This example assumes even number of devices >= 2")
@@ -275,6 +347,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_padding(self):
+    # [FUNCTION DOC]
+    # Verifies a source attention k_proj with head dim 64 is zero-padded on the last axis to the target head
+    # dim 128: first 64 values are copied, the rest are zero.
     # Create source module with smaller head dim
     src = MockState(
         {"decoder.layers.5.attn.k_proj": MockParam(jnp.ones((2, 4, 64)))}
@@ -307,6 +382,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_bias_padding_and_reshape(self):
+    # [FUNCTION DOC]
+    # Verifies a 1-D attention q_bias of length 256 is reshaped and broadcast into a (4, 128) target given
+    # num_kv_heads 2 and head_dim 128, with all values preserved as 1.0.
     """Test rank mismatch, reshape and padding for attention bias."""
     src_key = "layers.0.attn.q_bias"
     src_q_bias = jnp.ones((256,), dtype=jnp.float32)
@@ -327,6 +405,10 @@ class UtilsTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(result.params[src_key].value, 1.0))
 
   def test_transfer_state_with_scanned_layers(self):
+    # [FUNCTION DOC]
+    # Verifies scanned-layer handling: a weight stacked on axis 0 and a bias stacked on axis 1 (sharding specs
+    # naming the "layer" axis) are split into per-layer targets matched by "*" in the target key (the weight
+    # also transposed), and an unscanned embedding is transferred and transposed directly.
     """Comprehensive test for scanned layers covering multiple scenarios."""
     num_layers = 3
     embed_dim = 4
@@ -464,6 +546,11 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_mappings_gemma4(self):
+    # [FUNCTION DOC]
+    # Verifies the Gemma4 vLLM-JAX mapping (applying its preprocess_src_state hook if present): kv_einsum is
+    # split into k_proj and v_proj, each transposed from (heads, embed, head_dim) to (embed, heads, head_dim),
+    # and MoE gating_einsum and linear weights are copied unchanged into the experts' gating/up-proj and
+    # down-proj kernels.
     """Test transfer_state_with_mappings for Gemma4."""
     from tunix.models.gemma4.mapping_vllm_jax import VLLM_JAX_MAPPING
 
@@ -548,6 +635,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_verify_state_closeness(self):
+    # [FUNCTION DOC]
+    # Verifies verify_state_closeness(golden, test, atol) returns True for identical states, states within
+    # atol (1e-2 or a custom 0.1), and two empty states; and False for values outside tolerance, differing or
+    # missing keys, and mismatched shapes.
     """Test verify_state_closeness function with various scenarios."""
 
     # Test case 1: Identical states should return True
@@ -679,6 +770,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_attention_weight_head_dim_padding(self):
+    # [FUNCTION DOC]
+    # Verifies an attention q_proj with head dim 64 is zero-padded on the last axis to 128 with original
+    # values (2.0) preserved.
     """Test padding head dimension (last axis) for attention weights."""
     # Source: (num_heads, head_dim=64)
     # Target: (num_heads, head_dim=128)
@@ -717,6 +811,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_attention_weight_num_heads_repetition(self):
+    # [FUNCTION DOC]
+    # Verifies an attention key kernel with 4 heads on axis 0 is repeated to 8 heads, each source head
+    # appearing twice consecutively (even and odd target rows equal the source).
     """Test repeating num_heads dimension (non-last axis) for attention weights."""
     # Source: (num_heads=4, seq_len=16, head_dim=64)
     # Target: (num_heads=8, seq_len=16, head_dim=64)
@@ -746,6 +843,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_non_attention_weight_padding_fails(self):
+    # [FUNCTION DOC]
+    # Verifies a shape mismatch on a non-attention (MLP) weight raises utils.ShapeMismatchError mentioning
+    # "Padding/repetition only supported for attention weights".
     """Test that padding non-attention weights raises an error."""
     # Try to pad an MLP weight (should fail)
     src_mlp = jnp.ones((256, 64), dtype=jnp.float32)
@@ -765,6 +865,8 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_attention_weight_invalid_repeat_factor(self):
+    # [FUNCTION DOC]
+    # Verifies repeating 3 heads to 8 raises ShapeMismatchError mentioning "not divisible".
     """Test that non-divisible repeat factors raise an error."""
     # Source: (num_heads=3, head_dim=64)
     # Target: (num_heads=8, head_dim=64) - 8 is not divisible by 3
@@ -783,6 +885,8 @@ class UtilsTest(parameterized.TestCase):
     self.assertIn("not divisible", str(context.exception))
 
   def test_attention_weight_shrinking_fails(self):
+    # [FUNCTION DOC]
+    # Verifies a target smaller than the source raises ShapeMismatchError mentioning "Cannot shrink".
     """Test that shrinking dimensions raises an error."""
     # Source: (num_heads=8, head_dim=128)
     # Target: (num_heads=4, head_dim=64) - cannot shrink
@@ -801,6 +905,9 @@ class UtilsTest(parameterized.TestCase):
     self.assertIn("Cannot shrink", str(context.exception))
 
   def test_various_attention_key_patterns(self):
+    # [FUNCTION DOC]
+    # Verifies several attention key naming styles (q/k/v/o proj, attention key/value/query, self_attn) are
+    # recognized as attention weights, allowing head-dim padding from 64 to 128 without error.
     """Test that various attention key naming patterns are recognized."""
     attention_keys = [
         "model.layers.0.self_attn.q_proj",
@@ -821,6 +928,9 @@ class UtilsTest(parameterized.TestCase):
       self.assertEqual(result.params[key].shape, (4, 128))
 
   def test_transfer_state_directly_simple_transfer(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_directly copies a matching nested nnx.Dict parameter into the destination in
+    # place (identity reshard function).
     """Tests direct state transfer with matching structures."""
     src_state = nnx.Dict(
         decoder=nnx.Dict(layer0=nnx.Dict(weight=nnx.Param(jnp.array([1.0, 2.0]))))
@@ -838,6 +948,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_unwraps_base_and_model(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_directly strips a top-level "base" wrapper from the source and a "model" wrapper
+    # from the destination before matching keys.
     """Tests unwrapping of 'base' from src and 'model' from dst."""
     # Source has 'base' wrapper
     src_state = nnx.Dict(
@@ -861,6 +974,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_intersects_keys(self):
+    # [FUNCTION DOC]
+    # Verifies only keys common to source and destination are transferred: extra source keys are not added,
+    # extra destination keys keep their values, in three scenarios (source superset, destination superset,
+    # mixed extras such as rngs and kv_cache).
     """Tests that only common keys are transferred; extras are ignored."""
     mock_reshard = lambda source, target: source
 
@@ -952,6 +1069,10 @@ class UtilsTest(parameterized.TestCase):
     self.assertFalse(hasattr(dst_state_mixed['decoder'], 'layer1'))
 
   def test_transfer_state_directly_with_plain_dicts(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_directly works on plain nested dicts with nnx.Param and nnx.Variable leaves:
+    # common leaves are updated (including nested ones and top-level variables) while destination-only leaves
+    # are untouched.
     """Tests transfer with plain dicts and various variables."""
     src_state = {
         'decoder': {
@@ -1014,6 +1135,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_attention_weight_num_heads_repetition_and_rank_alignment(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_with_mappings aligns rank and repeats heads: a k_proj of shape (16, 2, 128)
+    # is repeated on the heads axis and flattened to (16, 512), and an o_proj of shape (16, 128, 2) is
+    # repeated on its heads axis (2) and flattened to (16, 512).
     """Test repeating num_heads dimension (non-last axis) for attention weights."""
     # Source k_proj: (model_dim=16, num_heads=2, head_dim=128)
     # Target k_proj: (model_dim=16, num_heads * head_dim=512)
@@ -1056,6 +1181,10 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_allclose(result.params[o_dst_key], expected_o, atol=1e-1)
 
   def test_transfer_state_with_interleaved_scanned_layers(self):
+    # [FUNCTION DOC]
+    # Verifies interleaved scanned layers: a source weight stacked over 2 layers mapped to a target pattern
+    # with an alternation group "decoder.layer.(0|2).weight" (layer axis 0) fills target layers 0 and 2 in
+    # order (values 1.0 and 2.0, transposed via the "kernel" rule) and leaves layers 1 and 3 zero.
     """Test transfer with interleaved scanned layers using regex in mappings."""
     num_src_layers = 2
     num_tgt_layers = 4
@@ -1142,6 +1271,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_mappings_syncs_implicit_tied_lm_head(self):
+    # [FUNCTION DOC]
+    # Verifies that when only the embedding is mapped and the target has an lm_head, the lm_head is also
+    # filled from the source embedding (implicit tied embeddings).
     src = MockState({
         "model.embed_tokens.weight": MockParam(
             jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
@@ -1169,6 +1301,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_mappings_keeps_explicit_lm_head_mapping(self):
+    # [FUNCTION DOC]
+    # Verifies an explicit lm_head mapping with an lm_head present in the source takes precedence over the
+    # tied-embedding sync.
     src = MockState({
         "model.embed_tokens.weight": MockParam(
             jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
@@ -1198,6 +1333,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_with_mappings_syncs_when_lm_head_mapping_unused(self):
+    # [FUNCTION DOC]
+    # Verifies that when an lm_head mapping exists but the source has no lm_head, the target lm_head is
+    # synced from the embedding.
     src = MockState({
         "model.embed_tokens.weight": MockParam(
             jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
@@ -1226,6 +1364,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_scanned_layers(self):
+    # [FUNCTION DOC]
+    # Verifies transfer_state_directly with scan_axis 0 unstacks a scanned "layers" source (under "base") into
+    # unrolled "layers_0"/"layers_1" destination entries (under "model").
     """Tests transfer from scanned 'layers' in source to 'layers_X' in dest."""
     # Source has 'layers' containing stacked weights (shape (2, ...))
     src_state = nnx.Dict(
@@ -1263,6 +1404,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_implicit_layers_container(self):
+    # [FUNCTION DOC]
+    # Verifies unstacking works when the source "layers" container maps onto a destination "layers" container
+    # holding layers_N children (GPT-OSS style).
     """Tests transfer when source IS the layers container (GPT-OSS style)."""
     # Use nnx.Dict for consistency
     src_state = nnx.Dict(
@@ -1291,6 +1435,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_with_dtype_casting(self):
+    # [FUNCTION DOC]
+    # Verifies float32 source values are cast to the bfloat16 destination dtype for both direct and scanned
+    # (unstacked) transfers.
     """Tests that transfer_state_directly correctly casts dtypes (e.g., f32 to bf16)."""
     # Source state in float32
     src_state = nnx.Dict(
@@ -1349,6 +1496,8 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_scanned_layers_casting(self):
+    # [FUNCTION DOC]
+    # Verifies dtype casting to bfloat16 when unstacking scalar per-layer values from a scanned container.
     """Tests transfer from scanned layers container with dtype casting."""
     # Source has scanned layers in float32
     src_state = nnx.Dict(
@@ -1385,6 +1534,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_repeats_kv_heads(self):
+    # [FUNCTION DOC]
+    # Verifies a direct-match weight with 2 rows is repeated (each row twice, consecutively) to fill a
+    # destination with 4 rows (KV head repetition).
     """Tests that direct-match weights are repeated when dst has more heads."""
     src = jnp.array([[1., 2., 3., 4., 5., 6., 7., 8.],
                      [3., 4., 5., 6., 7., 8., 9., 10.]], dtype=jnp.float32)
@@ -1409,6 +1561,8 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_repeats_scanned_kv_heads(self):
+    # [FUNCTION DOC]
+    # Verifies scanned per-layer weights with 2 heads are unstacked and head-repeated to 4 rows per layer.
     """Tests that scanned weights are tiled when dst has more heads than src."""
     # Source: scanned layers, kv_weight shape [2, 2, 8] (layers=2, heads=2, dim=8)
     src_state = nnx.Dict(
@@ -1446,6 +1600,12 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_slice_scanned_param_with_repeatable_target(self):
+    # [FUNCTION DOC]
+    # Verifies utils._unstack_scanned_param on a source (4, 3, 2, 8) and a target (4, 4, 8) detects layer
+    # axis 1 even though the per-layer slice (4, 2, 8) still needs head repetition, and returns per-layer
+    # slices whose second element equals the layer-1 slice.
+    # KNOWN ISSUE: the docstring names a function _slice_scanned_param, while the code calls
+    # _unstack_scanned_param.
     """_slice_scanned_param finds scan axis even when post-slice shape needs repeat."""
     # src: (embed=4, layers=3, kv_heads=2, head_dim=8)
     # tgt: (embed=4, kv_heads=4, head_dim=8) — 2x repeat on kv_heads axis
@@ -1457,6 +1617,11 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(result, src[:, 1, :, :])
 
   def test_transfer_state_directly_scanned_with_repeated_kv_heads(self):
+    # [FUNCTION DOC]
+    # Verifies end-to-end transfer from a scanned source (2 layers stacked on axis 0, each (2, 4)) into
+    # unrolled destinations of shape (4, 4), with each layer's rows repeated twice.
+    # KNOWN ISSUE: inline comments describe the scanned shape as (4, 2, 2, 4) and embed size 4, which does
+    # not match the actual (2, 2, 4) array.
     """Scanned src + KV-head-repeated dst transfer works end-to-end."""
     # src: scanned, shape (2, 2, 4) = (embed, layers, kv_heads*head_dim combined)
     # Use small shapes: embed=4, layers=2, kv_heads=2, head_dim=4
@@ -1494,6 +1659,9 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(dst_state['layers_1']['attn']['kv_weight'][...], expected_1)
 
   def test_sglang_jax_1d_kv_bias_alignment(self):
+    # [FUNCTION DOC]
+    # Verifies that for rollout_engine "sglang_jax" a 1-D k_bias of length 128 (one kv head of dim 128) is
+    # tiled 8 times to fill a 1024-length target.
     """Test 1-D KV bias alignment for sglang_jax rollout engine."""
     src_key = "layers.0.attn.k_bias"
     src_k_bias = jnp.arange(128, dtype=jnp.float32)
@@ -1517,6 +1685,8 @@ class UtilsTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(result.params[src_key].value, expected))
 
   def test_transfer_state_directly_fuses_moe_weights(self):
+    # [FUNCTION DOC]
+    # Verifies source MoE wi_0 and wi_1 are concatenated on the last axis into a destination wi.
     """Tests that wi_0 and wi_1 are fused into wi when target expects it."""
     wi_0_val = jnp.array([[1.0, 2.0], [5.0, 6.0]], dtype=jnp.float32)
     wi_1_val = jnp.array([[3.0, 4.0], [7.0, 8.0]], dtype=jnp.float32)
@@ -1544,6 +1714,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_fuses_moe_weights_scanned_to_unrolled(self):
+    # [FUNCTION DOC]
+    # Verifies scanned MoE wi_0/wi_1 with layout (experts 3, layers 2, features 2) are unstacked along the
+    # default scan axis 1 and fused per layer by concatenating features, into unrolled layers_0/layers_1 wi.
     """Scanned wi_0/wi_1 are unstacked and fused into per-layer wi (unrolled dst).
 
     Uses the function default `scan_axis=1`, matching MaxText's canonical
@@ -1589,6 +1762,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_delete_dst_buffers_no_chunking(self):
+    # [FUNCTION DOC]
+    # Verifies that with delete_dst_buffers True the reshard function receives only sharding objects
+    # (NamedSharding or SingleDeviceSharding) as targets, never possibly-deleted destination arrays, and the
+    # value is still transferred.
     """delete_dst_buffers=True must never pass deleted arrays to reshard_fn."""
     src_val = jnp.array([1.0, 2.0, 3.0])
     src_state = nnx.Dict(
@@ -1603,6 +1780,8 @@ class UtilsTest(parameterized.TestCase):
     inspected_targets = []
 
     def reshard_fn(source, target):
+      # [FUNCTION DOC]
+      # HELPER: records all leaves of target and returns source unchanged.
       inspected_targets.extend(jax.tree_util.tree_leaves(target))
       return source
 
@@ -1621,6 +1800,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_delete_dst_buffers_chunked(self):
+    # [FUNCTION DOC]
+    # Verifies the same delete_dst_buffers guarantee when resharding in chunks of 2 over four parameters, and
+    # that all four values are transferred.
     """delete_dst_buffers=True works through the chunked path too."""
     src_state = nnx.Dict(
         decoder=nnx.Dict(**{
@@ -1638,6 +1820,8 @@ class UtilsTest(parameterized.TestCase):
     inspected_targets = []
 
     def reshard_fn(source, target):
+      # [FUNCTION DOC]
+      # HELPER: records all leaves of target and returns source unchanged.
       inspected_targets.extend(jax.tree_util.tree_leaves(target))
       return source
 
@@ -1663,6 +1847,9 @@ class UtilsTest(parameterized.TestCase):
   def test_transfer_state_directly_delete_dst_buffers_skips_aliased_buffers(
       self,
   ):
+    # [FUNCTION DOC]
+    # Verifies that when source and destination share the same backing array, delete_dst_buffers does not
+    # delete it (the array remains readable and the destination keeps its values).
     """When src and dst Variables share a backing jax.Array, skip deletion."""
     shared = jnp.array([1.0, 2.0, 3.0])
     src_state = nnx.Dict(
@@ -1689,6 +1876,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_delete_dst_buffers_scanned_layers(self):
+    # [FUNCTION DOC]
+    # Verifies per-layer slices produced by unstacking a scanned source remain valid destination values after
+    # delete_dst_buffers.
     """Unstacked-slice targets remain valid after delete_dst_buffers=True."""
     scanned = jnp.arange(8, dtype=jnp.float32).reshape(2, 4)
     src_state = nnx.Dict(layers=nnx.Dict(weight=nnx.Param(scanned)))
@@ -1718,6 +1908,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_fuses_moe_weights_with_padding(self):
+    # [FUNCTION DOC]
+    # Verifies MoE wi_0/wi_1 fusion with per-shard padding into a destination sharded over 2 devices on the
+    # last axis: each half is padded per shard (one value plus one zero per shard) and halves are interleaved
+    # by shard, giving rows like [a, 0, c, 0, b, 0, d, 0]. Skipped with fewer than 2 devices.
     """Tests that wi_0 and wi_1 are fused, padded and interleaved into wi."""
     # Source: wi_0, wi_1 each (2 experts, 2 features)
     wi_0_val = jnp.array([[1.0, 2.0], [5.0, 6.0]], dtype=jnp.float32)
@@ -1765,6 +1959,10 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(dst_state["layers"]["wi"][...], expected_wi)
 
   def test_transfer_state_directly_fuses_moe_weights_with_padding_scanned(self):
+    # [FUNCTION DOC]
+    # Verifies the padded, interleaved MoE fusion also works for a scanned source (experts 3, layers 2,
+    # features 2; default scan axis 1) unstacked into two unrolled sharded destinations. Skipped with fewer
+    # than 2 devices.
     """Scanned wi_0/wi_1 are fused, padded per-shard, and unstacked per-layer.
 
     Mirrors `test_transfer_state_directly_fuses_moe_weights_with_padding` but
@@ -1847,6 +2045,10 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_transfer_state_directly_moe_wi_padding_replicated_source(self):
+    # [FUNCTION DOC]
+    # Verifies a replicated MoE wi_0 (3, 4) transferred to a target (3, 8) sharded over 2 devices is padded
+    # per shard chunk: each row [a, b, c, d] becomes [a, b, 0, 0, c, d, 0, 0]. Skipped with fewer than 2
+    # devices.
     """Replicated source -> TP-sharded target produces interleaved global pad.
 
     The MoE-key path in `_align_per_axis` reshapes the source to expose
@@ -1901,6 +2103,10 @@ class UtilsTest(parameterized.TestCase):
   def test_transfer_state_directly_moe_wi_padding_unscanned_separate_replicated_src(
       self,
   ):
+    # [FUNCTION DOC]
+    # Verifies the same interleaved per-shard padding end-to-end for an unscanned replicated wi_0 source into
+    # an unscanned sharded wi_0 target. Skipped with fewer than 2 devices.
+    # KNOWN ISSUE: the docstring mentions wi_0 and wi_1 but only wi_0 is exercised.
     """End-to-end: unscanned replicated wi_0/wi_1 -> unscanned padded sharded wi_0/wi_1.
 
     The bug this whole refactor targets: a replicated trainer source that
@@ -1948,6 +2154,11 @@ class UtilsTest(parameterized.TestCase):
   def test_transfer_state_directly_moe_wi_padding_scanned_separate_replicated_src(
       self,
   ):
+    # [FUNCTION DOC]
+    # Verifies a scanned replicated wi_0 (experts 3, layers 2, features 4) is unstacked into two unrolled
+    # sharded (3, 8) targets with interleaved per-shard padding for each layer. Skipped with fewer than 2
+    # devices.
+    # KNOWN ISSUE: the docstring mentions wi_0 and wi_1 but only wi_0 is exercised.
     """Scanned replicated wi_0/wi_1 -> unrolled padded sharded non-fused wi_0/wi_1.
 
     Exercises the bulk-align-and-unstack path on a scanned source that's
@@ -1973,6 +2184,8 @@ class UtilsTest(parameterized.TestCase):
     ))
 
     def _zeros():
+      # [FUNCTION DOC]
+      # HELPER: returns a (3, 8) float32 zero array placed with the 2-device last-axis sharding.
       return jax.device_put(jnp.zeros((3, 8), dtype=jnp.float32), sharded)
 
     dst_state = nnx.Dict(**{
@@ -2009,6 +2222,9 @@ class UtilsTest(parameterized.TestCase):
     )
 
   def test_align_per_axis_attention_pure_repeat(self):
+    # [FUNCTION DOC]
+    # Verifies utils._align_per_axis on an attention key repeats along mismatched axes only: (2, 4) to (8, 4)
+    # equals each row repeated 4 times.
     """Attention key path → pure `repeat` on every mismatched axis.
 
     KV-head expansion and head_dim padding never co-occur on a single
@@ -2027,6 +2243,9 @@ class UtilsTest(parameterized.TestCase):
     np.testing.assert_array_equal(np.asarray(result), expected)
 
   def test_align_per_axis_non_repeatable_non_moe_raises(self):
+    # [FUNCTION DOC]
+    # Verifies _align_per_axis raises ShapeMismatchError for a non-MoE key whose mismatched axis is not an
+    # integer multiple (no zero-padding fallback).
     """Non-MoE key with a non-integer-multiple mismatch raises.
 
     The simplified single-mode aligner no longer falls back to zero-pad
@@ -2040,6 +2259,9 @@ class UtilsTest(parameterized.TestCase):
       )
 
   def test_align_per_axis_moe_two_axes_zero_pad(self):
+    # [FUNCTION DOC]
+    # Verifies _align_per_axis on an MoE "wi" key zero-pads every mismatched axis at the end: (1, 2, 2) to
+    # (2, 2, 4).
     """MoE `wi` style: multiple mismatched axes, all classified as zero_pad.
 
     Pre-refactor `_align_to_model_shape` only padded the *last* mismatched
@@ -2059,8 +2281,13 @@ class UtilsTest(parameterized.TestCase):
 
 
 class ResolveParallelismSizesTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests utils.resolve_parallelism_sizes, which infers tensor, data and expert parallel sizes from the
+  # mesh's total device count.
 
   def _make_mesh(self, total_devices):
+    # [FUNCTION DOC]
+    # HELPER: returns a MagicMock mesh whose shape dict has a single axis of total_devices.
     """Returns a mock mesh with the given total device count."""
     mesh = mock.MagicMock()
     mesh.shape = {"axis": total_devices}
@@ -2083,6 +2310,10 @@ class ResolveParallelismSizesTest(parameterized.TestCase):
       expected_dp,
       expected_ep,
   ):
+    # [FUNCTION DOC]
+    # Verifies resolve_parallelism_sizes returns the expected (tp, dp, ep) for 8 devices: with tp and dp
+    # unset (-1) tp becomes devices divided by ep and dp becomes 1; with one of tp/dp given the other is
+    # inferred; fully explicit values are returned unchanged.
     mesh = self._make_mesh(total_devices)
     tp, dp, ep = utils.resolve_parallelism_sizes(
         mesh=mesh,
@@ -2095,6 +2326,8 @@ class ResolveParallelismSizesTest(parameterized.TestCase):
     self.assertEqual(ep, expected_ep)
 
   def test_resolve_parallelism_sizes_indivisible_ep_raises(self):
+    # [FUNCTION DOC]
+    # Verifies expert_parallel_size 3 on 8 devices raises ValueError mentioning "expert_parallel_size".
     mesh = self._make_mesh(8)
     with self.assertRaisesRegex(ValueError, "expert_parallel_size"):
       utils.resolve_parallelism_sizes(mesh=mesh, expert_parallel_size=3)

@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.experimental.tracer (perf v2 PerfTracer):
+# per-thread host timelines (ids 'host-<ident>'; the main thread's created at
+# init), per-device AsyncTimelines (ids from generate_device_timeline_id,
+# devices given as lists or numpy arrays, born time aligned with host),
+# span(name, devices, tags) context managers whose async_end(waitlist)
+# records a flat device span when the waitlist completes (by default only on
+# the first device per mesh unless collect_on_first_device_per_mesh is
+# False), sequential device span ids in start order, device queue timelines
+# ('<id>_queue') filled when overlapping device spans are sequentialized
+# (unless the span names are listed in concurrent_device_spans or it is
+# 'all'), synchronize() (waits pending spans and blocks on a tiny array put
+# on every jax device), process_and_commit_timelines(), export() (commits
+# then calls export_fn, default returns {}), print(), and NoopTracer.
+# timeline._async_wait, time.perf_counter and the tracer's jax module are
+# patched in most tests.
 from __future__ import annotations
 
 import contextlib
@@ -31,11 +47,17 @@ from tunix.perf.experimental import tracer
 
 @dataclasses.dataclass
 class MockDevice:
+  # [CLASS DOC]
+  # HELPER: dataclass standing in for a JAX device with platform and id.
   platform: str
   id: int
 
 
 class ControlledAsyncWait:
+  # [CLASS DOC]
+  # HELPER: callable replacement for timeline._async_wait that starts a thread
+  # per call which waits on an Event before invoking success, letting tests
+  # complete async spans in a chosen order. Thread-safe via a lock.
   """Helper to control the completion of async tasks.
 
   Attributes:
@@ -45,6 +67,8 @@ class ControlledAsyncWait:
   """
 
   def __init__(self) -> None:
+    # [FUNCTION DOC]
+    # HELPER: initializes an empty task list of (Event, Thread) and a lock.
     self.tasks: List[tuple[threading.Event, threading.Thread]] = []
     self.lock: threading.Lock = threading.Lock()
 
@@ -54,9 +78,15 @@ class ControlledAsyncWait:
       success: Callable[[], None],
       failure: Callable[[Exception], None],
   ) -> threading.Thread:
+    # [FUNCTION DOC]
+    # HELPER: creates an Event and starts a thread that waits on it then calls
+    # success; records (event, thread) and returns the thread. waitlist and
+    # failure are ignored.
     event = threading.Event()
 
     def target() -> None:
+      # [FUNCTION DOC]
+      # HELPER: thread body; blocks on the event then calls success.
       event.wait()
       success()
 
@@ -67,12 +97,16 @@ class ControlledAsyncWait:
     return t
 
   def trigger(self, index: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: sets the event of task index and joins its thread.
     with self.lock:
       event, t = self.tasks[index]
     event.set()
     t.join()
 
   def trigger_all(self) -> None:
+    # [FUNCTION DOC]
+    # HELPER: sets all events then joins all threads (snapshot of tasks).
     with self.lock:
       tasks = list(self.tasks)
     for event, _ in tasks:
@@ -82,8 +116,13 @@ class ControlledAsyncWait:
 
 
 class PerfTracerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for PerfTracer with _async_wait patched to return a Thread mock
+  # and time.perf_counter patched to return 1000.0.
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture installing the two patches via enter_context.
     super().setUp()
     self.mock_async_wait = self.enter_context(
         mock.patch.object(timeline, "_async_wait", autospec=True)
@@ -96,6 +135,9 @@ class PerfTracerTest(absltest.TestCase):
     self.mock_perf_counter.return_value = 1000.0
 
   def test_no_devices_tracer(self):
+    # [FUNCTION DOC]
+    # Verifies a tracer without devices has all_devices [] and only one host
+    # timeline holding the span.
     t = tracer.PerfTracer()
     self.assertEqual(t.all_devices, [])
 
@@ -109,6 +151,9 @@ class PerfTracerTest(absltest.TestCase):
     self.assertLen(timelines[host_id].cur_step, 1)
 
   def test_tracer_with_devices_and_tags(self):
+    # [FUNCTION DOC]
+    # Verifies a device span with tags is recorded with the same name and tags
+    # on both the main host timeline and the tpu0 device timeline.
     d1 = MockDevice("tpu", 0)
     t = tracer.PerfTracer(devices=[d1])
     self.assertEqual(t.all_devices, ["tpu0"])
@@ -117,6 +162,9 @@ class PerfTracerTest(absltest.TestCase):
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -140,6 +188,9 @@ class PerfTracerTest(absltest.TestCase):
       self.assertEqual(dev_tl.cur_step[0].tags, tags)
 
   def test_tracer_with_multiple_devices(self):
+    # [FUNCTION DOC]
+    # Verifies with collect_on_first_device_per_mesh False both devices get the
+    # span and all timelines share the same born time.
     d1 = MockDevice("tpu", 0)
     d2 = MockDevice("tpu", 1)
     t = tracer.PerfTracer(
@@ -151,6 +202,9 @@ class PerfTracerTest(absltest.TestCase):
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -180,6 +234,9 @@ class PerfTracerTest(absltest.TestCase):
       self.assertEqual(tl2.cur_step[0].name, "multi_dev_op")
 
   def test_tracer_collect_on_one_device(self):
+    # [FUNCTION DOC]
+    # Verifies by default only the first device of the span's device list gets
+    # the device span; the second device timeline exists but is empty.
     d1 = MockDevice("tpu", 0)
     d2 = MockDevice("tpu", 1)
     # Default collect_on_first_device_per_mesh=True
@@ -189,6 +246,9 @@ class PerfTracerTest(absltest.TestCase):
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -211,6 +271,9 @@ class PerfTracerTest(absltest.TestCase):
     self.assertEmpty(tl2.cur_step)
 
   def test_tracer_with_multidim_devices(self):
+    # [FUNCTION DOC]
+    # Verifies a 2D numpy array of devices is flattened to tpu0 and tpu1 and a
+    # synchronous span is recorded on both device timelines.
     d1 = MockDevice("tpu", 0)
     d2 = MockDevice("tpu", 1)
     arr_devices = np.array([[d1], [d2]])
@@ -231,12 +294,18 @@ class PerfTracerTest(absltest.TestCase):
     self.assertLen(timelines["tpu1"].cur_step, 1)
 
   def test_nested_host_spans_with_devices(self):
+    # [FUNCTION DOC]
+    # Verifies nested host spans produce two host spans and two device spans,
+    # with the inner (exited first) recorded first on the device.
     d1 = "gpu0"
     t = tracer.PerfTracer(devices=[d1])
 
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -263,10 +332,15 @@ class PerfTracerTest(absltest.TestCase):
     self.assertEqual(outer_span.name, "outer")
 
   def test_interleaved_threads(self):
+    # [FUNCTION DOC]
+    # Verifies spans from two worker threads land on separate host timelines
+    # (main thread timeline stays empty): span counts [0, 1, 1].
     # Test multiple threads using the same tracer
     t = tracer.PerfTracer()
 
     def worker(name: str) -> None:
+      # [FUNCTION DOC]
+      # HELPER: opens a span with the given name and sleeps 10 ms.
       with t.span(name):
         time.sleep(0.01)
 
@@ -288,6 +362,8 @@ class PerfTracerTest(absltest.TestCase):
     self.assertEqual(sorted(span_counts), [0, 1, 1])
 
   def test_synchronize(self):
+    # [FUNCTION DOC]
+    # Verifies synchronize() calls _synchronize_devices once.
     t = tracer.PerfTracer()
     with mock.patch.object(
         tracer, "_synchronize_devices", autospec=True
@@ -296,6 +372,10 @@ class PerfTracerTest(absltest.TestCase):
       mock_sync.assert_called_once()
 
   def test_synchronize_slow_fast_devices(self):
+    # [FUNCTION DOC]
+    # Verifies synchronize blocks on every device's put array (fast and slow).
+    # KNOWN ISSUE: elapsed time comes from the patched perf_counter (scripted
+    # 1000.0 then 1000.2), so the at-least-0.1s assertion is always true.
     """Tests synchronization with devices having different latencies."""
     t = tracer.PerfTracer()
 
@@ -311,12 +391,16 @@ class PerfTracerTest(absltest.TestCase):
 
       # Slow one sleeps
       def slow_block() -> None:
+        # [FUNCTION DOC]
+        # HELPER: block_until_ready replacement sleeping 0.1 s.
         time.sleep(0.1)
 
       mock_future_slow.block_until_ready.side_effect = slow_block
 
       # device_put returns fast then slow (or based on device arg)
       def side_effect_put(arr: Any, device: Any) -> mock.Mock:
+        # [FUNCTION DOC]
+        # HELPER: device_put replacement returning the fast or slow future by device.
         if device == "fast_dev":
           return mock_future_fast
         else:
@@ -338,6 +422,9 @@ class PerfTracerTest(absltest.TestCase):
       self.assertGreaterEqual(end_time - start_time, 0.1)
 
   def test_synchronize_waits_for_pending_spans(self):
+    # [FUNCTION DOC]
+    # Verifies synchronize blocks while an async device span is pending and
+    # returns after the ControlledAsyncWait task is triggered.
     d0 = MockDevice("tpu", 0)
     t = tracer.PerfTracer(devices=[d0])
 
@@ -370,6 +457,9 @@ class PerfTracerTest(absltest.TestCase):
       self.assertFalse(sync_thread.is_alive())
 
   def test_export(self):
+    # [FUNCTION DOC]
+    # Verifies export() commits timelines then returns export_fn's result, and
+    # the default export returns {}.
     export_mock = mock.Mock(return_value={"a": 1})
     t = tracer.PerfTracer(export_fn=export_mock)
 
@@ -387,12 +477,18 @@ class PerfTracerTest(absltest.TestCase):
     self.assertEqual(t2.export(), {})
 
   def test_commit_timelines(self):
+    # [FUNCTION DOC]
+    # Verifies process_and_commit_timelines gives every timeline one committed
+    # step.
     d0 = MockDevice("tpu", 0)
     t = tracer.PerfTracer(devices=[d0])
 
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -409,12 +505,18 @@ class PerfTracerTest(absltest.TestCase):
       self.assertLen(tl.committed_steps, 1)
 
   def test_tracer_print(self):
+    # [FUNCTION DOC]
+    # Verifies print() writes committed and current steps with span names to
+    # stdout.
     d1 = MockDevice("tpu", 0)
     t = tracer.PerfTracer(devices=[d1])
 
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -437,12 +539,17 @@ class PerfTracerTest(absltest.TestCase):
     self.assertIn("Current Step", output)
 
   def test_get_timelines_includes_queue_timelines(self):
+    # [FUNCTION DOC]
+    # Verifies _get_timelines includes the device queue timeline 'tpu0_queue'.
     d1 = MockDevice("tpu", 0)
     t = tracer.PerfTracer(devices=[d1])
 
     def immediate_success(
         waitlist: Any, success: Callable[[], None], failure: Callable[[], None]
     ) -> mock.Mock:
+      # [FUNCTION DOC]
+      # HELPER: fake _async_wait that calls success immediately and returns an
+      # autospec'd Thread mock.
       success()
       return mock.create_autospec(threading.Thread, instance=True)
 
@@ -457,8 +564,14 @@ class PerfTracerTest(absltest.TestCase):
 
 
 class AdvancedPerfTracerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Test case for PerfTracer concurrency/ordering using ControlledAsyncWait and
+  # a patched tracer jax module (one device 'tpu0').
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: fixture installing the ControlledAsyncWait patch, a MockDevice and
+    # the jax mock.
     super().setUp()
     self.mock_async_wait = self.enter_context(
         mock.patch.object(timeline, "_async_wait", autospec=True)
@@ -475,6 +588,9 @@ class AdvancedPerfTracerTest(parameterized.TestCase):
     self.mock_jax.device_put.return_value.block_until_ready.return_value = None
 
   def test_interleaved_device_completion(self):
+    # [FUNCTION DOC]
+    # Verifies device spans may complete out of order: B (id 1) recorded first
+    # with end 100.0, then A (id 0) with end 101.0; ids follow start order.
     """Tests that device spans can complete in a different order than started."""
     t = tracer.PerfTracer(devices=[self.device])
 
@@ -522,6 +638,10 @@ class AdvancedPerfTracerTest(parameterized.TestCase):
       self.assertEqual(dev_cur_step[1].id, 1)
 
   def test_host_nesting_and_device_flatness(self):
+    # [FUNCTION DOC]
+    # Verifies host spans nest (Child's parent is Root) while device spans are
+    # flat (no parent) and ordered by submission (Child before Root); nothing is
+    # recorded on the device before completion.
     """Tests correct nesting on host vs flat structure on device."""
     t = tracer.PerfTracer(devices=[self.device])
 
@@ -570,12 +690,17 @@ class AdvancedPerfTracerTest(parameterized.TestCase):
       self.assertIsNone(d_second.parent_id)
 
   def test_concurrent_stress(self):
+    # [FUNCTION DOC]
+    # Verifies 10 threads x 20 async spans all get recorded on the device with
+    # ids exactly 0..199.
     """Tests correctness under concurrent submissions via PerfTracer."""
     t = tracer.PerfTracer(devices=[self.device])
     num_threads = 10
     spans_per_thread = 20
 
     def worker() -> None:
+      # [FUNCTION DOC]
+      # HELPER: opens and async-ends spans_per_thread device spans.
       for _ in range(spans_per_thread):
         with t.span(f"span", devices=[self.device]) as s:
           s.async_end(["w"])
@@ -635,6 +760,11 @@ class AdvancedPerfTracerTest(parameterized.TestCase):
   def test_concurrent_spans(
       self, concurrent_spans, span1_name, span2_name, expect_sequentializing
   ):
+    # [FUNCTION DOC]
+    # Verifies concurrent_device_spans: after forcing two device spans to
+    # overlap, commit sequentializes them (one queued span on the queue
+    # timeline) only when neither span name is listed as concurrent (or 'all').
+    # Inputs: concurrent_spans, span names and the expectation.
     t = tracer.PerfTracer(
         devices=[self.device], concurrent_device_spans=concurrent_spans
     )
@@ -672,8 +802,12 @@ class AdvancedPerfTracerTest(parameterized.TestCase):
 
 
 class PrivateHelpersTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for private tracer helpers.
 
   def test_synchronize_devices(self):
+    # [FUNCTION DOC]
+    # Verifies _synchronize_devices puts an array on each jax device (patched).
     with mock.patch.object(tracer, "jax", autospec=True) as mock_jax:
       mock_jax.devices.return_value = ["d1"]
       mock_put = mock_jax.device_put
@@ -685,29 +819,45 @@ class PrivateHelpersTest(absltest.TestCase):
 
 
 class NoopTracerTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for NoopTracer and assorted timeline.Span/Timeline behaviours.
+  # KNOWN ISSUE: the last five tests exercise timeline classes rather than
+  # NoopTracer and duplicate coverage in timeline_test.
 
   def test_noop_tracer_span(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer.span works as a context manager with async_end.
     t = tracer.NoopTracer()
     with t.span("noop") as span:
       span.async_end([])
 
   def test_noop_tracer_export(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer.export returns {}.
     t = tracer.NoopTracer()
     self.assertEqual(t.export(), {})
 
   def test_noop_tracer_all_devices(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer.all_devices is [].
     t = tracer.NoopTracer()
     self.assertEqual(t.all_devices, [])
 
   def test_noop_tracer_synchronize(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer.synchronize does not raise.
     t = tracer.NoopTracer()
     t.synchronize()
 
   def test_noop_tracer_print(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTracer.print does not raise.
     t = tracer.NoopTracer()
     t.print()
 
   def test_span_lifecycle(self):
+    # [FUNCTION DOC]
+    # Verifies Span ended/duration after setting end.
     span = timeline.Span(
         name="test", begin=0.0, id=1, parent_id=0, tags={"k": "v"}
     )
@@ -717,6 +867,8 @@ class NoopTracerTest(absltest.TestCase):
     self.assertEqual(span.duration, 1.0)
 
   def test_span_tags(self):
+    # [FUNCTION DOC]
+    # Verifies add_tag adds and overwrites with a WARNING.
     span = timeline.Span(
         name="test", begin=0.0, id=1, parent_id=0, tags={"k": "v"}
     )
@@ -729,6 +881,8 @@ class NoopTracerTest(absltest.TestCase):
     self.assertEqual(span.tags["k2"], "v3")
 
   def test_span_end_before_begin(self):
+    # [FUNCTION DOC]
+    # Verifies stop_span before begin raises ValueError with both times.
     tl = timeline.Timeline("host", 0.0)
     tl.start_span("test", 10.0)
     with self.assertRaisesRegex(
@@ -737,6 +891,9 @@ class NoopTracerTest(absltest.TestCase):
       tl.stop_span(5.0)
 
   def test_commit_uncompleted_span(self):
+    # [FUNCTION DOC]
+    # Verifies commit_step purges an uncompleted span with a WARNING, leaving an
+    # empty committed step.
     tl = timeline.Timeline("host", 0.0)
     tl.start_span("test", 10.0)
     with self.assertLogs(level="WARNING") as cm:
@@ -747,6 +904,8 @@ class NoopTracerTest(absltest.TestCase):
     self.assertEmpty(tl.committed_steps[0])
 
   def test_timeline_properties(self):
+    # [FUNCTION DOC]
+    # Verifies all_steps holds the committed step and current step (1 each).
     tl = timeline.Timeline("host", 0.0)
     span = tl.start_span("test", 10.0)
     tl.stop_span(11.0)
@@ -759,8 +918,14 @@ class NoopTracerTest(absltest.TestCase):
 
 
 class AsyncFailureTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for async wait failure handling through PerfTracer.
 
   def test_async_wait_failure(self):
+    # [FUNCTION DOC]
+    # Verifies a jax.block_until_ready error inside the real _async_wait is
+    # logged at ERROR (containing 'jax error') rather than raised, with
+    # synchronize still returning.
     with mock.patch.object(timeline, "jax", autospec=True) as mock_jax:
       mock_jax.block_until_ready.side_effect = RuntimeError("jax error")
 

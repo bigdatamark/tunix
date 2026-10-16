@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.rl.rl_cluster: RLCluster construction (placing actor,
+# reference and rollout models on per-role meshes, rollout dtype casting),
+# perf tracer selection from PerfMetricsConfig, RLTrainingConfig batch-size
+# validation and derived gradient accumulation, generate with chat
+# templates, rollout engine selection and validation (vanilla, vllm,
+# sglang_jax, mock, user-defined classes or partials, invalid values), and
+# per-role logical axis rule context management. Uses toy transformers on
+# simulated CPU devices; vLLM/SGLang tests are skipped when the GITHUB_JOB
+# env var is "run_prod".
+# Side effects: sets XLA_FLAGS at import; setUpClass sets CPU device count
+# (DEVICE_COUNTS env var, default 4) via chex and prints it.
+# KNOWN ISSUE: os is imported twice, and XLA_FLAGS is set after jax is
+# imported so it likely has no effect (the setUpClass message "before JAX
+# init" is also inaccurate for the same reason).
+
 import functools
 import os
 import os
@@ -45,14 +61,21 @@ Mesh = jax.sharding.Mesh
 
 
 def _dummy_export_fn(*args, **kwargs) -> None:
+  # [FUNCTION DOC]
+  # HELPER: no-op perf metrics export function; ignores all arguments.
   """Provides a dummy export function for testing."""
   del args, kwargs
 
 
 class RlClusterTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for RLCluster and its configs on simulated CPU devices.
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: sets the CPU device count from DEVICE_COUNTS (default 4),
+    # prints it, and stores cls.num_cpus and cls.device_count.
     super().setUpClass()
 
     cls.num_cpus = int(os.environ.get('DEVICE_COUNTS', 4))
@@ -61,6 +84,12 @@ class RlClusterTest(parameterized.TestCase):
     cls.device_count = jax.device_count()
 
   def test_model_loading_with_resharding(self):
+    # [FUNCTION DOC]
+    # With actor/reference on the first half of devices and rollout on the
+    # second half, verifies an unsharded actor gets resharded: the actor
+    # trainer model lives on the actor mesh in float32, the rollout model on
+    # the rollout mesh cast to bfloat16 (rollout data_type), and the
+    # reference model on the actor mesh.
     split_index = self.device_count // 2
 
     actor_mesh = Mesh(

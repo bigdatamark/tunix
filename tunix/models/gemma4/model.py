@@ -12,6 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Flax NNX implementation of the Gemma 4 decoder-only transformer (text only).
+# Key features beyond Gemma 3:
+# - Configurable cyclic attention pattern of LOCAL_SLIDING / GLOBAL layers;
+#   global layers may use a different number of kv heads
+#   (num_global_kv_heads), a larger head size (global_key_size, default 512),
+#   partial RoPE (global_rope_proportion of the rotary frequencies; the rest
+#   unrotated) and shared key/value projections (k_eq_v_global).
+# - QK RMSNorm plus a parameter-free RMS normalization of values.
+# - KV-cache sharing: the last frac_shared_layers of layers reuse the K/V of
+#   an earlier layer (create_kv_cache_sharing_patterns) and keep no cache of
+#   their own; they may use a different FFN width
+#   (override_kv_shared_ffw_hidden).
+# - Ring-buffer KV caches of size sliding_window_size for local layers
+#   (use_sliding_window_kv_cache, default on).
+# - Optional TPU splash (flash) attention for prefill / training, run under
+#   shard_map; mutually exclusive with the sliding window cache.
+# - Per-layer input embeddings (PLE, per_layer_input_dim > 0): an extra
+#   embedding table and projection producing one small vector per layer that
+#   gates an additive residual update in each layer.
+# - Optional mixture-of-experts branch (moe.MoERagged) added to the dense MLP.
+# - Per-layer learned scalar skip_scale on the layer output; final logit
+#   soft-capping (default 30.0); RMSNorm scale applied directly (init 1).
+# - Separate compute dtype (dtype) and parameter dtype (param_dtype).
+# Types: LayerCache dict with 'k', 'v' [B, cache_len, K, H] and 'end_index'
+# int32 [B]; Cache maps 'layer_<i>' (non-shared layers only) to LayerCache.
+# K_MASK is a large negative masking value. GEMMA4_ATTENTION_PATTERN is the
+# default 5 local + 1 global pattern. Side effect at import:
+# env_utils.setup_sharding_environment().
 """Gemma4 model."""
 
 import dataclasses
@@ -46,6 +75,9 @@ Cache = dict[str, LayerCache]
 
 
 class RematConfig(enum.Enum):
+  # [CLASS DOC]
+  # Enum of rematerialization modes: NONE, BLOCK (remat attention and MLP
+  # blocks individually), DECODER (remat whole decoder layers).
   NONE = enum.auto()
   BLOCK = enum.auto()
   DECODER = enum.auto()
@@ -53,6 +85,11 @@ class RematConfig(enum.Enum):
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardingConfig:
+  # [CLASS DOC]
+  # Frozen dataclass of partition-spec tuples for Gemma 4 weights and
+  # activations: Gemma 3 fields plus MoE expert weights (exp_weight_edf,
+  # exp_weight_efd) and per-layer-embedding weights (per_layer_model_projection,
+  # per_layer_input_gate, per_layer_projection, per_layer_input_embedding).
   """Sharding configuration for gemma transformer."""
 
   emb_vd: Tuple[str | None, ...]
@@ -79,6 +116,10 @@ class ShardingConfig:
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False):
+    # [FUNCTION DOC]
+    # Static factory for the default sharding; with is_sampling True, 'fsdp' is
+    # removed from weight specs and act_btd's feature dimension is unsharded.
+    # Returns a new ShardingConfig.
     fsdp = 'fsdp' if not is_sampling else None
 
     return ShardingConfig(
@@ -106,6 +147,19 @@ class ShardingConfig:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ModelConfig:
+  # [CLASS DOC]
+  # Keyword-only dataclass of Gemma 4 hyperparameters. Core sizes (num_layers,
+  # num_embed, embed_dim, hidden_dim, num_heads, head_dim, num_kv_heads);
+  # final_logit_softcap (30.0, None disables); sliding_window_size;
+  # per_layer_input_dim (0 disables PLE); num_global_kv_heads and
+  # global_key_size for GLOBAL layers; attention_pattern (None uses
+  # GEMMA4_ATTENTION_PATTERN); frac_shared_layers (fraction of trailing layers
+  # that share KV); global/local rope proportions; k_eq_v_global;
+  # override_kv_shared_ffw_hidden; RoPE base frequencies (10k local, 1M global)
+  # and scale factors; shd_config; remat_config; param_dtype and dtype (both
+  # float32 by default); use_flash_attention and flash_attention_block_size;
+  # use_sliding_window_kv_cache; MoE settings (enable_moe, num_experts,
+  # num_experts_per_tok, expert_dim, moe_dense_hidden_dim).
   """Transformer config."""
 
   num_layers: int
@@ -148,6 +202,9 @@ class ModelConfig:
   moe_dense_hidden_dim: int | None = None
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Dataclass post-init validation: raises ValueError when both
+    # use_sliding_window_kv_cache and use_flash_attention are True.
     # TODO(tunix-dev): support flash attention with sliding window KV cache
     if self.use_sliding_window_kv_cache and self.use_flash_attention:
       raise ValueError(
@@ -159,6 +216,11 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: Gemma 4 E2B config: 35 layers, vocab 262144, embed 1536,
+    # hidden 6144, 8 heads, head_dim 256, 1 kv head, window 512, PLE dim 256,
+    # 20 of 35 layers KV-shared with FFN width 12288 for those layers, pattern
+    # 4 local + 1 global. Other fields default.
     return cls(
         num_layers=35,
         num_embed=262144,
@@ -186,6 +248,10 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: Gemma 4 E4B config: 42 layers, vocab 262144, embed 2560,
+    # hidden 10240, 8 heads, head_dim 256, 2 kv heads, window 512, PLE dim 256,
+    # 18 of 42 layers KV-shared, pattern 5 local + 1 global.
     return cls(
         num_layers=42,
         num_embed=262144,
@@ -213,6 +279,11 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: Gemma 4 31B dense config: 60 layers, vocab 262144, embed
+    # 5376, hidden 21504, 32 heads, head_dim 256, 16 kv heads (4 for global
+    # layers), window 1024, global layers share k and v projections, pattern
+    # 5 local + 1 global.
     return cls(
         num_layers=60,
         num_embed=262144,
@@ -240,6 +311,12 @@ class ModelConfig:
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> 'ModelConfig':
+    # [FUNCTION DOC]
+    # Classmethod: Gemma 4 26B-A4B MoE config: 30 layers, vocab 262144, embed
+    # 2816, dense MLP hidden 2112, 16 heads, head_dim 256, 8 kv heads (2 global),
+    # window 1024, MoE with 128 experts of width 704 and 8 experts per token,
+    # k_eq_v for global layers, global rope proportion 0.25, pattern 5 local + 1
+    # global.
     return cls(
         num_layers=30,
         num_embed=262144,
@@ -270,6 +347,12 @@ class ModelConfig:
 
 
 class Embedder(nnx.Module):
+  # [CLASS DOC]
+  # Token embedder with tied unembedding, and (when per_layer_input_dim > 0)
+  # the per-layer-input machinery: per_layer_model_projection (Einsum
+  # 'BTD,DNP->BTNP', weight [D, num_layers, P], weights scaled by D^-0.5 at
+  # use time), per_layer_projection_norm (RMSNorm over P) and
+  # per_layer_input_embedding table [vocab, num_layers, P].
   """Embedder module."""
 
   def __init__(
@@ -277,6 +360,10 @@ class Embedder(nnx.Module):
       config: ModelConfig,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Stores config, vocab_size, embed_dim, param_dtype and creates the
+    # parameters listed in the class doc (normal init in param_dtype, sharding
+    # from config.shd_config).
     self.config = config
     self.vocab_size = config.num_embed
     self.embed_dim = config.embed_dim
@@ -316,6 +403,9 @@ class Embedder(nnx.Module):
       )
 
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Looks up tokens x [B, T], multiplies by sqrt(embed_dim) in the table dtype,
+    # casts to config.dtype and applies act_btd sharding. Returns [B, T, D].
     x = self.input_embedding[(x,)]
     x *= jnp.sqrt(x.shape[-1]).astype(x.dtype)
     x = jnp.astype(x, self.config.dtype)
@@ -325,6 +415,12 @@ class Embedder(nnx.Module):
   def encode_per_layer_input(
       self, x: jaxtyping.ArrayLike, t: jaxtyping.ArrayLike
   ) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Computes per-layer inputs. Inputs: x = token embeddings [B, T, D] (output
+    # of encode), t = token ids [B, T]. Out-of-range ids are replaced by 0.
+    # Projects x to [B, T, num_layers, P] and RMS-normalizes over P; looks up
+    # per_layer_input_embedding[t] and scales it by sqrt(P); returns
+    # (projection + embedding) / sqrt(2), shape [B, T, num_layers, P].
     t = jnp.where(
         jnp.logical_and(t >= 0, t < self.vocab_size), t, jnp.zeros_like(t)
     )
@@ -335,12 +431,18 @@ class Embedder(nnx.Module):
     return (x + y) * jax.lax.rsqrt(2.0).astype(x.dtype)
 
   def decode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x and the embedding table to config.dtype and returns logits
+    # x @ table^T ([..., vocab]).
     x = jnp.astype(x, self.config.dtype)
     w = jnp.astype(self.input_embedding.value, self.config.dtype)
     return jnp.dot(x, w.T)
 
 
 class Einsum(nnx.Module):
+  # [CLASS DOC]
+  # Parameterized einsum with explicit compute dtype and optional constant
+  # weight multiplier w_scale.
   """Einsum module."""
 
   def __init__(
@@ -354,6 +456,9 @@ class Einsum(nnx.Module):
       param_dtype: jnp.dtype,
       w_scale: float | None = None,
   ):
+    # [FUNCTION DOC]
+    # Stores einsum_str, dtype, w_scale and shape; creates weight w with normal
+    # init in param_dtype and the given sharding.
     self.einsum_str = einsum_str
     self.dtype = dtype
     self.w_scale = w_scale
@@ -365,6 +470,9 @@ class Einsum(nnx.Module):
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Multiplies w by w_scale if set, casts x and w to dtype and returns
+    # einsum(einsum_str, x, w).
     w = self.w.value
     if self.w_scale is not None:
       w = w * self.w_scale
@@ -374,6 +482,10 @@ class Einsum(nnx.Module):
 
 
 def find_last_one_index(attn_mask: jnp.ndarray) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # For attn_mask [B, 1, S] returns [B] with the index of the last true entry
+  # per row (0 for all-false rows); computed with argmax on the reversed rows
+  # then squeezing the query axis (errors if that axis is not 1).
   """Finds the index of the last (rightmost) '1' from attn_mask."""
   cache_len = attn_mask.shape[-1]
 
@@ -403,6 +515,11 @@ def create_sliding_window_mask(
     attn_mask: jnp.ndarray,  # [B, seq_len, cache_len] seq_len=1 for decoding
     sliding_window_size: int,
 ) -> jnp.ndarray:
+  # [FUNCTION DOC]
+  # HELPER: decode-time sliding window mask over cache slot indices (no ring
+  # buffer): [B, 1, S] true for slots in [last - window + 1, last] where last
+  # is find_last_one_index(attn_mask). Used when the sliding window cache is
+  # disabled.
   """Helper function to create sliding window mask for local attention."""
   upper_index = find_last_one_index(attn_mask)
 
@@ -422,6 +539,10 @@ def create_sliding_window_mask(
 
 
 class RMSNorm(nnx.Module):
+  # [CLASS DOC]
+  # RMSNorm computed in float32 with epsilon 1e-6 and a learned scale
+  # initialized to ones and applied directly (no "1 +" offset); output cast to
+  # the configured dtype.
   """RMSNorm layer."""
 
   def __init__(
@@ -433,6 +554,10 @@ class RMSNorm(nnx.Module):
       dtype: jnp.dtype,
       param_dtype: jnp.dtype,
   ):
+    # [FUNCTION DOC]
+    # Creates scale [dim] of ones in param_dtype, sharded with
+    # sharding.rms_norm_weight (sharding is a whole ShardingConfig), and stores
+    # dtype.
     self.scale = nnx.Param(
         nnx.initializers.ones_init()(rngs.params(), dim).astype(param_dtype),
         sharding=sharding.rms_norm_weight,
@@ -440,6 +565,9 @@ class RMSNorm(nnx.Module):
     self.dtype = dtype
 
   def __call__(self, x: jaxtyping.Array) -> jaxtyping.Array:
+    # [FUNCTION DOC]
+    # Casts x to float32, multiplies by rsqrt(mean(x^2) + 1e-6) and by scale
+    # (broadcast over leading dims), and casts to dtype.
     x = jnp.astype(x, jnp.float32)
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
     normed_inputs = x * jax.lax.rsqrt(var + 1e-06).astype(x.dtype)
@@ -456,6 +584,13 @@ def apply_rope(
     scale_factor: float = 1.0,
     rope_proportion: float = 1.0,
 ) -> jax.Array:
+  # [FUNCTION DOC]
+  # Applies half-split RoPE to inputs [B, L, N, H] at positions [B, L] with
+  # partial rotation: of the H/2 frequency pairs, the first
+  # int(rope_proportion * H / 2) use timescales base_frequency^(2i/H); the rest
+  # get infinite timescale (angle 0, i.e. left unrotated). Angles are divided
+  # by scale_factor. Raises ValueError if scale_factor < 1. Returns same shape
+  # and dtype as inputs.
   """Applies RoPE.
 
   Let B denote batch size, L denote sequence length, N denote number of heads,
@@ -507,6 +642,9 @@ K_MASK = -2.3819763e38
 
 
 class AttentionType(enum.Enum):
+  # [CLASS DOC]
+  # Enum of attention kinds: GLOBAL (=1) full causal attention, LOCAL_SLIDING
+  # (=2) windowed attention.
   GLOBAL = 1
   LOCAL_SLIDING = 2
 
@@ -528,6 +666,17 @@ def create_kv_cache_sharing_patterns(
     share_local: bool,
     attention_types: tuple[AttentionType, ...],
 ) -> list[int]:
+  # [FUNCTION DOC]
+  # Returns, for each layer i, the index of the layer whose K/V it uses.
+  # The first int(num_layers - frac_shared_layers * num_layers) layers use
+  # their own (index i). Each later layer maps to the last unshared layer
+  # (index num_unshared - 1) if GLOBAL and share_global, to the second-to-last
+  # unshared layer (num_unshared - 2) if LOCAL_SLIDING and share_local,
+  # otherwise to itself.
+  # KNOWN ISSUE: assumes the last unshared layer is GLOBAL and the one before
+  # it is LOCAL_SLIDING; other patterns would share K/V across mismatched
+  # attention types. The docstring wording ("for which KV cache is used") is
+  # vague.
   """Creates a list of layer indices for which KV cache is used."""
   kv_cache_sharing_patterns = []
   num_unshared_layers = int(num_layers - frac_shared_layers * num_layers)
@@ -545,6 +694,14 @@ def create_kv_cache_sharing_patterns(
 
 
 class Attention(nnx.Module):
+  # [CLASS DOC]
+  # Gemma 4 attention layer. Configured per attention type: RoPE base
+  # frequency, scale factor and rope proportion; for GLOBAL layers kv heads
+  # and head_dim may be overridden by num_global_kv_heads / global_key_size.
+  # Always separate q_einsum; keys/values come from k_einsum (k_eq_v: values
+  # equal keys) or kv_einsum. Supports KV caches (full or ring buffer for local
+  # layers), reading another layer's K/V (kv sharing), naive einsum attention
+  # (MHA/MQA/GQA) or TPU splash attention.
   """Attention module."""
 
   def __init__(
@@ -553,6 +710,13 @@ class Attention(nnx.Module):
       attn_type: AttentionType,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Computes rope_proportion, rope_base_frequency and rope_scale_factor from
+    # config and attn_type; sets num_kv_heads and head_dim (global overrides when
+    # GLOBAL; global_key_size is always non-None by default, so global layers use
+    # 512 unless overridden). Creates attn_vec_einsum [N, H, D], q_einsum
+    # [N, D, H], then either k_einsum [K, D, H] (when k_eq_v_global and GLOBAL;
+    # sharded like q weights) or kv_einsum [2, K, D, H], and the QK RMSNorms.
     self.config = config
     self.rope_proportion = (
         config.global_rope_proportion
@@ -655,6 +819,37 @@ class Attention(nnx.Module):
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
+    # [FUNCTION DOC]
+    # Attention computation.
+    # Inputs: x [B, T, D]; segment_pos [B, T]; cache (LayerCache or None);
+    # attn_mask bool [B, T, S]; kv_shared_cache (dict with 'k', 'v' and, during
+    # decode, 'end_index') to reuse another layer's K/V instead of computing them.
+    # Steps: q = RoPE(QKnorm(q_einsum(x))). If kv_shared_cache is given (cache
+    # must be None, asserted), take k/v from it; else compute k (and v = k for
+    # k_eq_v, else from kv_einsum), shard, RMS-normalize v without scale,
+    # normalize k with _key_norm and apply RoPE.
+    # Cache update when cache is given: prefill (T > 1) writes the last
+    # min(T, cache_len) k/v into slots (position modulo cache_len) for the ring
+    # cache, or into slots [0, T) otherwise, keeps attention over the fresh
+    # k/v, and sets end_index += T; decode (T == 1) writes at end_index[0] modulo
+    # cache_len and attends over the whole cache. Without a cache, new_cache holds
+    # only the fresh 'k' and 'v'.
+    # Attention: if use_flash_attention and T > 1, runs a splash attention kernel
+    # (LocalMask with window (W-1, 0) or CausalMask over T x T, one per head)
+    # under shard_map using act_btnh mesh axes. Otherwise computes logits (grouped
+    # for GQA), truncates the mask to the first T keys during prefill, and for
+    # LOCAL_SLIDING layers: in decode with the ring cache, remaps mask columns
+    # from logical positions to physical ring slots (using end_index, minus 1
+    # when reading a shared cache already advanced by its origin layer) and
+    # masks never-written slots; in decode without ring cache uses
+    # create_sliding_window_mask; in prefill applies a |i - j| < W band mask.
+    # Then masks with K_MASK, softmax in float32, aggregates values, projects
+    # with attn_vec_einsum and applies act_btd sharding.
+    # Output: (new_cache, attn_output [B, T, D], (keys, values) used).
+    # KNOWN ISSUE: prefill always writes the non-ring cache from slot 0 and
+    # attends only to the fresh tokens (no chunked prefill); the splash path
+    # ignores attn_mask (padding is not masked); decode uses end_index[0] for
+    # the whole batch.
     x = x.astype(self.config.dtype)
     seq_len = x.shape[1]
     query_proj = self.q_einsum(x)
@@ -801,6 +996,9 @@ class Attention(nnx.Module):
           check_rep=False,
       )
       def sharded_splash_attn(kernel, q_block, k_block, v_block):
+        # [FUNCTION DOC]
+        # HELPER: per-shard body for shard_map; vmaps the splash kernel over the
+        # batch of q/k/v blocks ([B, N, T, H]) and returns the attention output.
         return jax.vmap(kernel)(q_block, k_block, v_block)
 
       qkv: jaxtyping.Array = sharded_splash_attn(
@@ -890,9 +1088,15 @@ class Attention(nnx.Module):
 
   @property
   def use_gqa(self):
+    # [FUNCTION DOC]
+    # Property: True when this layer's kv head count differs from num_heads and
+    # is greater than 1 (grouped-query attention).
     return self.num_kv_heads != self.config.num_heads and self.num_kv_heads > 1
 
   def __call__(self, x, segment_pos, cache, attn_mask, kv_shared_cache=None):
+    # [FUNCTION DOC]
+    # Calls block, wrapped in nnx.remat (graph_updates=False) when the config's
+    # remat_config is BLOCK (enum or value). Returns block's 3-tuple.
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
         remat_config == RematConfig.BLOCK
@@ -910,6 +1114,12 @@ class Attention(nnx.Module):
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
+    # [FUNCTION DOC]
+    # Creates this layer's zero cache: cache_len = max_seq_len, or
+    # min(max_seq_len, sliding_window_size) for LOCAL_SLIDING layers when the
+    # ring cache is enabled. 'k' and 'v' are [batch, cache_len, K, H] numpy
+    # zeros of dtype eagerly placed with act_btnh sharding; 'end_index' int32
+    # zeros [batch] sharded on the batch axis. Returns the dict.
     cache_len = max_seq_len
     if (
         self.config.use_sliding_window_kv_cache
@@ -938,6 +1148,9 @@ class Attention(nnx.Module):
 
 
 class FeedForward(nnx.Module):
+  # [CLASS DOC]
+  # Gated GELU MLP (gate_proj, up_proj, down_proj; bias-free, zero init),
+  # with optional hidden width override.
   """Feed forward module."""
 
   def __init__(
@@ -947,6 +1160,9 @@ class FeedForward(nnx.Module):
       hidden_dim: int | None = None,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates the three nnx.Linear layers with width hidden_dim (or
+    # config.hidden_dim if None), compute dtype config.dtype and param_dtype.
     self.config = config
     h_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
     self.gate_proj = nnx.Linear(
@@ -987,9 +1203,13 @@ class FeedForward(nnx.Module):
     )
 
   def block(self, x):
+    # [FUNCTION DOC]
+    # Returns down_proj(gelu(gate_proj(x)) * up_proj(x)).
     return self.down_proj(nnx.gelu(self.gate_proj(x)) * self.up_proj(x))
 
   def __call__(self, x):
+    # [FUNCTION DOC]
+    # Calls block, wrapped in nnx.remat when remat_config is BLOCK.
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
         remat_config == RematConfig.BLOCK
@@ -1001,6 +1221,12 @@ class FeedForward(nnx.Module):
 
 
 class DecoderLayer(nnx.Module):
+  # [CLASS DOC]
+  # Gemma 4 decoder layer: pre-norm attention with post-norm and residual;
+  # dense MLP (plus, if MoE is enabled, a parallel MoE branch with its own
+  # pre/post norms, summed with the post-normed dense output) followed by
+  # post_ffw_norm and residual; optional per-layer-input gated update; final
+  # multiplication by the learned scalar skip_scale.
   """Decoder layer."""
 
   def __init__(
@@ -1011,6 +1237,13 @@ class DecoderLayer(nnx.Module):
       hidden_dim: int | None = None,
       rngs: nnx.Rngs,
   ):
+    # [FUNCTION DOC]
+    # Creates pre_attention_norm, attn, post_attention_norm, pre_ffw_norm, mlp
+    # (width hidden_dim or config default), MoE modules when enable_moe
+    # (moe_pre_ffw_norm, moe, moe_post_ffw_norm, dense_post_ffw_norm),
+    # post_ffw_norm, PLE modules when per_layer_input_dim > 0
+    # (per_layer_input_gate [D, P], per_layer_projection [P, D],
+    # post_per_layer_input_norm), and skip_scale (ones [1]).
 
     self.config = config
     self.pre_attention_norm = RMSNorm(
@@ -1115,6 +1348,15 @@ class DecoderLayer(nnx.Module):
       per_layer_input=None,
       kv_shared_cache=None,
   ):
+    # [FUNCTION DOC]
+    # Inputs: x [B, T, D], segment_pos, cache, attn_mask, per_layer_input
+    # [B, T, P] or None, kv_shared_cache.
+    # h = post_attention_norm(attn(pre_attention_norm(x))) + x.
+    # f = mlp(pre_ffw_norm(h)); with MoE f = dense_post_ffw_norm(f) +
+    # moe_post_ffw_norm(moe(moe_pre_ffw_norm(h))). out = post_ffw_norm(f) + h.
+    # With PLE: out += post_per_layer_input_norm(per_layer_projection(
+    # gelu(per_layer_input_gate(out)) * per_layer_input)). out *= skip_scale.
+    # Returns (cache, out, (k, v)).
     norm = self.pre_attention_norm(x)
     cache, attn, kv = self.attn(
         norm, segment_pos, cache, attn_mask, kv_shared_cache=kv_shared_cache
@@ -1154,6 +1396,8 @@ class DecoderLayer(nnx.Module):
       per_layer_input=None,
       kv_shared_cache=None,
   ):
+    # [FUNCTION DOC]
+    # Calls block, wrapped in nnx.remat when remat_config is DECODER.
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
         remat_config == RematConfig.DECODER
@@ -1174,13 +1418,25 @@ class DecoderLayer(nnx.Module):
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
+    # [FUNCTION DOC]
+    # Delegates to attn.init_cache.
     return self.attn.init_cache(batch_size, max_seq_len, dtype)
 
 
 class Gemma4(BackendMappingMixin, nnx.Module):
+  # [CLASS DOC]
+  # Full Gemma 4 model: Embedder, DecoderLayers following the attention
+  # pattern, KV sharing map, final RMSNorm, tied unembedding and logit
+  # soft-capping. Mixes in BackendMappingMixin.
   """Gemma4 model."""
 
   def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+    # [FUNCTION DOC]
+    # Builds the embedder; derives per-layer attention types by cycling the
+    # configured (or default) pattern; computes kv_cache_sharing_patterns
+    # (sharing both global and local) and shared_layer_origins (set of layers
+    # whose K/V are reused); creates each DecoderLayer (shared layers use
+    # override_kv_shared_ffw_hidden when set) and the final norm.
     self.config = config
     self.embedder = Embedder(config, rngs=rngs)
 
@@ -1239,6 +1495,21 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       decode_only_last_token=False,
       segment_ids=None,
   ):
+    # [FUNCTION DOC]
+    # Forward pass. Inputs: tokens [B, T]; positions (default 0..T-1 per row);
+    # cache (Cache or None); attention_mask [B, T, S]; decode_only_last_token
+    # (only compute logits for the last position); segment_ids (ignored).
+    # Embeds tokens and computes per-layer inputs if enabled. For each layer:
+    # shared layers get no own cache and read K/V from their origin layer
+    # (fresh projections recorded during this prefill, or the origin's updated
+    # cache during decode); other layers use cache['layer_<i>']. Records origin
+    # layers' K/V during prefill and stores non-shared layers' new caches.
+    # Applies final norm, optional last-token slicing, unembedding in float32
+    # and soft-capping tanh(logits/cap)*cap.
+    # Output: (logits [B, T or 1, vocab] float32, new cache or None when no
+    # cache was passed).
+    # KNOWN ISSUE: prefill is detected as T > 1, so a single-token prompt is
+    # treated as decode (shared layers then read from new_cache).
     # Accepted for RL pipeline compatibility; unused until seq packing lands.
     del segment_ids
     if positions is None:
@@ -1308,6 +1579,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     return logits, (None if cache is None else new_cache)
 
   def init_cache(self, batch_size, max_seq_len, dtype):
+    # [FUNCTION DOC]
+    # Returns a dict of per-layer caches for non-shared layers only
+    # ('layer_<i>' -> layer.init_cache(batch_size, max_seq_len, dtype)).
     cache = {}
     for i, layer in enumerate(self.layers):
       if self.kv_cache_sharing_patterns[i] != i:
@@ -1316,6 +1590,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     return cache
 
   def get_model_input(self):
+    # [FUNCTION DOC]
+    # Returns dummy inputs: tokens and positions int32 ones [2, 2], cache None,
+    # attention_mask bool ones [2, 1, 2] (broadcast over queries).
     """Returns a dummy model input for the transformer.
 
     This dummy input has a batch size compatible with FSDP sharding on a
@@ -1338,4 +1615,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
   @property
   def num_embed(self) -> int:
+    # [FUNCTION DOC]
+    # Property: vocabulary size from config.
     return self.config.num_embed

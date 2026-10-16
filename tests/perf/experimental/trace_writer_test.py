@@ -13,6 +13,20 @@
 # limitations under the License.
 
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.experimental.trace_writer (perf v2 Perfetto
+# export): _create_span_name renders 'name (k=v, ...)' with a span-type
+# specific whitelist/order of tags (step always first; role for peft_train;
+# group_id and pair_index for rollout/environment; name for queue; other
+# tags dropped); PerfettoTraceWriter.write_timelines emits one track
+# descriptor per timeline (plus child lane tracks when spans overlap, lanes
+# reused greedily with END sorted before BEGIN at equal timestamps), groups
+# tracks under 'Host - Main threads' (uuid 100000), 'Host - Rollout threads'
+# (100001) and per-device-set cluster groups named from role_to_devices
+# (queue timelines share their device's group), timestamps in nanoseconds
+# relative to the timeline's born time, and writes 'perfetto_trace_v2_*.pb'
+# only when there is content; an invalid trace dir logs one ERROR and writes
+# are skipped. NoopTraceWriter ignores writes.
 import os
 import tempfile
 from unittest import mock
@@ -29,6 +43,8 @@ from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import TrackEvent
 
 
 class PerfettoTraceWriterTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for PerfettoTraceWriter and span naming.
 
   @parameterized.named_parameters(
       (
@@ -95,16 +111,27 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
       ),
   )
   def test_create_span_name(self, name, tags, expected):
+    # [FUNCTION DOC]
+    # Verifies _create_span_name output for the tag combinations listed in the
+    # parameters. Inputs: span name, tags dict, expected string.
     actual_name = trace_writer_lib._create_span_name(name, tags)
     self.assertEqual(actual_name, expected)
 
   @mock.patch.object(trace_writer_lib, "TraceProtoBuilder", autospec=True)
   def test_write_timelines_content(self, mock_builder_cls):
+    # [FUNCTION DOC]
+    # Verifies a single committed span produces 3 packets: timeline descriptor,
+    # SLICE_BEGIN at 1e9 ns named 'span_test (step=42)' (mini_batch tag omitted)
+    # and SLICE_END at 2e9 ns on that track; serialize called once.
+    # Input: patched TraceProtoBuilder class.
     mock_builder = mock_builder_cls.return_value
     mock_builder.serialize.return_value = b""
     captured_packets = []
 
     def add_packet_side_effect():
+      # [FUNCTION DOC]
+      # HELPER: add_packet side effect returning and recording an autospec'd
+      # TracePacket with autospec'd descriptor and event.
       p = mock.create_autospec(TracePacket, instance=True)
       p.track_descriptor = mock.create_autospec(TrackDescriptor, instance=True)
       p.track_event = mock.create_autospec(TrackEvent, instance=True)
@@ -167,11 +194,20 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
 
   @mock.patch.object(trace_writer_lib, "TraceProtoBuilder", autospec=True)
   def test_write_timelines_overlapping_spans(self, mock_builder_cls):
+    # [FUNCTION DOC]
+    # Verifies overlapping spans are placed on two lane tracks under the main
+    # track (9 packets): span_1 on lane 0, span_2 on lane 1, and span_3 (starting
+    # exactly when span_2 ends) reuses lane 0 with span_2's END ordered before
+    # span_3's BEGIN.
+    # KNOWN ISSUE: the explanatory comment lists span_3 on Lane 1 while the
+    # assertion expects lane 0.
     mock_builder = mock_builder_cls.return_value
     mock_builder.serialize.return_value = b""
     captured_packets = []
 
     def add_packet_side_effect():
+      # [FUNCTION DOC]
+      # HELPER: add_packet side effect as above.
       p = mock.create_autospec(TracePacket, instance=True)
       p.track_descriptor = mock.create_autospec(TrackDescriptor, instance=True)
       p.track_event = mock.create_autospec(TrackEvent, instance=True)
@@ -292,11 +328,18 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
 
   @mock.patch.object(trace_writer_lib, "TraceProtoBuilder", autospec=True)
   def test_write_timelines_grouping(self, mock_builder_cls):
+    # [FUNCTION DOC]
+    # Verifies track grouping: host main/rollout thread groups with fixed uuids,
+    # 'Actor, Rollout Cluster' for tpu0 and 'Actor Cluster' for tpu1 derived
+    # from role_to_devices, and each timeline (including tpu0_queue) parented to
+    # the right group.
     mock_builder = mock_builder_cls.return_value
     mock_builder.serialize.return_value = b""
     captured_packets = []
 
     def add_packet_side_effect():
+      # [FUNCTION DOC]
+      # HELPER: add_packet side effect as above.
       p = mock.create_autospec(TracePacket, instance=True)
       p.track_descriptor = mock.create_autospec(TrackDescriptor, instance=True)
       p.track_event = mock.create_autospec(TrackEvent, instance=True)
@@ -390,6 +433,9 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
       self.assertEqual(tpu1.parent_uuid, tpu1_group.uuid)
 
   def test_perfetto_trace_writer_integration(self):
+    # [FUNCTION DOC]
+    # Verifies end-to-end writing with a real builder creates exactly one
+    # non-empty 'perfetto_trace_v2_*.pb' file.
     with tempfile.TemporaryDirectory() as tmp_dir:
       writer = trace_writer_lib.PerfettoTraceWriter(trace_dir=tmp_dir)
 
@@ -433,6 +479,9 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
           )
 
   def test_perfetto_trace_writer_invalid_dir(self):
+    # [FUNCTION DOC]
+    # Verifies a file path used as trace_dir logs one ERROR 'Failed to
+    # initialize perfetto trace writer' and later writes do not raise.
     # Use a file path as directory to cause failure
     with tempfile.NamedTemporaryFile() as tmp_file:
       # Expect initialization to fail gracefully (log error, no crash)
@@ -447,6 +496,8 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
     self.assertIn("Failed to initialize perfetto trace writer", cm.output[0])
 
   def test_perfetto_trace_writer_empty_timelines(self):
+    # [FUNCTION DOC]
+    # Verifies writing no timelines creates no file.
     with tempfile.TemporaryDirectory() as tmp_dir:
       writer = trace_writer_lib.PerfettoTraceWriter(trace_dir=tmp_dir)
       writer.write_timelines({})
@@ -455,6 +506,8 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
       self.assertEmpty(files)
 
   def test_perfetto_trace_writer_timeline_with_empty_committed_steps(self):
+    # [FUNCTION DOC]
+    # Verifies a timeline with no committed steps creates no file.
     with tempfile.TemporaryDirectory() as tmp_dir:
       writer = trace_writer_lib.PerfettoTraceWriter(trace_dir=tmp_dir)
       t = tracer.Timeline("timeline_test", 1000.0)
@@ -464,8 +517,12 @@ class PerfettoTraceWriterTest(parameterized.TestCase):
 
 
 class NoopTraceWriterTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Test case for NoopTraceWriter.
 
   def test_noop_trace_writer_write_timelines(self):
+    # [FUNCTION DOC]
+    # Verifies NoopTraceWriter.write_timelines accepts timelines without error.
     writer = trace_writer_lib.NoopTraceWriter()
     t = tracer.Timeline("timeline", 1000.0)
     t.start_span("span1", 1001.0)

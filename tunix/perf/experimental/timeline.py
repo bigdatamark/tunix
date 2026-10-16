@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Experimental (perf v2) span/timeline data model. A Span is a dataclass with
+# id, optional parent id, name, begin/end times and tags. A Timeline is a
+# thread-safe (reentrant lock) per-thread or per-device record of spans keyed
+# by integer span id, grouped into "steps": spans accumulate in the current
+# step and commit_step archives it. Synchronous spans nest via a stack of open
+# span ids. AsyncTimeline records leaf spans whose end is when JAX values
+# become ready (background waiter threads). BatchAsyncTimelines fans one async
+# span out to several timelines. Times are perf_counter seconds.
 """Span based data model."""
 
 from __future__ import annotations
@@ -30,6 +39,13 @@ import jaxtyping
 
 @dataclasses.dataclass
 class Span:
+  # [CLASS DOC]
+  # Dataclass fields: name; begin; end (not an init argument, defaults to
+  # +infinity meaning not ended); id (int, unique per timeline); parent_id
+  # (optional enclosing span id); tags (mapping copied into a new dict, None
+  # becomes an empty dict).
+  # KNOWN ISSUE: the docstring cites constants.GLOBAL_STEP, which does not
+  # exist; the step tag constant is constants.STEP.
   """A duration of time with a name, beginning, and end.
 
   Attributes:
@@ -52,9 +68,14 @@ class Span:
   tags: Mapping[str, Any] | None = None
 
   def __post_init__(self) -> None:
+    # [FUNCTION DOC]
+    # Copies tags into a fresh dict (or creates an empty dict when None).
     self.tags = dict(self.tags) if self.tags is not None else {}
 
   def add_tag(self, key: str, value: Any) -> None:
+    # [FUNCTION DOC]
+    # Sets tags[key] = value; logs a warning first if the key already exists
+    # (it is overwritten).
     """Adds a tag to the span.
 
     Args:
@@ -74,6 +95,10 @@ class Span:
     self.tags[key] = value
 
   def _format_relative(self, born_at: float) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "[id] name: begin, end" with times relative to born_at
+    # (6 decimals), plus " (parent=<id>)" when a parent exists and
+    # ", tags=<dict>" when tags are non-empty.
     """Returns a string representation of the span with relative times.
 
     The times are relative to `born_at`.
@@ -89,11 +114,15 @@ class Span:
 
   @property
   def ended(self) -> bool:
+    # [FUNCTION DOC]
+    # Property: True if end is not +infinity.
     """Whether the span has ended."""
     return self.end != float("inf")
 
   @property
   def duration(self) -> float:
+    # [FUNCTION DOC]
+    # Property: end minus begin.
     """The duration of the span."""
     return self.end - self.begin
 
@@ -104,6 +133,11 @@ def _async_wait(
     success: Callable[[], None],
     failure: Callable[[Exception], None],
 ) -> threading.Thread:
+  # [FUNCTION DOC]
+  # HELPER: Starts a thread that blocks until waitlist is ready and resolves a
+  # Future; the Future's done callback runs success() on success or
+  # failure(exception) on error (on the waiter thread). Returns the started
+  # thread.
   """Asynchronously waits for all JAX computations to finish.
 
   Args:
@@ -118,6 +152,8 @@ def _async_wait(
   fut = futures.Future()
 
   def callback(f: futures.Future[Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Done callback dispatching to success or failure.
     e = f.exception()
     if e is None:
       success()
@@ -127,6 +163,8 @@ def _async_wait(
   fut.add_done_callback(callback)
 
   def wait() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Thread body: block until ready, then set result or exception.
     try:
       jax.block_until_ready(waitlist)
     except Exception as e:  # pylint: disable=broad-exception-caught
@@ -140,6 +178,12 @@ def _async_wait(
 
 
 class Timeline:
+  # [CLASS DOC]
+  # Thread-safe span recorder. State: id, born, stack of open synchronous span
+  # ids, current step dict (span id -> Span), last assigned span id (starts
+  # at -1, increasing across steps), list of committed step dicts (replaced,
+  # never mutated, on commit so readers may use it without the lock), and a
+  # reentrant lock.
   """A thread-safe data structure for recording spans of execution time.
 
   A timeline represents a chronological sequence of spans or events. It supports
@@ -165,6 +209,8 @@ class Timeline:
   """
 
   def __init__(self, id: str, born: float):
+    # [FUNCTION DOC]
+    # Initializes id, born and empty state as described for the class.
     """Initializes the Timeline instance.
 
     Args:
@@ -182,17 +228,25 @@ class Timeline:
 
   @property
   def committed_steps(self) -> list[dict[int, Span]]:
+    # [FUNCTION DOC]
+    # Property: the committed steps list (returned without locking or
+    # copying).
     """The immutable chunks of committed steps lock-free."""
     return self._committed_steps
 
   @property
   def cur_step(self) -> dict[int, Span]:
+    # [FUNCTION DOC]
+    # Property: shallow copy of the current step dict, taken under the lock.
     """A copy of the active current step spans."""
     with self._lock:
       return dict(self._cur_step)
 
   @property
   def all_steps(self) -> list[dict[int, Span]]:
+    # [FUNCTION DOC]
+    # Property: new list of committed steps followed by a copy of the current
+    # step (under the lock).
     """A list of all step dictionaries (history and current)."""
     with self._lock:
       return self._committed_steps + [dict(self._cur_step)]
@@ -200,6 +254,10 @@ class Timeline:
   def start_span(
       self, name: str, begin: float, tags: Mapping[str, Any] | None = None
   ) -> Span:
+    # [FUNCTION DOC]
+    # Under the lock: assigns the next span id, sets parent to the top of the
+    # open-span stack (or None), creates the Span with given name/begin/tags,
+    # stores it in the current step and pushes its id. Returns the Span.
     """Starts a new span and pushes it to active spans.
 
     Args:
@@ -222,6 +280,10 @@ class Timeline:
     return _span
 
   def stop_span(self, end: float) -> None:
+    # [FUNCTION DOC]
+    # Under the lock: pops the innermost open span and sets its end.
+    # ValueError if no span is open, or if end is before its begin (the span
+    # is still popped and remains unended in that case).
     """Ends the current span on the stack.
 
     Args:
@@ -244,6 +306,11 @@ class Timeline:
       _span.end = end
 
   def commit_step(self) -> None:
+    # [FUNCTION DOC]
+    # Under the lock: removes from the current step every span that is unended
+    # or still on the open stack (warning per span), clears the stack, appends
+    # the current step dict to a new committed list, and starts an empty
+    # current step.
     """Commits current step spans to history, purging any uncompleted/dangling spans."""
     with self._lock:
       to_remove = []
@@ -267,6 +334,11 @@ class Timeline:
       self._cur_step = {}
 
   def __repr__(self) -> str:
+    # [FUNCTION DOC]
+    # Multi-line text: header "Timeline(id, born)", then the current step (if
+    # non-empty) labelled with the committed count, then committed steps from
+    # newest to oldest (empty ones skipped), each span on its own line in id
+    # order with relative times.
     parts = [f"Timeline({self.id}, {self.born:.6f})\n"]
     with self._lock:
       if self._cur_step:
@@ -282,9 +354,14 @@ class Timeline:
 
 
 class AsyncTimeline(Timeline):
+  # [CLASS DOC]
+  # Timeline whose spans are leaves ended asynchronously by waiter threads.
+  # Tracks live waiter threads for joining.
   """A timeline with asynchronously closing spans."""
 
   def __init__(self, id: str, born: float):
+    # [FUNCTION DOC]
+    # Base initialization plus an empty waiter-thread list.
     """Initializes the AsyncTimeline instance.
 
     Args:
@@ -302,6 +379,16 @@ class AsyncTimeline(Timeline):
       waitlist: jaxtyping.PyTree,
       tags: Mapping[str, Any] | None = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Records an async span. Under the lock, reserves the next span id and
+    # captures the current open span (if any) as parent; the span is never
+    # pushed on the stack. On success (immediately if waitlist is empty or
+    # falsy, else on a waiter thread once the waitlist is ready) a Span with
+    # begin = thread_span_begin, end = completion time and the tags is stored
+    # in the current step under the lock. On failure the error is logged and no
+    # span is stored. Waiter threads are tracked (finished ones pruned).
+    # KNOWN ISSUE: a span completing after a commit lands in the next step,
+    # with a parent id belonging to the previous step.
     """Records a new span for a timeline.
 
     Args:
@@ -324,6 +411,8 @@ class AsyncTimeline(Timeline):
       span_id = self._last_span_id
 
     def on_success() -> None:
+      # [FUNCTION DOC]
+      # HELPER: Takes the end time first, then stores the completed span.
       # Capture time immediately to avoid including lock contention in the span.
       end = time.perf_counter()
 
@@ -345,6 +434,8 @@ class AsyncTimeline(Timeline):
         self._cur_step[span_id] = _span
 
     def on_failure(e: Exception) -> None:
+      # [FUNCTION DOC]
+      # HELPER: Logs the failure with traceback; swallows it.
       # TODO(noghabi):Capture the span even if it fails, but add a tag that it
       # failed and process accordingly.
       # Metrics are best effort and should not raise exceptions.
@@ -361,6 +452,9 @@ class AsyncTimeline(Timeline):
         self._threads.append(t)
 
   def wait_pending_spans(self) -> None:
+    # [FUNCTION DOC]
+    # Under the lock takes and clears the waiter list, then joins each thread
+    # outside the lock.
     """Waits for all current pending spans to finish."""
     with self._lock:
       cur_threads = list(self._threads)
@@ -370,9 +464,14 @@ class AsyncTimeline(Timeline):
 
 
 class BatchAsyncTimelines:
+  # [CLASS DOC]
+  # Fan-out helper applying one async span to several AsyncTimelines (each
+  # starts its own waiter thread on the same waitlist).
   """A helper class to record spans across multiple AsyncTimeline instances."""
 
   def __init__(self, timelines: list[AsyncTimeline]):
+    # [FUNCTION DOC]
+    # Stores the list of timelines.
     """Initializes the BatchAsyncTimelines instance.
 
     Args:
@@ -387,6 +486,9 @@ class BatchAsyncTimelines:
       waitlist: jaxtyping.PyTree,
       tags: Mapping[str, Any] | None = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Calls span(name, thread_span_begin, waitlist, tags=tags) on each
+    # timeline.
     """Records a new span across multiple timelines.
 
     Args:

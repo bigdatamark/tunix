@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for TrajectoryCollectEngine, which drives an agent/environment
+# loop: reset env, then repeatedly call the model on the agent's chat
+# history, update the agent from the model response, step the env, and
+# update the agent from the observation, until done, max_steps, timeout or
+# context limit. It then adds the env's final reward to the last step,
+# computes discounted Monte Carlo returns (gamma), closes the env and
+# returns the result in one of three modes: "Trajectory" (Trajectory
+# object with steps, reward, status, timing dicts), "Conversation" (list of
+# chat messages) or "Token" (dict of prompt/conversation tokens, masks,
+# old logprobs, reward, timings, status and metadata; requires both a
+# tokenizer and a chat parser). Also covers perf tracing tags/spans,
+# collect_multiple over several (agent, env) pairs, and the overlong
+# filter that zeroes masks and skips the final reward when max steps is
+# reached. Agents and envs are autospec mocks with stateful side effects.
+# Side effects: patches time.perf_counter and utils.tokenize_and_generate_
+# masks in some tests.
+
 import asyncio
 import time
 from unittest import mock
@@ -32,14 +50,32 @@ RolloutOutput = base_rollout.RolloutOutput
 
 
 class TrajectoryCollectEngineTest(absltest.TestCase):
+  # [CLASS DOC]
+  # Tests for TrajectoryCollectEngine modes, termination statuses, timing,
+  # tokenization and perf tagging.
 
   class _TestEnv(base_environment.BaseTaskEnv):
+    # [CLASS DOC]
+    # HELPER: BaseTaskEnv subclass declaring reward_fn and final_reward_fn
+    # class attributes so autospec mocks expose them.
     """Dummy class to expose reward_fn to autospec."""
 
     reward_fn = None
     final_reward_fn = None
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: builds the default fixture. A mock agent whose
+    # update_from_model appends a new Step (with the response and a dummy
+    # action) to a shared Trajectory and an assistant message to the chat
+    # history; update_from_env fills observation/reward/done/info on the
+    # current step and appends a user message; reset clears both;
+    # get_current_step returns the current step. A mock env with
+    # max_steps 10, final reward 0.5, reset returning "initial_obs", two
+    # steps (obs1 reward 1.0 not done, obs2 reward 2.0 done), a task dict
+    # and empty extra_kwargs. A mock model call returning five successive
+    # RolloutOutputs (response1..5 with two tokens each, logprobs of ones),
+    # a mock tokenizer and a mock chat parser.
     super().setUp()
     self.mock_agent = mock.create_autospec(
         base_agent.ConversationAgentBase, instance=True
@@ -64,6 +100,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.current_step = None
 
     def _update_from_model(resp):
+      # [FUNCTION DOC]
+      # HELPER: creates and records a new Step for resp; returns it.
       self.current_step = agent_types.Step(
           model_response=resp, action=agent_types.Action(action=['action'])
       )
@@ -72,6 +110,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
       return self.current_step
 
     def _update_from_env(observation, reward, done, info):
+      # [FUNCTION DOC]
+      # HELPER: writes env feedback onto the current step if any and
+      # appends the observation as a user message.
       if self.current_step:
         self.current_step.observation = observation
         self.current_step.reward = reward
@@ -80,6 +121,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
       self._chat_history.append({'role': 'user', 'content': observation})
 
     def _reset_agent():
+      # [FUNCTION DOC]
+      # HELPER: clears steps and chat history and the current step.
       self.trajectory.steps.clear()
       self._chat_history.clear()  # Clear the local list
       self.current_step = None
@@ -100,6 +143,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.trajectory.task = self.mock_env.task
 
     def _mock_rollout_output(text, tokens):
+      # [FUNCTION DOC]
+      # HELPER: wraps text and tokens into a single-sample RolloutOutput
+      # with zero logits, prompt token 101 and logprobs of ones.
       return RolloutOutput(
           text=[text],
           logits=[jnp.zeros_like(tokens)],
@@ -118,9 +164,14 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     ]
 
   async def _run_collect(self, engine, mode='Trajectory'):
+    # [FUNCTION DOC]
+    # HELPER: awaits engine.collect with the given mode and returns it.
     return await engine.collect(mode=mode)
 
   def test_get_perf_tags(self):
+    # [FUNCTION DOC]
+    # Verifies perf tags map env extra_kwargs group_id and pair_index and
+    # task policy_version to the GROUP_ID, PAIR_INDEX and STEP constants.
     self.mock_env.extra_kwargs = {
         'group_id': 'test_group',
         'pair_index': 42,
@@ -142,6 +193,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertEqual(tags, expected_tags)
 
   def test_get_perf_tags_missing_attributes(self):
+    # [FUNCTION DOC]
+    # Verifies perf tags are an empty dict when the env lacks extra_kwargs
+    # and task attributes.
     del self.mock_env.extra_kwargs
     del self.mock_env.task
     engine = trajectory_collect_engine.TrajectoryCollectEngine(
@@ -153,6 +207,10 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertEqual(tags, {})
 
   def test_perf_v2_and_noop_used_by_default(self):
+    # [FUNCTION DOC]
+    # Verifies the default perf_v2 tracer is a NoopTracer and that a
+    # one-step collection opens exactly one ENVIRONMENT span tagged with
+    # the group id (span patched to yield an AsyncWaitlist).
     self.mock_env.max_steps = 1
     self.mock_env.step.return_value = ('obs1', 1.0, True, {})
     self.mock_env.extra_kwargs = {'group_id': 'test_group'}
@@ -174,6 +232,14 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
       )
 
   def test_collect_trajectory_mode(self):
+    # [FUNCTION DOC]
+    # Verifies Trajectory mode with gamma 0.9 runs two steps (one reset,
+    # two env steps, two model calls), calls final_reward_fn once and
+    # closes the env; the final reward 0.5 is added to the last step (1.0,
+    # 2.5); MC returns are 3.25 and 2.5; total reward 3.5; and env_time and
+    # reward_time dicts contain non-negative latencies.
+    # KNOWN ISSUE: sets env.reward_fn's return value, which the engine does
+    # not use in this flow.
     self.mock_env.max_steps = 5
     self.mock_env.reward_fn.return_value = 0.5
     engine = trajectory_collect_engine.TrajectoryCollectEngine(
@@ -212,6 +278,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertAlmostEqual(result_traj.reward, 3.5)  # 1.0 + 2.5
 
   def test_collect_with_list_logprobs(self):
+    # [FUNCTION DOC]
+    # Verifies the engine accepts logprobs given as a plain Python list
+    # (no size attribute) and stores them on the step (length 2).
     # Test that it works with logprobs as a list (which doesn't have .size)
     self.mock_env.max_steps = 1
     self.mock_env.step.side_effect = [
@@ -219,6 +288,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     ]
 
     def _mock_rollout_output_list_logprobs(text, tokens):
+      # [FUNCTION DOC]
+      # HELPER: RolloutOutput whose logprobs are a list of 0.1 values.
       return RolloutOutput(
           text=[text],
           logits=[jnp.zeros_like(tokens)],
@@ -245,6 +316,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertEqual(len(result_traj.steps[0].logprobs), 2)
 
   def test_collect_conversation_mode(self):
+    # [FUNCTION DOC]
+    # Verifies Conversation mode returns the alternating user/assistant
+    # messages: initial observation, response1, obs1, response2, obs2.
     engine = trajectory_collect_engine.TrajectoryCollectEngine(
         agent=self.mock_agent,
         env=self.mock_env,
@@ -264,6 +338,21 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_collect_with_tokenization(self, mock_convert):
+    # [FUNCTION DOC]
+    # With tokenize_and_generate_masks patched, verifies Token mode output:
+    # conversation text; prompt tokens from the first tokenization;
+    # conversation tokens interleaving model tokens with non-terminal env
+    # tokens (the terminal observation is not tokenized); masks; total
+    # reward 3.5 including the final reward; non-negative timings; old
+    # logprobs from the model with zeros for env tokens; metadata
+    # (policy_version None, original_input the task, group_id None) and
+    # status "SUCCEEDED". Also verifies the parser is passed to every
+    # tokenization call, the initial prompt call sets contains_first_msg
+    # and contains_generation_msg, and the env observation call sets
+    # contains_generation_msg; exactly 2 calls occur.
+    # KNOWN ISSUE: the mock provides a third tokenization result that is
+    # never consumed, and env tokens are given mask 1 by the mock, so the
+    # test does not check that env tokens are masked out.
     mock_convert.side_effect = [
         ([101], [1]),  # prompt tokens
         ([301, 302], [1, 1]),  # env tokens 1
@@ -349,6 +438,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_collect_token_mode_empty_steps(self, mock_convert):
+    # [FUNCTION DOC]
+    # Verifies with max_steps 0 no steps are taken and Token mode returns
+    # empty int32 conversation tokens and masks and None old logprobs.
     mock_convert.side_effect = [
         ([101], [1]),  # prompt tokens
     ]
@@ -375,6 +467,10 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
   def test_collect_with_incomplete_tokenizer_config_skips_tokenization(
       self, mock_tokenize
   ):
+    # [FUNCTION DOC]
+    # Verifies tokenization is skipped entirely when either the tokenizer
+    # or the chat parser is missing (two scenarios; fixtures are rebuilt
+    # by calling setUp again between them).
     # Scenario 1: Tokenizer is missing, but chat parser is present.
     # Tokenization should be skipped as both are required.
     engine = trajectory_collect_engine.TrajectoryCollectEngine(
@@ -404,6 +500,10 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     mock_tokenize.assert_not_called()
 
   async def _run_collect_multiple(self, engine_args, pairs):
+    # [FUNCTION DOC]
+    # HELPER: consumes the async generator collect_multiple(pairs, engine
+    # args) and returns the list of (pair index, result) tuples in
+    # completion order.
     results = []
     async for (
         i,
@@ -415,8 +515,18 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     return results
 
   def test_collect_multiple(self):
+    # [FUNCTION DOC]
+    # Verifies collect_multiple in Conversation mode over two pairs returns
+    # two results which, sorted by index, have 3 messages (one-step
+    # episode) and 5 messages (two-step episode).
+    # KNOWN ISSUE: the inline comment says Conversation is collect's default
+    # mode, but the mode is passed explicitly here.
     # Helper to configure a new mock agent
     def configure_mock_agent(initial_obs):
+      # [FUNCTION DOC]
+      # HELPER: builds an autospec agent with its own Trajectory and chat
+      # list and stateful update/reset side effects equivalent to setUp's.
+      # KNOWN ISSUE: initial_obs is accepted but unused.
       agent = mock.create_autospec(
           base_agent.ConversationAgentBase, instance=True
       )
@@ -426,6 +536,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
       current_step = [None]
 
       def _update_from_model(resp):
+        # [FUNCTION DOC]
+        # HELPER: appends and returns a new Step; records assistant message.
         step = agent_types.Step(
             model_response=resp, action=agent_types.Action(action=['action'])
         )
@@ -435,6 +547,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
         return step
 
       def _update_from_env(observation, reward, done, info):
+        # [FUNCTION DOC]
+        # HELPER: fills the current step and records a user message.
         if current_step[0]:
           current_step[0].observation = observation
           current_step[0].reward = reward
@@ -447,6 +561,8 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
       agent.get_current_step.side_effect = lambda: current_step[0]
 
       def _reset_agent():
+        # [FUNCTION DOC]
+        # HELPER: clears steps and chat list (current step is kept).
         traj.steps.clear()
         agent.chat_completions.clear()
 
@@ -493,6 +609,12 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_status_max_context_limit_reached(self, mock_convert):
+    # [FUNCTION DOC]
+    # Verifies that when accumulated response tokens (100 model plus 100
+    # env) exceed max_response_length 150, collection stops after one step
+    # with status MAX_CONTEXT_LIMIT_REACHED.
+    # KNOWN ISSUE: the trailing comment "100 step = 100 > 150" is
+    # arithmetically wrong; the limit is exceeded by model plus env tokens.
     # 100 assistant + 100 env = 200 > 150. Should stop after 1 step.
     mock_convert.side_effect = [
         ([1] * 100, [1] * 100),  # prompt tokens
@@ -532,6 +654,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertLen(result_traj.steps, 1)
 
   def test_collect_max_steps_reached(self):
+    # [FUNCTION DOC]
+    # Verifies that when the env reports done on the only allowed step the
+    # status is SUCCEEDED (not MAX_STEPS_REACHED) with one step.
     self.mock_env.max_steps = 1
     self.mock_env.step.side_effect = [
         ('obs1', 1.0, True, {}),
@@ -547,6 +672,11 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
     self.assertLen(result_traj.steps, 1)
 
   def test_collect_timeout(self):
+    # [FUNCTION DOC]
+    # With time.perf_counter patched to a scripted sequence so the first
+    # step ends 0.18s after reset, verifies timeout 0.1 stops collection,
+    # marks the last step done, and sets status TIMEOUT. Depends on the
+    # exact number of perf_counter calls in reset, step and final reward.
     self.mock_env.max_steps = 10
     with mock.patch.object(time, 'perf_counter') as mock_perf:
       # Reset: 3 calls
@@ -578,6 +708,10 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_overlong_filter_masks_out_and_skips_reward(self, mock_convert):
+    # [FUNCTION DOC]
+    # Verifies with overlong_filter on and max_steps 1 without done, status
+    # is MAX_STEPS_REACHED, the final reward fn is not called, and all
+    # conversation masks (2 model tokens and 1 env token) are zeroed.
     # Setup for MAX_STEPS_REACHED
     self.mock_env.max_steps = 1
     self.mock_env.step.side_effect = [
@@ -618,6 +752,9 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_overlong_filter_disabled_does_not_mask_out(self, mock_convert):
+    # [FUNCTION DOC]
+    # Verifies with overlong_filter off the same scenario calls the final
+    # reward fn once and keeps masks at 1.
     # Setup for MAX_STEPS_REACHED but with overlong_filter=False
     self.mock_env.max_steps = 1
     self.mock_env.step.side_effect = [
@@ -650,6 +787,10 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
 
   @mock.patch.object(utils, 'tokenize_and_generate_masks')
   def test_overlong_filter_does_not_mask_out_on_success(self, mock_convert):
+    # [FUNCTION DOC]
+    # Verifies overlong_filter leaves masks intact when the episode
+    # succeeds; only the two model-token masks appear because the terminal
+    # observation is not tokenized.
     # Setup for SUCCEEDED
     self.mock_env.max_steps = 5
     self.mock_env.step.side_effect = [

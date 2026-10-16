@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Loading utilities for Gemma 4 from upstream (google-deepmind/gemma) Orbax
+# checkpoints into the text-only NNX model.Gemma4, plus tokenizer loading.
+# Defines GCS path constants for E2B/E4B pretrained and instruction-tuned
+# checkpoints and the tokenizer. Pipeline: restore -> remap keys
+# (map_from_upstream_checkpoint) -> prune keys absent from the model
+# (multimodal weights) -> validate shapes -> cast/shard -> nnx.update.
+# Uses absl logging for informational messages.
 """Gemma4 model parameters.
 
 This provides a mapping from upstream ORBAX_FLAX NESTED checkpoints [1] to our
@@ -51,6 +59,18 @@ def create_model_from_checkpoint(
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> model_lib.Gemma4:
+  # [FUNCTION DOC]
+  # Loads a Gemma4 from an Orbax checkpoint.
+  # Inputs: checkpoint_path, model_config, optional mesh, dtype (default
+  # bfloat16, applied uniformly to every parameter).
+  # Steps: abstract model via nnx.eval_shape; restore the checkpoint with
+  # StandardCheckpointer (I/O); remap with map_from_upstream_checkpoint; prune
+  # to the model's keys; validate shapes (ValueError on missing keys or shape
+  # mismatch); convert each leaf to jnp with dtype, placed per the model's
+  # NamedSharding on mesh if given; update the abstract model in place.
+  # Output: the populated Gemma4.
+  # KNOWN ISSUE: model_config.param_dtype is ignored; every parameter
+  # (including norms, skip scales and MoE router weights) is cast to dtype.
   """Load a Gemma4 model from an Orbax checkpoint.
 
   Args:
@@ -95,6 +115,12 @@ def _validate_param_shapes(
     mapped_params: Mapping[str, Any],
     model_state: Any,
 ) -> None:
+  # [FUNCTION DOC]
+  # HELPER: compares a mapped parameter tree with the model state tree after
+  # flattening both to tuple keys. Raises ValueError listing model keys missing
+  # from the checkpoint; logs a warning for extra checkpoint keys; skips (with a
+  # warning) entries without a shape attribute; raises ValueError listing all
+  # keys whose shapes differ. Returns None.
   """Validate that mapped checkpoint params match expected model shapes.
 
   Args:
@@ -153,6 +179,10 @@ def _prune_to_model_keys(
     params: Mapping[str, Any],
     model_state: Any,
 ) -> dict[str, Any]:
+  # [FUNCTION DOC]
+  # HELPER: returns a copy of params (nested dict) containing only the
+  # flattened keys present in the model state, logging (info) the keys that
+  # were dropped.
   """Prune checkpoint params to only include keys present in the model.
 
   IT checkpoints contain multimodal params (audio_input_projection,
@@ -186,6 +216,9 @@ def _prune_to_model_keys(
 def create_tokenizer(
     path: str = GEMMA4_TOKENIZER,
 ) -> spm.SentencePieceProcessor:
+  # [FUNCTION DOC]
+  # Loads the SentencePiece model bytes from path (default GEMMA4_TOKENIZER,
+  # any epath location) and returns a SentencePieceProcessor.
   """Load the Gemma 4 SentencePiece tokenizer.
 
   Args:
@@ -201,6 +234,21 @@ def create_tokenizer(
 
 
 def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
+  # [FUNCTION DOC]
+  # Converts an upstream Gemma 4 checkpoint dict to the NNX Gemma4 nested
+  # layout. Each flattened key tuple is split on '/' and concatenated into a
+  # list of parts (supports both semi-flat and fully nested keys); a leading
+  # 'transformer' is dropped; the last part is the param name.
+  # Rules: embedder per_layer_embeddings (as a sub-module or leaf name) ->
+  # ('embedder', 'per_layer_input_embedding'); other embedder sub-modules are
+  # copied; bare embedder leaves -> ('embedder', name). final_norm copied.
+  # Empty or bare (no module) keys and non-'layer_' modules (e.g. audio or
+  # vision encoders) are skipped with a log message. 'layer_i' -> ('layers', i):
+  # bare leaves (e.g. skip_scale) copied; mlp gating_einsum [2, F, D] split
+  # into gate_proj and up_proj kernels transposed to [D, F] (ValueError if the
+  # first dim is not 2); mlp linear -> down_proj kernel; 'query_norm' /
+  # 'key_norm' renamed to '_query_norm' / '_key_norm'; everything else copied.
+  # Output: nested dict (flax unflatten_dict).
   """Map from upstream Orbax NESTED checkpoint to Tunix NNX layout.
 
   Handles both key formats produced by Orbax checkpoints:

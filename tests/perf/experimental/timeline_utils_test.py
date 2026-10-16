@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Unit tests for tunix.perf.experimental.timeline_utils: timeline id helpers
+# (host ids 'host-<thread ident>', device ids from strings or objects with
+# platform and id as '<platform><id>', ValueError 'Unsupported id type'
+# otherwise, flattening lists/numpy arrays of devices, queued ids
+# '<id>_queue'), is_timeline_only_of_allowed_type (True only when the
+# non-empty set of span names in committed steps, plus the current step if
+# include_cur_step, is a subset of the allowed types) and
+# sequentialize_overlapping_spans (splits overlapping spans into a
+# sequential active view where each span begins when the previous ends, and
+# queue spans covering each span's waiting period; fully subsumed spans
+# appear only in the queue).
 from __future__ import annotations
 
 import dataclasses
@@ -26,13 +38,19 @@ from tunix.perf.experimental import timeline_utils
 
 @dataclasses.dataclass
 class MockDevice:
+  # [CLASS DOC]
+  # HELPER: dataclass standing in for a JAX device with platform and id.
   platform: str
   id: int
 
 
 class TimelineIdGenerationTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Parameterized test case for timeline_utils helpers.
 
   def test_generate_host_timeline_id(self):
+    # [FUNCTION DOC]
+    # Verifies host ids start with 'host-' and contain the current thread ident.
     tid = timeline_utils.generate_host_timeline_id()
     self.assertStartsWith(tid, "host-")
     self.assertIn(str(threading.get_ident()), tid)
@@ -78,6 +96,11 @@ class TimelineIdGenerationTest(parameterized.TestCase):
   def test_is_timeline_only_of_allowed_type(
       self, spans_to_add, allowed_types, expected
   ):
+    # [FUNCTION DOC]
+    # Verifies is_timeline_only_of_allowed_type before commit (False by default,
+    # expected with include_cur_step), after commit (expected either way), and
+    # that an unallowed span in the current step only matters with
+    # include_cur_step. Inputs: span names, allowed types, expected result.
     tl = timeline.Timeline("test", 0)
     for i, span_name in enumerate(spans_to_add):
       tl.start_span(span_name, float(i))
@@ -143,6 +166,8 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       dict(testcase_name="empty", tl_id="", expected=False),
   )
   def test_is_host_timeline(self, tl_id, expected):
+    # [FUNCTION DOC]
+    # Verifies is_host_timeline is True only for ids starting with 'host-'.
     self.assertEqual(timeline_utils.is_host_timeline(tl_id), expected)
 
   @parameterized.named_parameters(
@@ -154,16 +179,23 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       ),
   )
   def test_generate_device_timeline_id(self, device_id, expected_id):
+    # [FUNCTION DOC]
+    # Verifies device timeline ids for strings (unchanged) and device objects
+    # ('gpu7').
     self.assertEqual(
         timeline_utils.generate_device_timeline_id(device_id), expected_id
     )
 
   @dataclasses.dataclass
   class MockDeviceNoId:
+    # [CLASS DOC]
+    # HELPER: dataclass device lacking id.
     platform: str
 
   @dataclasses.dataclass
   class MockDeviceNoPlatform:
+    # [CLASS DOC]
+    # HELPER: dataclass device lacking platform.
     id: int
 
   @parameterized.named_parameters(
@@ -175,6 +207,9 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       ),
   )
   def test_generate_device_timeline_id_error(self, invalid_device):
+    # [FUNCTION DOC]
+    # Verifies ValueError 'Unsupported id type' for ints and objects missing id
+    # or platform.
     with self.assertRaisesRegex(ValueError, "Unsupported id type"):
       timeline_utils.generate_device_timeline_id(invalid_device)
 
@@ -206,11 +241,17 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       ),
   )
   def test_generate_device_timeline_ids(self, devices, expected_ids):
+    # [FUNCTION DOC]
+    # Verifies generate_device_timeline_ids handles None, empty list/array,
+    # mixed lists and 1D/2D numpy arrays (flattened row-major).
     self.assertEqual(
         timeline_utils.generate_device_timeline_ids(devices), expected_ids
     )
 
   def test_sequentialize_overlapping_spans_standard(self):
+    # [FUNCTION DOC]
+    # Verifies two overlapping spans: active b is shifted to start at a's end,
+    # and b's queue span covers its original begin to a's end.
     spans = {
         0: timeline.Span("a", 0.0, id=0),
         1: timeline.Span("b", 1.0, id=1),
@@ -232,6 +273,9 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       self.assertEqual(queue_spans[1].end, 2.0)
 
   def test_sequentialize_overlapping_spans_three_way_contention(self):
+    # [FUNCTION DOC]
+    # Verifies three-way contention chains active spans end to end and creates
+    # queue spans for each waiting span.
     spans = {
         0: timeline.Span("c", 5.0, id=0),
         1: timeline.Span("d", 6.0, id=1),
@@ -261,6 +305,9 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       self.assertEqual(queue_spans[2].end, 9.0)
 
   def test_sequentialize_overlapping_spans_subsumed_span(self):
+    # [FUNCTION DOC]
+    # Verifies a span ending before the previous one ends is excluded from
+    # active spans but present in queue spans.
     spans = {
         0: timeline.Span("f", 15.0, id=0),
         1: timeline.Span("g", 15.1, id=1),
@@ -278,16 +325,22 @@ class TimelineIdGenerationTest(parameterized.TestCase):
       self.assertIn(1, queue_spans)
 
   def test_sequentialize_overlapping_spans_empty(self):
+    # [FUNCTION DOC]
+    # Verifies empty input yields empty active and queue dicts.
     active_spans, queue_spans = timeline_utils.sequentialize_overlapping_spans({})
     self.assertEmpty(active_spans)
     self.assertEmpty(queue_spans)
 
   def test_generate_queued_timeline_id(self):
+    # [FUNCTION DOC]
+    # Verifies generate_queued_timeline_id appends '_queue'.
     self.assertEqual(
         timeline_utils.generate_queued_timeline_id("tpu0"), "tpu0_queue"
     )
 
   def test_is_queued_timeline(self):
+    # [FUNCTION DOC]
+    # Verifies is_queued_timeline detects the '_queue' suffix.
     self.assertTrue(timeline_utils.is_queued_timeline("tpu0_queue"))
     self.assertFalse(timeline_utils.is_queued_timeline("tpu0"))
 

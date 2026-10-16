@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Experimental (perf v2) tracer. PerfTracer records host spans (nested,
+# per-thread Timelines keyed "host-<thread ident>") and device spans
+# (AsyncTimelines per device, ended when JAX values become ready). Each device
+# timeline has a companion queue timeline ("<id>_queue"). On export, current
+# steps are post-processed (overlapping device spans are sequentialized into
+# active spans plus queue spans, unless configured as concurrent) and committed,
+# then the user export function receives a mapping of timeline id to timeline.
+# NoopTracer offers the same API without recording. Tracer is the union type.
+# Aliases: JaxDevice, MetricsT, PerfSpanQuery, Span, Timeline, AsyncTimeline,
+# BatchAsyncTimelines.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -38,17 +49,27 @@ BatchAsyncTimelines = timeline.BatchAsyncTimelines
 
 
 def _synchronize_devices() -> None:
+  # [FUNCTION DOC]
+  # HELPER: Barrier: for every JAX device, places 0.0 on it and blocks until
+  # ready.
   for device in jax.devices():
     jax.device_put(0.0, device=device).block_until_ready()
 
 
 class AsyncWaitlist:
+  # [CLASS DOC]
+  # Collector of JAX pytrees, yielded by span(), whose readiness defines the
+  # end of the device span. Holds a list.
   """An interface to collect waitlist for PerfTracer span()."""
 
   def __init__(self) -> None:
+    # [FUNCTION DOC]
+    # Initializes an empty list.
     self._waitlist = []
 
   def async_end(self, waitlist: jaxtyping.PyTree) -> None:
+    # [FUNCTION DOC]
+    # Appends a pytree to the list.
     """Adds a JAX PyTree computation to the asynchronous waitlist.
 
     Args:
@@ -59,14 +80,21 @@ class AsyncWaitlist:
 
   @property
   def waitlist(self) -> jaxtyping.PyTree:
+    # [FUNCTION DOC]
+    # Property: the accumulated list (not a copy).
     """Returns the current accumulated waitlist."""
     return self._waitlist
 
 
 class NoopTracer:
+  # [CLASS DOC]
+  # Tracer API that records nothing: synchronize/print no-ops, export returns
+  # {}, all_devices empty, span yields an unused AsyncWaitlist.
   """A no-op tracer that does nothing."""
 
   def synchronize(self) -> None:
+    # [FUNCTION DOC]
+    # No-op.
     """Synchronizes all devices to ensure pending computations are finished.
 
     Use this carefully as it is a blocking operation.
@@ -74,10 +102,14 @@ class NoopTracer:
     pass
 
   def print(self) -> None:
+    # [FUNCTION DOC]
+    # No-op.
     """Prints the captured timelines to standard output."""
     pass
 
   def export(self) -> MetricsT:
+    # [FUNCTION DOC]
+    # Returns {}.
     """Exports the gathered timeline metrics.
 
     Returns:
@@ -87,6 +119,8 @@ class NoopTracer:
 
   @property
   def all_devices(self) -> Sequence[str | JaxDevice]:
+    # [FUNCTION DOC]
+    # Property: empty list.
     """Returns a list of all devices tracked by the tracer."""
     return []
 
@@ -97,6 +131,8 @@ class NoopTracer:
       devices: Sequence[str | JaxDevice] | np.ndarray | None = None,
       tags: Mapping[str, Any] | None = None,
   ) -> Iterator[AsyncWaitlist]:
+    # [FUNCTION DOC]
+    # Context manager yielding a fresh AsyncWaitlist; arguments ignored.
     """A context manager to trace a span of execution.
 
     Args:
@@ -112,6 +148,12 @@ class NoopTracer:
 
 
 class PerfTracer(NoopTracer):
+  # [CLASS DOC]
+  # Recording tracer. State: export function, born time, main host timeline
+  # id, a lock guarding the timeline dicts, host timelines, device
+  # AsyncTimelines, device queue timelines, the first-device-per-mesh flag,
+  # and the concurrent span setting (None, the string "all", or a list of
+  # span names).
   """An API to collect performance metrics in the form of timelines.
 
   Collect API:
@@ -138,6 +180,14 @@ class PerfTracer(NoopTracer):
       collect_on_first_device_per_mesh: bool = True,
       concurrent_device_spans: Sequence[str] | str | None = None,
   ) -> None:
+    # [FUNCTION DOC]
+    # Inputs: devices (optional; each gets a device and queue timeline),
+    # export_fn (mapping of timelines -> MetricsT), keyword
+    # collect_on_first_device_per_mesh (default True), keyword
+    # concurrent_device_spans (None, "all", a single name, or a sequence of
+    # names). Records born time and creates the calling thread's host
+    # timeline. A single name other than "all" is wrapped in a list.
+    # Exceptions: ValueError for unsupported device ids.
     """Initializes the instance.
 
     Args:
@@ -180,6 +230,10 @@ class PerfTracer(NoopTracer):
       self._concurrent_spans = concurrent_device_spans
 
   def _get_timelines(self) -> Mapping[str, Timeline]:
+    # [FUNCTION DOC]
+    # HELPER: Under the lock, merges host, device and device-queue timelines
+    # into one dict by id; ValueError if a device or queue id collides with an
+    # earlier id.
     # TODO(noghabi): do we need this function anymore?
     timelines_by_id: dict[str, Timeline] = {}
     with self._timelines_lock:
@@ -197,6 +251,9 @@ class PerfTracer(NoopTracer):
     return timelines_by_id
 
   def _get_or_create_host_timeline(self, timeline_id: str) -> Timeline:
+    # [FUNCTION DOC]
+    # HELPER: Returns (creating under the lock if needed) the host timeline for
+    # the id.
     with self._timelines_lock:
       host_timeline = self._host_timelines.get(timeline_id)
       if host_timeline is None:
@@ -205,6 +262,9 @@ class PerfTracer(NoopTracer):
       return host_timeline
 
   def _get_or_create_device_timeline(self, timeline_id: str) -> AsyncTimeline:
+    # [FUNCTION DOC]
+    # HELPER: Returns (creating under the lock if needed) the device
+    # AsyncTimeline for the id; creation also creates its queue Timeline.
     with self._timelines_lock:
       device_timeline = self._device_timelines.get(timeline_id)
       if device_timeline is None:
@@ -220,12 +280,18 @@ class PerfTracer(NoopTracer):
   def _get_or_create_device_timelines(
       self, ids: Sequence[str | JaxDevice] | np.ndarray | None
   ) -> BatchAsyncTimelines:
+    # [FUNCTION DOC]
+    # HELPER: Converts devices to ids and wraps their (created on demand)
+    # device timelines in a BatchAsyncTimelines.
     return BatchAsyncTimelines([
         self._get_or_create_device_timeline(id)
         for id in timeline_utils.generate_device_timeline_ids(ids)
     ])
 
   def synchronize(self) -> None:
+    # [FUNCTION DOC]
+    # Blocks on all devices, then joins pending waiter threads of every device
+    # timeline (snapshot taken under the lock).
     """Synchronizes all devices and waits for pending asynchronous spans to finish.
 
     Use this carefully as it is a blocking operation.
@@ -237,6 +303,9 @@ class PerfTracer(NoopTracer):
       tl.wait_pending_spans()
 
   def print(self) -> None:
+    # [FUNCTION DOC]
+    # Synchronizes, then prints each timeline's id header and text form to
+    # stdout.
     """Synchronizes and prints the captured timelines to standard output."""
     self.synchronize()
     for tl in self._get_timelines().values():
@@ -246,6 +315,14 @@ class PerfTracer(NoopTracer):
   def _sequentialize_device_timeline(
       self, timeline_id: str, tl: AsyncTimeline
   ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Under the device timeline's lock (accesses its private state):
+    # if any current-step span name is in the concurrent list, does nothing.
+    # Otherwise replaces the current step with the active spans from
+    # timeline_utils.sequentialize_overlapping_spans and adds the queue spans
+    # to the companion queue timeline's current step (under its lock).
+    # KNOWN ISSUE: device spans that have not completed yet are not in the
+    # current step and are therefore not considered.
     """Sequentializes overlapping spans on a device timeline."""
     with tl._lock:
       ignore_list = self._concurrent_spans or []
@@ -267,6 +344,10 @@ class PerfTracer(NoopTracer):
             queue_tl._cur_step[span_id] = span
 
   def process_and_commit_timelines(self) -> None:
+    # [FUNCTION DOC]
+    # Under the tracer lock: unless concurrency is "all", sequentializes every
+    # device timeline; then commits the current step on all host, device and
+    # queue timelines (dropping unfinished spans with warnings).
     """Explicitly commits current steps across all active timelines."""
     with self._timelines_lock:
       # 1. Post process timelines
@@ -284,6 +365,10 @@ class PerfTracer(NoopTracer):
         tl.commit_step()
 
   def export(self) -> MetricsT:
+    # [FUNCTION DOC]
+    # Returns {} if no export function (without committing). Otherwise
+    # processes and commits timelines and returns the export function applied
+    # to the id -> timeline mapping. Pending async spans are not waited for.
     """Commits timelines and exports the gathered metrics using export_fn.
 
     Returns:
@@ -298,6 +383,8 @@ class PerfTracer(NoopTracer):
 
   @property
   def all_devices(self) -> Sequence[str]:
+    # [FUNCTION DOC]
+    # Property: device timeline ids (under the lock).
     """Returns a list of all device IDs currently tracked by the tracer."""
     with self._timelines_lock:
       return list(self._device_timelines.keys())
@@ -309,6 +396,16 @@ class PerfTracer(NoopTracer):
       devices: Sequence[str | JaxDevice] | np.ndarray | None = None,
       tags: Mapping[str, Any] | None = None,
   ) -> Iterator[AsyncWaitlist]:
+    # [FUNCTION DOC]
+    # Context manager recording a span. If collect_on_first_device_per_mesh is
+    # set and devices are given, only the first device (first element of a
+    # non-empty array or sequence) is tracked. Records begin time, starts a
+    # nested span on the calling thread's host timeline with tags, and yields
+    # an AsyncWaitlist. On exit (also on exceptions, if the host span was
+    # started) stops the host span at the exit time and records an async span
+    # (begin = host begin, end = readiness of the collected waitlist, or
+    # immediately if empty) on each tracked device timeline with the tags.
+    # Exceptions: ValueError from stop_span or unsupported device ids.
     """A context manager to trace a synchronous or asynchronous span of execution.
 
     Args:

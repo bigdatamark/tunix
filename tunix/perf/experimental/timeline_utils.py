@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# HELPER: Utilities for the experimental (perf v2) tracer: timeline id
+# generation/classification (host timelines "host-<thread ident>", device
+# timelines "<platform><id>" or a given string, queue timelines
+# "<device id>_queue"), a check that a timeline contains only allowed span
+# names, and an algorithm that turns overlapping device spans into
+# non-overlapping "active" spans plus "queue" (waiting) spans.
+# JaxDevice is an alias of Any.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -30,6 +38,8 @@ JaxDevice = Any
 
 
 def generate_host_timeline_id() -> str:
+  # [FUNCTION DOC]
+  # Returns "host-" followed by the current thread's identifier.
   """Generates a string ID for a host timeline.
 
   Returns:
@@ -39,6 +49,8 @@ def generate_host_timeline_id() -> str:
 
 
 def is_host_timeline(tl_id: str) -> bool:
+  # [FUNCTION DOC]
+  # True if the id starts with "host-".
   """Checks if the timeline ID corresponds to a host timeline.
 
   Args:
@@ -51,6 +63,8 @@ def is_host_timeline(tl_id: str) -> bool:
 
 
 def generate_queued_timeline_id(tl_id: str) -> str:
+  # [FUNCTION DOC]
+  # Returns the id with suffix "_queue" appended.
   """Generates a string ID for a queued timeline based on a base timeline ID.
 
   Args:
@@ -63,6 +77,8 @@ def generate_queued_timeline_id(tl_id: str) -> str:
 
 
 def is_queued_timeline(tl_id: str) -> bool:
+  # [FUNCTION DOC]
+  # True if the id ends with "_queue".
   """Checks if the timeline ID corresponds to a queued timeline.
 
   Args:
@@ -75,6 +91,10 @@ def is_queued_timeline(tl_id: str) -> bool:
 
 
 def generate_device_timeline_id(device_id: str | JaxDevice) -> str:
+  # [FUNCTION DOC]
+  # Returns a str id unchanged; for objects having "platform" and "id"
+  # attributes returns platform followed by id (for example "tpu0");
+  # otherwise ValueError.
   """Generates a string ID for a device timeline.
 
   Args:
@@ -101,6 +121,9 @@ def generate_device_timeline_id(device_id: str | JaxDevice) -> str:
 def generate_device_timeline_ids(
     devices: Sequence[str | JaxDevice] | np.ndarray | None,
 ) -> Sequence[str]:
+  # [FUNCTION DOC]
+  # None -> empty list; numpy arrays are flattened to a list; each element is
+  # converted with generate_device_timeline_id. Output: list of strings.
   """Generates a list of string IDs for a list of devices.
 
   Args:
@@ -127,6 +150,11 @@ def is_timeline_only_of_allowed_type(
     allowed_span_names: Sequence[str],
     include_cur_step: bool = False,
 ) -> bool:
+  # [FUNCTION DOC]
+  # Iterates the committed steps (plus a copy of the current step when
+  # include_cur_step) of a timeline; returns False as soon as a span name is
+  # not in allowed_span_names; returns True only if at least one span exists
+  # and all are allowed (False for an empty timeline).
   """Checks if all spans in a timeline are of allowed types.
 
   Args:
@@ -151,6 +179,23 @@ def is_timeline_only_of_allowed_type(
 def sequentialize_overlapping_spans(
     spans_dict: Mapping[int, timeline.Span],
 ) -> tuple[Mapping[int, timeline.Span], Mapping[int, timeline.Span]]:
+  # [FUNCTION DOC]
+  # Converts possibly overlapping spans into (active spans, queue spans), both
+  # keyed by original span id, modelling serial execution on one device.
+  # Algorithm: sort by (begin, id); track current_end (end of the last active
+  # span, initially -infinity) and last_queue_end. For each span s:
+  #   - if s begins before current_end (overlap): its active interval becomes
+  #     [current_end, max(current_end, s.end)]; a queue span named "queue"
+  #     (same id and parent, tag NAME -> original name) covering
+  #     [max(s.begin, last_queue_end), current_end] is emitted when that
+  #     interval is non-empty, and last_queue_end advances to current_end;
+  #   - otherwise its active interval is its original [begin, end].
+  #   If the active interval has positive length, a new active Span (same
+  #   name/id/parent, copied tags) is emitted and current_end moves to its end;
+  #   otherwise a warning is logged and s gets no active span.
+  # Inputs are not modified; new Span objects are created.
+  # KNOWN ISSUE: a non-overlapping span with zero duration is also dropped and
+  # the warning misleadingly blames overlap.
   """Sequentializes overlapping spans into non-overlapping active and queue spans.
 
   If spans overlap, they are assumed to be executed sequentially. The first span
