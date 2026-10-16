@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Agentic GRPO learner: concrete AgenticRLLearner implementing Group Relative
+# Policy Optimization over agent trajectories. Defines GRPOConfig (algorithm
+# hyperparameters, validated after init), GRPOLearner (configures the actor
+# trainer's loss/input/metric hooks and implements _process_results, which turns
+# "Token"-mode trajectory dicts into one padded TrainExample with rewards,
+# group-relative advantages, optional reference/old log-probs and optional
+# truncated importance-sampling weights), and aliases GrpoConfig / GrpoLearner.
+# Re-exports TrainingInputT, RewardFn, MetricFn and TrainExample from the base
+# learner module. algo_core is imported for its registration side effects (it
+# registers advantage estimators and policy losses in the function registry).
 """Implements an RLLearner for the Agentic GRPO algorithm.
 
 This learner orchestrates the process of generating multiple text completions
@@ -60,6 +71,19 @@ TrainExample = agentic_rl_learner.TrainExample
 
 @dataclasses.dataclass(kw_only=True)
 class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
+  # [CLASS DOC]
+  # Keyword-only dataclass extending AgenticRLConfig. Fields (defaults):
+  # algo_variant "agentic_grpo"; advantage_estimator "grpo" and policy_loss_fn
+  # "grpo" (registry names); loss_agg_mode "sequence-mean-token-mean"; loss_algo
+  # "grpo" or "gspo-token"; num_generations 2 (must be > 1); num_iterations 1;
+  # beta 0.04 (KL coefficient; KL/ref logps computed only if beta != 0 or
+  # force_compute_kl); kl_loss_mode "kl"; force_compute_kl False; epsilon 0.2;
+  # epsilon_high None (defaults to epsilon); system_prompt ""; max_concurrency 16;
+  # off_policy_steps 0; degenerate_group_masking False (zero the completion mask
+  # when all advantages are ~0); use_rollout_logps True; sampler_is None or
+  # "token" (enable per-token truncated importance sampling using trainer logps as
+  # old logps); sampler_is_threshold 2.0 (cap on IS weights).
+  # A temperature attribute is assigned later by the learner.
   """Configuration for GRPO algorithm.
 
   Attributes:
@@ -126,6 +150,11 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
   sampler_is_threshold: float = 2.0
 
   def __post_init__(self):
+    # [FUNCTION DOC]
+    # Validate and complete the config after construction.
+    # Exceptions: ValueError if num_generations is at most 1, or if loss_algo is not
+    # "grpo" or "gspo-token". Side effect: sets epsilon_high to epsilon when None.
+    # Does not call a parent post-init.
     if self.num_generations <= 1:
       raise ValueError(
           "num_generations must be greater than 1. Received: "
@@ -144,6 +173,13 @@ TGrpoConfig = TypeVar("TGrpoConfig", bound=GRPOConfig)
 
 
 class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
+  # [CLASS DOC]
+  # GRPO learner. Adds _trajectory_logger (AsyncTrajectoryLogger when a metrics
+  # log dir is configured, else None) and wires the actor trainer: loss function
+  # from the registry (called with model, train example, the learner's algo_config,
+  # and the rollout pad and eos ids), model-input function producing
+  # {"train_example": example, "algo_config": config}, RL metrics to log with their
+  # aggregators, and a tqdm display of "kl" when KL is computed.
   """An RLLearner that implements the GRPO algorithm in an agentic setting.
 
   GRPO is a reinforcement learning algorithm designed to enhance the reasoning
@@ -174,6 +210,24 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       ] = task_environment.TaskEnvironment,
       env_kwargs: Dict[str, Any] | None = None,
   ):
+    # [FUNCTION DOC]
+    # Construct the GRPO learner.
+    # Inputs: same as AgenticRLLearner (rl_cluster, algo_config, reward_fns,
+    # chat_parser, metric_fns, agent_class/kwargs, env_class/kwargs).
+    # Behavior: calls the base constructor; creates the async trajectory logger if
+    # training_config.metrics_logging_options has a log_dir, else logs a warning;
+    # copies the TRAIN rollout config temperature into algo_config.temperature; looks
+    # up the policy loss by name and registers a wrapper (ignoring the algo_config
+    # argument it receives and using self.algo_config instead) with has_aux True;
+    # registers the gen-model-input function; registers metric aggregators: mean for
+    # kl, entropy, pg_loss, pg_clipfrac, ppo_kl, kl_loss, is_ratio/mean,
+    # log_ratio/abs_mean, pg_loss/unclipped_mean, pg_loss/clipped_mean,
+    # advantage/abs_mean, advantage/nonzero_frac, sampler_is/weight_mean; max for
+    # is_ratio/max, advantage/max; min for is_ratio/min, advantage/min,
+    # sampler_is/weight_min; and a tqdm entry showing "kl" when force_compute_kl or
+    # beta != 0.
+    # Side effects: mutates algo_config and the actor trainer configuration.
+    # Exceptions: base-constructor errors; registry lookup errors.
     """Initializes the `GRPOTrainer`.
 
     Args:
@@ -288,6 +342,64 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       mode: rl_cluster_lib.Mode = rl_cluster_lib.Mode.TRAIN,
       expected_step: int | None = None,
   ) -> List[TrainExample]:
+    # [FUNCTION DOC]
+    # Convert trajectory items (one or more full groups of G, in group order) into a
+    # single TrainExample.
+    # Inputs: trajectories (TrajectoryItems whose traj is the "Token"-mode dict),
+    # mode, expected_step (metrics step).
+    # Steps:
+    # 1. For each item: completion text = content of the first assistant message in
+    # conversation_text (or ""); collect prompt_tokens, conversation_tokens,
+    # conversation_masks, old_logprobs, policy_version (ValueError if None) and
+    # trajectory_reward. Optionally log every traj dict asynchronously.
+    # 2. Use the rollout config for this mode (dict-keyed configs indexed by mode).
+    # For each sample: count it as clipped when its completion length is at least
+    # max_response_length and the last mask value differs from eos id; left-pad /
+    # truncate the prompt to max_prompt_length and right-pad / truncate completion
+    # tokens and masks to max_response_length (pad id and 0). If use_rollout_logps,
+    # right-pad old logprobs with 0.0 (or zeros if missing).
+    # 3. Build JAX arrays prompt_ids, prompt_mask (ids != pad), completion_ids,
+    # completion_mask.
+    # 4. Old log-probs: with rollout logps available, use them, and additionally
+    # recompute trainer logps (micro-batched) when the actor mesh exists and is
+    # non-empty or sampler_is is "token"; with sampler_is "token" the trainer logps
+    # become the old logps. With use_rollout_logps but no logprobs, old logps are
+    # None. Without use_rollout_logps, trainer logps are always recomputed and used.
+    # RuntimeError if num_iterations > 1 and old logps are None.
+    # 5. Perf tags: step plus group id (from traj "group_id" or
+    # original_input["group_id"]). If beta != 0 or force_compute_kl, compute
+    # reference logps in a perf span; else None.
+    # 6. Merge original_input dicts with rl_utils.merge_micro_batches; buffer prompt
+    # length metrics (using only the first prompt's length). Rewards: _compute_rewards
+    # with prompts from the merged inputs, completion texts, all other merged input
+    # fields plus trajectory_rewards as kwargs. Advantages from the registered
+    # estimator with num_generations.
+    # 7. If degenerate_group_masking and all advantages are close to 0, zero the
+    # completion mask.
+    # 8. Metrics: completion length mean/max/min (mask sums), clip ratio, advantage
+    # mean/max/min/std; when both rollout and trainer logps exist, masked mean/max
+    # absolute logp difference, probability difference and masked Pearson
+    # correlation of probabilities (also logged at info).
+    # 9. If sampler_is is "token" with both logps: weights = min(exp(clip(trainer -
+    # rollout, -20, 20)), threshold) times the completion mask, gradient-stopped;
+    # logs mean, max and fraction clipped.
+    # 10. Per time key (env_time, reward_time) adds mean/max/min of each sub key
+    # across trajectories to the metrics and buffers them. Then calls each metric_fn
+    # with prompts, completions, advantages, rewards and other inputs and buffers its
+    # result.
+    # Outputs: a one-element list with TrainExample(prompt_ids, prompt_mask,
+    # completion_ids, completion_mask, ref_per_token_logps, advantages,
+    # old_per_token_logps, policy_version as int32 array, sampler_is_weights).
+    # Exceptions: ValueError, RuntimeError as above; IndexError on empty input.
+    # KNOWN ISSUE: the clipped-completion check compares the last MASK value to the
+    # eos token id instead of the last token, and fails on an empty mask. The metrics
+    # dict is buffered inside the sub-key loop, so it is buffered repeatedly, and is
+    # never buffered when trajectories carry no timing sub-keys. Degenerate-group
+    # masking checks all advantages in the batch rather than per group when several
+    # groups are processed together. Registered metric "sampler_is/weight_min" does
+    # not match the emitted "sampler_is/weight_max". The docstring says
+    # policy_version comes from the trajectory task, but it is read from the traj
+    # dict.
     """Processes generation results, computes rewards and advantages.
 
     This is a core method that performs several steps:

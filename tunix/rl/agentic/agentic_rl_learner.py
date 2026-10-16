@@ -311,6 +311,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     loop_queue = queue.Queue()
 
     def run_loop_forever():
+      # [FUNCTION DOC]
+      # HELPER: Thread target. Gets or creates this thread's event loop, sets a
+      # ThreadPoolExecutor with max_concurrency + 1 workers as its default executor,
+      # hands the loop to the constructor via a queue, then runs the loop forever
+      # (never returns; the daemon thread dies with the process).
       loop = agentic_utils.get_or_create_loop()
       loop.set_default_executor(
           ThreadPoolExecutor(max_workers=algo_config.max_concurrency + 1)
