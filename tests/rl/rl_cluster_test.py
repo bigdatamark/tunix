@@ -761,6 +761,8 @@ class RlClusterTest(parameterized.TestCase):
           rollout_config: base_rollout.RolloutConfig,
           **kwargs,
       ) -> base_rollout.RolloutOutput:
+        # [FUNCTION DOC]
+        # HELPER: returns a fixed "generated text" RolloutOutput.
         return base_rollout.RolloutOutput(
             text=['generated text'],
             logits=np.zeros((1, 1, 1)),
@@ -770,9 +772,13 @@ class RlClusterTest(parameterized.TestCase):
         )
 
       def eos_id(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: returns 1.
         return 1
 
       def pad_id(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: returns 0.
         return 0
 
       def get_per_token_logps(
@@ -781,16 +787,24 @@ class RlClusterTest(parameterized.TestCase):
           completion_tokens: jax.Array,
           completion_mask: jax.Array | None = None,
       ) -> jax.Array:
+        # [FUNCTION DOC]
+        # HELPER: placeholder returning log-softmax of prompt_tokens.
         return jax.nn.log_softmax(prompt_tokens)
 
       def model(self) -> nnx.Module:
+        # [FUNCTION DOC]
+        # HELPER: returns None.
         pass
 
       def update_params(self, params, filter_types):
+        # [FUNCTION DOC]
+        # HELPER: no-op.
         pass
 
       @property
       def mesh(self):
+        # [FUNCTION DOC]
+        # HELPER: a fresh (1, 1) fsdp/tp mesh on the first device.
         return Mesh(
             np.array(jax.devices()[:1]).reshape(1, 1),
             ('fsdp', 'tp'),
@@ -808,6 +822,10 @@ class RlClusterTest(parameterized.TestCase):
     )
 
     def create_cluster_config(rollout_engine):
+      # [FUNCTION DOC]
+      # HELPER: ClusterConfig with actor/reference on the actor mesh,
+      # rollout on the rollout mesh, the given engine, and a bfloat16
+      # rollout config with an empty mapping config.
       return rl_cluster_lib.ClusterConfig(
           role_to_mesh={
               rl_cluster_lib.Role.ACTOR: actor_mesh,
@@ -904,6 +922,13 @@ class RlClusterTest(parameterized.TestCase):
   def test_logical_axis_rules_cm(
       self, role_to_logical_axis_rules, expected_logical_axis_rules
   ):
+    # [FUNCTION DOC]
+    # Replaces the inference worker's reference-logps function with a probe
+    # and verifies that during get_ref_per_token_logps the active flax
+    # logical axis rules equal the REFERENCE role's configured rules (empty
+    # when none or only other roles are configured), that the probe ran,
+    # and that rules are empty before and after (context restored). The
+    # original function is restored in a finally block.
     mesh = Mesh(np.array(jax.devices()).reshape(1, -1), ('fsdp', 'tp'))
     cluster_config = rl_cluster_lib.ClusterConfig(
         role_to_mesh={
@@ -944,6 +969,9 @@ class RlClusterTest(parameterized.TestCase):
     invoked = False
 
     def mock_fn(*args, **kwargs):  # pylint: disable=unused-argument
+      # [FUNCTION DOC]
+      # HELPER: marks invoked, asserts current axis rules match the
+      # expectation, and returns a (1, 1) zeros array.
       nonlocal invoked
       invoked = True
       self.assertEqual(

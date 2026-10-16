@@ -11,6 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# [MODULE DOC]
+# End-to-end and unit tests for tunix.rl.grpo.grpo_learner.GRPOLearner on
+# toy transformers with the vanilla rollout engine: data preparation with
+# sample/batch repeat and gradient accumulation, full training with one or
+# more reward fns and grpo or gspo-token loss, metric logging, call timing
+# of generation and log-prob functions under multiple iterations, LoRA
+# actors with separate rollout mesh (weight sync), sequence packing
+# equivalence, exception propagation from data preparation, checkpoint
+# resume (including with mini-batches and changed batch size), stable
+# trajectory ids across batch configurations, micro-batching equivalence,
+# and reward computation shape. Datasets are tiny grain MapDatasets of
+# strings with "prompts" and "answer" fields.
+# Side effects: sets XLA_FLAGS at import; setUpClass sets CPU device count
+# (DEVICE_COUNTS, default 2) and prints; some tests write checkpoints and
+# profiler output under /tmp; metrics are printed via an external logger.
+# KNOWN ISSUE: XLA_FLAGS is set after jax import (likely ineffective);
+# algo_core is imported as grpo_core but unused.
 import itertools
 import os
 import shutil
@@ -55,27 +73,46 @@ _DUMMY_DATA = [
 ]
 
 def reward_1(completions, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning 0..n-1 for n completions.
   return jnp.arange(len(completions))
 
 
 def reward_2(prompts, answer, **kargs):  # pylint: disable=unused-argument
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning 0..n-1 for n answers.
   return jnp.arange(len(answer))
 
 class MySource(grain.RandomAccessDataSource):
+  # [CLASS DOC]
+  # HELPER: random-access grain source over a list (default the four dummy
+  # strings) repeated repeat times.
 
   def __init__(self, data=None, repeat=1):
+    # [FUNCTION DOC]
+    # HELPER: stores data (default _DUMMY_DATA) concatenated repeat times.
     if data is None:
       data = _DUMMY_DATA
     self._data = data * repeat
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the item at idx.
     return self._data[idx]
 
   def __len__(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the number of stored items.
     return len(self._data)
 
 
 def _dummy_dataset(source=MySource(), batch_size: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: grain MapDataset over source (MySource or any sequence),
+  # batched by batch_size, mapping each batch to a dict with "prompts" and
+  # "answer" both equal to the batch.
+  # KNOWN ISSUE: the default MySource is created once at definition time
+  # and shared across calls.
   return (
       grain.MapDataset.source(source)
       .batch(batch_size)
@@ -84,6 +121,14 @@ def _dummy_dataset(source=MySource(), batch_size: int = 1):
 
 
 def setup(kwargs: Optional[Dict[str, Any]] = None):
+  # [FUNCTION DOC]
+  # HELPER: builds a GRPO test cluster: toy actor and identical reference
+  # model (seed 0), all roles on the current physical mesh, vanilla
+  # rollout (10 new tokens, prompt length 256, KV cache 1024), sgd 1e-3,
+  # max_steps 10. Optional kwargs: eval_every_n_steps (default 2),
+  # gradient_accumulation_steps (default None), max_seq_token_per_tpu
+  # (default None, enables sequence packing when set). Returns (cluster,
+  # actor model, deep copy of the actor's initial params).
   if kwargs is None:
     kwargs = {}
   vocab = tc.MockVocab()
@@ -130,18 +175,36 @@ def setup(kwargs: Optional[Dict[str, Any]] = None):
 
 
 class GRPOLearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # GRPO learner tests on simulated CPU devices.
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: sets CPU device count from DEVICE_COUNTS (default 2), prints
+    # it, and stores cls.device_count.
     super().setUpClass()
     num_cpus = int(os.environ.get('DEVICE_COUNTS', 2))
     chex.set_n_cpu_devices(num_cpus)
     print(f'Setting up test with {num_cpus} devices')
     cls.device_count = jax.device_count()
   def test_iterator(self):
+    # [FUNCTION DOC]
+    # Verifies _prepare_data ordering using a stub learner: each sample in a
+    # batch is repeated sample_repeat times contiguously, each processed
+    # batch is emitted batch_repeat times, and with gradient accumulation
+    # the group of grad_acc_steps batches is repeated as a block; trailing
+    # batches that cannot fill a full accumulation group are dropped.
     class _EmptyTrainer(grpo_lib.GRPOLearner):
+      # [CLASS DOC]
+      # HELPER: GRPOLearner with a hand-built minimal state (no cluster
+      # construction) whose advantage step echoes prompts as prompt ids.
       """A trainer that does nothing but used to test the iterator preparation."""
       def __init__(self, grpo_config):
+        # [FUNCTION DOC]
+        # HELPER: sets step counters to 0, stores the config, and installs
+        # a namespace cluster with micro-batch sizes 1, no-op metric
+        # buffering and no-op tracers; does not call the base initializer.
         self._iter_steps = 0
         self._eval_iter_steps = 0
         self.rollout_worker_mesh = pxla.thread_resources.env.physical_mesh
@@ -164,6 +227,11 @@ class GRPOLearnerTest(parameterized.TestCase):
         self._compute_logps_micro_batch_size = 1
       @override
       def _generate_and_compute_advantage(self, example, mode='train'):
+        # [FUNCTION DOC]
+        # HELPER: drops trajectory_ids from example (mutating it) and
+        # returns a namespace mimicking TrainExample with prompt_ids equal
+        # to the prompts array, unit prompt mask, zero completions/masks,
+        # zero advantages and None log-probs.
         if 'trajectory_ids' in example:
           del example['trajectory_ids']
         prompts = example['prompts']
@@ -182,6 +250,11 @@ class GRPOLearnerTest(parameterized.TestCase):
         grpo_lib.GRPOConfig(num_generations=2, num_iterations=1)
     )
     def _prepare(dataset, sample_repeat, batch_repeat, grad_acc_steps):
+      # [FUNCTION DOC]
+      # HELPER: generator that repeatedly calls _prepare_data
+      # synchronously into a fresh queue sized batch_repeat * grad_acc_steps
+      # plus 1, yielding queued items until a None sentinel, and stops when
+      # the dataset iterator raises StopIteration.
       iterator = iter(dataset)
       while True:
         try:
@@ -262,6 +335,18 @@ class GRPOLearnerTest(parameterized.TestCase):
       ),
   )
   def test_grpo_learner(self, reward_fns, loss_algo):
+    # [FUNCTION DOC]
+    # Trains GRPO (2 generations, 1 iteration) for 10 steps with eval every
+    # 2 steps and a constant custom metric fn, wrapping _prepare_data to
+    # record step counters per mode. Verifies: no weight sync / async
+    # rollout (shared mesh, no LoRA); params changed; 10 train iterations
+    # and 4 eval iterations; actor iter steps match; _prepare_data called at
+    # train steps 0..9 and five times at eval step 0 (eval counter resets);
+    # global steps 10; reward sum/min/max, per-fn reward and custom metrics
+    # logged once per global step in train and train_steps / 2 times in
+    # eval; actor loss and kl logged likewise.
+    # KNOWN ISSUE: the skip for "rewards/reward_2" is unreachable because
+    # that name is only generated when reward_fns is a list.
 
     kwargs = {'eval_every_n_steps': 2}
     rl_cluster, model, original_variables = setup(kwargs)
@@ -282,7 +367,13 @@ class GRPOLearnerTest(parameterized.TestCase):
     train_ds = _dummy_dataset(MySource(repeat=10), batch_size=2)
     eval_ds = _dummy_dataset(batch_size=1)
     def wrap_prepare_data(fn, fn_call_at_step, learner):
+      # [FUNCTION DOC]
+      # HELPER: returns a wrapper of fn that records the learner's train or
+      # eval iteration counter (selected by the mode kwarg) before calling
+      # fn; raises KeyError if mode is not passed as a keyword.
       def wrapper(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: records the step for the mode then delegates to fn.
         if str(kwargs['mode']) == 'train':
           fn_call_at_step['train'].append(learner._iter_steps)
         else:
@@ -477,6 +568,15 @@ class GRPOLearnerTest(parameterized.TestCase):
       expected_inference_worker_logps_fn_call_at_step,
       expected_rollout_worker_logps_fn_call_at_step,
   ):
+    # [FUNCTION DOC]
+    # Records the actor trainer's iter_steps whenever generation, rollout
+    # log-probs (old policy) and reference log-probs are computed, trains
+    # on 8 single-prompt batches, and verifies: generation happens every
+    # num_iterations steps; reference log-probs only when beta is nonzero;
+    # old-policy log-probs only when num_iterations exceeds 1; params
+    # changed; train_steps equals iter_steps divided by gradient
+    # accumulation steps; and kl is logged once per train step.
+    # Gradient-accumulation cases are skipped (bug b/446969561).
     # TODO(b/446969561): Re-enable these test cases. Due to the change in
     # cl/810188417, the current test case will fail.
     if name in (
@@ -492,7 +592,12 @@ class GRPOLearnerTest(parameterized.TestCase):
     rollout_worker_logps_fn_call_at_step = []
     inference_worker_logps_fn_call_at_step = []
     def wrap_fn(fn, fn_call_at_step, trainer):
+      # [FUNCTION DOC]
+      # HELPER: returns a wrapper of fn that appends trainer.iter_steps to
+      # fn_call_at_step before delegating.
       def wrapper(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: records the step then returns fn's result.
         fn_call_at_step.append(trainer.iter_steps)
         return fn(*args, **kwargs)
       return wrapper
@@ -553,6 +658,11 @@ class GRPOLearnerTest(parameterized.TestCase):
     )
 
   def test_grpo_with_lora_model(self):
+    # [FUNCTION DOC]
+    # With a LoRA actor on the first half of devices and rollout on the
+    # second half, verifies weight sync and async rollout are enabled, and
+    # after training only LoRA params change, the rollout model's LoRA
+    # params equal the trainer's (synced), and base params are unchanged.
     # reshard through default device_put.
     split_index = self.device_count // 2
     mesh1 = Mesh(
@@ -653,6 +763,12 @@ class GRPOLearnerTest(parameterized.TestCase):
       ),
   )
   def test_sequence_packing(self, max_token_len):
+    # [FUNCTION DOC]
+    # Trains two identical setups, one without and one with sequence
+    # packing (max_seq_token_per_tpu set to budgets fitting one or more
+    # 266-token sequences), and verifies packed training changes params,
+    # ends close to unpacked params (loose tolerance because the toy model
+    # ignores segment ids in attention), and runs the same iterations.
     kwargs = {'eval_every_n_steps': 2}
 
     # Train without sequence packing
@@ -708,9 +824,16 @@ class GRPOLearnerTest(parameterized.TestCase):
     self.assertEqual(learner_unpacked._iter_steps, learner_packed._iter_steps)
 
   def test_exception_from_data_preparation(self):
+    # [FUNCTION DOC]
+    # Verifies an exception raised while generating/computing advantages
+    # (possibly on a data-loading thread) propagates out of train.
     class _TrainerWithException(grpo_lib.GRPOLearner):
+      # [CLASS DOC]
+      # HELPER: GRPOLearner whose advantage step always fails.
       @override
       def _generate_and_compute_advantage(self, example, mode='train'):
+        # [FUNCTION DOC]
+        # HELPER: raises ValueError("test exception").
         raise ValueError('test exception')
     rl_cluster, _, _ = setup()
     grpo_config = grpo_lib.GRPOConfig(
@@ -727,6 +850,15 @@ class GRPOLearnerTest(parameterized.TestCase):
       grpo_learner.train(train_ds, None)
 
   def test_resume_training(self):
+    # [FUNCTION DOC]
+    # Trains a reference learner on 2 batches (global steps 2). Then trains
+    # a second model with per-step checkpointing on only the first batch,
+    # rebuilds cluster and learner from the checkpoint (global steps 1,
+    # last iter step 1), resumes on the full dataset to global step 2, and
+    # verifies the final params equal the uninterrupted run.
+    # KNOWN ISSUE: the fallback temp dir uses the name of a
+    # TemporaryDirectory object that is not kept alive, so the directory
+    # may be deleted immediately.
     vocab = tc.MockVocab()
     model = tc.ToyTransformer(
         config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
