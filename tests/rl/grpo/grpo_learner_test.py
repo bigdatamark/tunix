@@ -968,7 +968,15 @@ class GRPOLearnerTest(parameterized.TestCase):
     jax.tree.map_with_path(tc.assert_equal, variables1, variables2)
 
   def test_trajectory_ids(self):
+    # [FUNCTION DOC]
+    # Records trajectory id to prompt maps via the reward fn for two runs
+    # with different batch sizes and gradient accumulation (batch 4 / accum
+    # 1 vs batch 8 / accum 4), and verifies the maps are identical, with 80
+    # train ids (max_steps x batch x generations) and 8 eval ids.
     def my_reward_fn(trajectories, prompts, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: stores each prompt under its trajectory id in
+      # trajectories[mode] and returns reward 1.0 per prompt.
       for t_id, prompt in zip(kwargs['trajectory_ids'], prompts):
         trajectories[kwargs['mode']][t_id] = prompt
       return [1.0] * len(prompts)
@@ -981,6 +989,11 @@ class GRPOLearnerTest(parameterized.TestCase):
     )
     mesh = pxla.thread_resources.env.physical_mesh
     def create_rl_cluster(grad_accu_steps, mini_batch_size):
+      # [FUNCTION DOC]
+      # HELPER: builds a cluster sharing the outer models with the given
+      # mini batch size and train micro batch size mini / accum (yielding
+      # that many accumulation steps), eval every 2 x accum steps, max
+      # steps 10, and a print-based external metrics logger.
       cluster_config = rl_cluster_lib.ClusterConfig(
           role_to_mesh={
               rl_cluster_lib.Role.ACTOR: mesh,
@@ -1098,7 +1111,18 @@ class GRPOLearnerTest(parameterized.TestCase):
       rollout_micro_batch_size,
       compute_logps_micro_batch_size,
   ):
+    # [FUNCTION DOC]
+    # Trains a baseline learner without micro-batching on 80 rows and a
+    # second with the given mini/train/rollout/logps micro-batch sizes, and
+    # verifies both change params, record identical trajectory-id maps, and
+    # take 80 / batch_size and 80 / (mini_batch_size or batch_size) train
+    # steps respectively.
+    # KNOWN ISSUE: the case named "individible_batch_size" uses sizes that
+    # are all divisible (20 by 10 and 4), contrary to its name.
     def my_reward_fn(trajectories, prompts, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: records prompts by trajectory id per mode and returns
+      # rewards 0..n-1.
       for t_id, prompt in zip(kwargs['trajectory_ids'], prompts):
         trajectories[kwargs['mode']][t_id] = prompt
       return jnp.arange(len(prompts))
@@ -1109,6 +1133,12 @@ class GRPOLearnerTest(parameterized.TestCase):
         compute_logps_micro_batch_size,
         trajectories,
     ):
+      # [FUNCTION DOC]
+      # HELPER: builds fresh toy actor/reference models and a GRPO learner
+      # (2 generations, max_steps 20, eval every 2, profiler on steps 2 with
+      # first step skipped writing to /tmp/profiler, prompt length 32, KV
+      # cache 256, temperature 0.5) using the given batch sizes and a
+      # recording reward fn. Returns (learner, actor model).
       vocab = tc.MockVocab()
       model = tc.ToyTransformer(
           config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -1224,6 +1254,13 @@ class GRPOLearnerTest(parameterized.TestCase):
   def test_checkpoint_with_mini_batch(
       self, max_steps, batch_size, mini_batch_size
   ):
+    # [FUNCTION DOC]
+    # Trains with checkpoints every 4 steps under a unique /tmp directory,
+    # verifies global steps equal max_steps x mini / batch; a new learner
+    # with doubled max_steps restores the same global step and custom
+    # metadata (global_step and actor role); then training with doubled
+    # batch size advances global steps by max_steps x mini / new batch.
+    # Side effects: writes checkpoints under /tmp (not cleaned up).
     ckpt_dir = f'/tmp/{self.id()}/{uuid.uuid4()}/checkpoint'
     if os.path.exists(ckpt_dir):
       shutil.rmtree(ckpt_dir)
@@ -1231,6 +1268,11 @@ class GRPOLearnerTest(parameterized.TestCase):
         ckpt_dir,
         max_steps,
     ):
+      # [FUNCTION DOC]
+      # HELPER: builds fresh toy models and a GRPO learner whose mini,
+      # train, rollout and logps micro-batch sizes all equal the outer
+      # mini_batch_size, checkpointing to ckpt_dir every 4 steps, with the
+      # given max_steps. Returns the learner.
       vocab = tc.MockVocab()
       model = tc.ToyTransformer(
           config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
@@ -1335,6 +1377,12 @@ class GRPOLearnerTest(parameterized.TestCase):
   )
 
   def test_compute_rewards_shape(self, reward_fns):
+    # [FUNCTION DOC]
+    # Verifies _compute_rewards on 3 prompts/completions/answers in train
+    # mode returns one aggregated reward per prompt for single and multiple
+    # reward fns.
+    # KNOWN ISSUE: the "single_reward_fn_gspo" case still uses loss_algo
+    # "grpo", so it duplicates the single_reward_fn case.
     rl_cluster, _, _ = setup()
     rl_cluster.with_external_metrics_logger(print)
     grpo_config = grpo_lib.GRPOConfig(

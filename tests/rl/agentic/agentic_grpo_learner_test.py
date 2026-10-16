@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC]
+# Tests for tunix.rl.agentic.agentic_grpo_learner.GRPOLearner, the agentic
+# (multi-turn, orchestrator-driven) GRPO learner. Rollouts are produced by
+# an async producer that runs agent/environment pairs through a rollout
+# orchestrator and puts processed train examples into a data queue consumed
+# by the trainer. Covers: producer ordering with num_iterations repeats,
+# GRPOConfig validation, how often train-example conversion, reference
+# log-prob computation and actor updates happen under micro-batching and
+# multiple iterations, policy loss shape and masking semantics,
+# _process_results text extraction and degenerate-group masking,
+# checkpointing/resume, micro-batch equivalence, KL forcing, use of
+# rollout log-probs, exception propagation, full training with metrics,
+# on/off-policy steps, prompt queueing, trajectory logging, LoRA weight
+# sync, and custom agent/environment classes. Generation is usually
+# replaced by _mock_generate, which picks random canned responses.
+# Side effects: sets XLA_FLAGS at import; setUpClass forces 2 CPU devices;
+# setUp seeds Python's random module with 42; several tests write
+# checkpoints or logs to temporary directories.
+# KNOWN ISSUE: XLA_FLAGS is set after jax is imported, so it likely has no
+# effect; _mock_generate draws logprobs from NumPy's global RNG, which is
+# not seeded, so values vary between runs.
+
 """Tests for agentic_grpo_learner."""
 
 import asyncio
@@ -60,11 +82,15 @@ TrainingInputT = agentic_grpo_learner.TrainingInputT
 
 
 def reward_fn_1(prompts, completions, **kwargs):
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning floats 0..n-1 for n completions.
   del prompts, kwargs
   return [float(i) for i in range(len(completions))]
 
 
 def reward_fn_2(answer, **kwargs):
+  # [FUNCTION DOC]
+  # HELPER: reward fn returning floats 0..n-1 for n answers.
   del kwargs
   return [float(i) for i in range(len(answer))]
 
@@ -94,6 +120,15 @@ def _mock_generate(
     tokenizer: Any | None = None,
     **kwargs,
 ) -> base_rollout.RolloutOutput:
+  # [FUNCTION DOC]
+  # HELPER: stand-in for RLCluster.generate. Accepts a string, a list of
+  # strings, or a list of chat message lists; requires tokenizer (asserts
+  # not None). For each prompt picks a random canned response, tokenizes
+  # it, draws negative random logprobs per token, and tokenizes the prompt
+  # (joining message contents with spaces for chat prompts), left-padding
+  # all prompt tokens with 0 to the longest length. Returns a RolloutOutput
+  # with text, tokens, padded prompt tokens, no logits, and logprobs only
+  # when output_logprobs is true. Other arguments are ignored.
   del apply_chat_template, mode, micro_batch_size, trace_tags
   assert tokenizer is not None
   if isinstance(prompts, str):
@@ -123,6 +158,10 @@ def _mock_generate(
 
 
 def _mock_vocab():
+  # [FUNCTION DOC]
+  # HELPER: builds a MockVocab whose word-to-id map contains special tokens,
+  # chat/env words, digits 1..10, and every word in the canned responses
+  # (sorted), ids assigned in list order.
   unique_words = {word for line in _MOCK_RESPONSES for word in line.split()}
   words = [
       "<pad>",
@@ -165,20 +204,35 @@ def _mock_vocab():
 
 
 class MySource(grain.RandomAccessDataSource):
+  # [CLASS DOC]
+  # HELPER: random-access grain source over a list (default four short
+  # strings) repeated repeat times.
 
   def __init__(self, data=None, repeat=1):
+    # [FUNCTION DOC]
+    # HELPER: stores data (or the default strings) concatenated repeat times.
     if data is None:
       data = ["input string", "hello world", "My name is", "hello there"]
     self._data = data * repeat
 
   def __getitem__(self, idx):
+    # [FUNCTION DOC]
+    # HELPER: returns the item at idx.
     return self._data[idx]
 
   def __len__(self):
+    # [FUNCTION DOC]
+    # HELPER: returns the number of stored items.
     return len(self._data)
 
 
 def _dummy_dataset(source=MySource(), batch_size: int = 1):
+  # [FUNCTION DOC]
+  # HELPER: grain MapDataset over source, batched by batch_size, mapping
+  # each batch to a dict with "prompts", "answer" and "question" all equal
+  # to the batch.
+  # KNOWN ISSUE: the default MySource is created once at definition time
+  # and shared across calls.
   return (
       grain.MapDataset.source(source)
       .batch(batch_size)
@@ -187,8 +241,16 @@ def _dummy_dataset(source=MySource(), batch_size: int = 1):
 
 
 class MockChatParser:
+  # [CLASS DOC]
+  # HELPER: minimal chat parser rendering messages as "System: ...",
+  # " User: ...", " Assistant: ..." with assistant token "Assistant: ".
 
   def parse(self, messages, add_generation_prompt=False, is_first_msg=False):
+    # [FUNCTION DOC]
+    # HELPER: returns "" for no messages; otherwise concatenates each
+    # message with its role prefix and, if add_generation_prompt, appends a
+    # space and the assistant token. Raises ValueError for roles other than
+    # system, user or assistant (e.g. tool). is_first_msg is ignored.
     del is_first_msg
     if not messages:
       return ""
@@ -210,24 +272,39 @@ class MockChatParser:
 
   @property
   def assistant_token(self):
+    # [FUNCTION DOC]
+    # HELPER: returns "Assistant: ".
     return "Assistant: "
 
 
 class _LearnerWithException(agentic_grpo_learner.GRPOLearner):
+  # [CLASS DOC]
+  # HELPER: learner whose train-example conversion always fails, used to
+  # test exception propagation from the producer.
 
   def _batch_to_train_example(self, batch_results, mode):
+    # [FUNCTION DOC]
+    # HELPER: raises ValueError("test exception in producer").
     raise ValueError("test exception in producer")
 
 
 class AgenticGrpoLearnerTest(parameterized.TestCase):
+  # [CLASS DOC]
+  # Tests for the agentic GRPO learner on 2 simulated CPU devices.
 
   @classmethod
   def setUpClass(cls):
+    # [FUNCTION DOC]
+    # HELPER: forces 2 CPU devices and stores cls.device_count.
     super().setUpClass()
     chex.set_n_cpu_devices(2)
     cls.device_count = jax.device_count()
 
   def setUp(self):
+    # [FUNCTION DOC]
+    # HELPER: seeds random with 42, builds the mock vocab, a
+    # TokenizerAdapter over it, and self._mock_generate bound to that
+    # tokenizer.
     super().setUp()
     random.seed(42)
     self.vocab = _mock_vocab()
@@ -237,15 +314,30 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     )
 
   def test_iterator(self):
+    # [FUNCTION DOC]
+    # Runs the learner's _producer with a stub trainer over a prompt queue
+    # holding one batch of prompts [0, 1] and a None sentinel, then drains
+    # the train data queue until None. Verifies each prompt yields
+    # num_generations (2) examples repeated num_iterations (2) times, in
+    # prompt order: 0,0,0,0,1,1,1,1.
     class _MockTrainer(agentic_grpo_learner.GRPOLearner):
+      # [CLASS DOC]
+      # HELPER: learner with minimal state (no base init), splitting batches
+      # into single-prompt micro-batches and faking orchestrator output.
 
       def __init__(self, algo_config):
+        # [FUNCTION DOC]
+        # HELPER: stores config, a Mock cluster, no metric fns, and
+        # disables processing in the consumer.
         self.algo_config = algo_config
         self.rl_cluster = mock.Mock()
         self.metric_fns = []
         self._process_in_consumer = False
 
       def _create_micro_batch_iterator(self, iterator, batch_size):
+        # [FUNCTION DOC]
+        # HELPER: yields each batch's rows one at a time as single-row
+        # pytrees, ignoring batch_size.
         # The dataset batch size is 2, and we want to test micro-batching
         # of size 1, as consumed by _orchestrator_producer.
         for batch in iterator:
@@ -254,6 +346,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
       @override
       def _batch_to_train_example(self, batch_results, mode):
+        # [FUNCTION DOC]
+        # HELPER: returns num_generations namespaces whose prompt_ids is the
+        # prompts of the first example in batch_results' second element.
         del mode
         examples = []
         for _ in range(self.algo_config.num_generations):
@@ -274,6 +369,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
           num_generations: int = 1,
           collect_mode: str = "Token",
       ):
+        # [FUNCTION DOC]
+        # HELPER: async generator over the (sync or async) prompt iterator
+        # yielding, per example, a group of num_generations namespaces with
+        # consecutive pair_index values and a one-element example list.
         i = 0
         if hasattr(prompt_iterator, "__aiter__"):
           async for example in prompt_iterator:
@@ -322,6 +421,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     self.assertEqual(prompt_ids, [0, 0, 0, 0, 1, 1, 1, 1])
 
   def test_grpo_config_validation(self):
+    # [FUNCTION DOC]
+    # Verifies GRPOConfig raises ValueError for num_generations 1 and for a
+    # loss_algo other than grpo or gspo-token.
     with self.assertRaisesRegex(
         ValueError, "num_generations must be greater than 1"
     ):
@@ -332,6 +434,11 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       agentic_grpo_learner.GRPOConfig(loss_algo="invalid")
 
   def test_num_iterations_greater_than_1(self):
+    # [FUNCTION DOC]
+    # Trains on 4 single-prompt batches with 2 generations, 2 iterations,
+    # mini and train micro batch 1, generate mocked, and verifies
+    # train-example conversion runs 4 times (once per prompt) while
+    # update_actor runs 8 times (16 queued examples consumed 2 at a time).
     vocab = test_common.MockVocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -421,6 +528,11 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       self.assertEqual(mock_update_actor.call_count, 8)
 
   def test_compute_logps_micro_batch_size(self):
+    # [FUNCTION DOC]
+    # With one batch of 4 prompts, 2 generations, 2 iterations and mini /
+    # train / logps micro batch 2, verifies train-example conversion and
+    # reference log-prob computation each run twice (2 prompt groups = 4
+    # trajectories per call), and update_actor runs 4 times.
     vocab = test_common.MockVocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -524,6 +636,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
   @parameterized.parameters("grpo", "gspo-token")
   def test_grpo_loss_fn(self, loss_algo):
+    # [FUNCTION DOC]
+    # Verifies the registered policy loss for grpo and gspo-token returns a
+    # scalar loss and an aux dict containing "kl", using a model that emits
+    # constant logits over 32 vocab entries.
     batch_size, seq_len = 2, 8
     prompt_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
     completion_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
@@ -544,13 +660,20 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     )
 
     class MockModel(nnx.Module):
+      # [CLASS DOC]
+      # HELPER: model returning constant 0.1 logits over 32 classes.
 
       def __init__(self, *, rngs: nnx.Rngs):
+        # [FUNCTION DOC]
+        # HELPER: sets a dummy lm_head attribute; rngs unused.
         self.lm_head = 1
 
       def __call__(
           self, inputs, positions, cache, attention_mask, **kwargs
       ):
+        # [FUNCTION DOC]
+        # HELPER: returns (logits of shape inputs.shape + (32,) all 0.1,
+        # None cache).
         del kwargs
         return (
             jnp.full(
@@ -585,6 +708,12 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       dict(testcase_name="masked", apply_masking=True),
   )
   def test_grpo_loss_fn_respects_mask(self, apply_masking):
+    # [FUNCTION DOC]
+    # For two prompt groups (one with advantages -1/1, one degenerate with
+    # zeros) and a uniform-logit model, verifies the token-mean grpo loss
+    # equals the mean over sequences of (-advantage + beta x per-token KL
+    # between log(1/32) and the reference logps), restricted to the first
+    # group when its completion mask zeroes out the degenerate group.
     seq_len = 8
     prompt_ids = jnp.asarray(
         [
@@ -612,13 +741,19 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     )
 
     class MockModel(nnx.Module):
+      # [CLASS DOC]
+      # HELPER: model returning constant 0.1 logits over 32 classes.
 
       def __init__(self, *, rngs: nnx.Rngs):
+        # [FUNCTION DOC]
+        # HELPER: sets a dummy lm_head attribute; rngs unused.
         self.lm_head = 1
 
       def __call__(
           self, inputs, positions, cache, attention_mask, **kwargs
       ):
+        # [FUNCTION DOC]
+        # HELPER: returns (constant 0.1 logits with a trailing 32 dim, None).
         del kwargs
         return (
             jnp.full(
@@ -693,8 +828,17 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     np.testing.assert_allclose(loss, expected_loss, rtol=1e-6, atol=1e-6)
 
   def test_process_results_extracts_assistant_text(self):
+    # [FUNCTION DOC]
+    # Verifies _process_results passes only the assistant message content
+    # of each trajectory's conversation as the completion to reward
+    # computation (rewards and reference logps are mocked).
     class MockTraj:
+      # [CLASS DOC]
+      # HELPER: fake orchestrator item whose traj dict mimics Token-mode
+      # output with system/user/assistant messages ("msg <index>").
       def __init__(self, index):
+        # [FUNCTION DOC]
+        # HELPER: builds the traj dict for the given index.
         self.traj = {
             "conversation_text": [
                 {"role": "system", "content": "system prompt"},
@@ -715,6 +859,8 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
     extracted_completions = []
     def mock_compute_rewards(prompts, completions, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: records completions and returns float32 ones per item.
       extracted_completions.extend(completions)
       return jnp.ones(len(completions), dtype=jnp.float32)
 
@@ -783,7 +929,19 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       dict(testcase_name="masking_enabled", masking=True),
   )
   def test_process_results_masks_zero_advantage_group(self, masking):
+    # [FUNCTION DOC]
+    # Verifies degenerate_group_masking: a group with differing rewards
+    # keeps a nonzero completion mask; a group with identical rewards (zero
+    # advantages), including one where a trajectory lacks an assistant
+    # message, is fully masked only when masking is enabled. Also verifies a
+    # group mixing present and missing old logprobs fills missing ones with
+    # zeros.
+    # KNOWN ISSUE: the patched get_ref_per_token_logps handle is bound but
+    # never asserted on; the old-logprobs check is weak (any zero passes).
     class MockTraj:
+      # [CLASS DOC]
+      # HELPER: fake trajectory item with configurable group, reward,
+      # presence of an assistant message and old logprobs.
 
       def __init__(
           self,
@@ -793,6 +951,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
           has_assistant_message=True,
           old_logprobs=None,
       ):
+        # [FUNCTION DOC]
+        # HELPER: builds the traj dict with a user message and optionally
+        # an assistant message "msg <index>".
         self.traj = {
             "conversation_text": [],
             "conversation_tokens": np.array([1, 2, 3]),
@@ -908,6 +1069,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       self.assertTrue(jnp.any(res_group4.old_per_token_logps == 0.0))
 
   def test_checkpointing(self):
+    # [FUNCTION DOC]
+    # Trains one step with per-step checkpointing into a temp dir (removed
+    # on cleanup), then verifies a new learner restores global step 1 and
+    # continues to global step 3 with max_steps 3.
     ckpt_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, ckpt_dir)
     mini_batch_size = 1
@@ -916,6 +1081,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         ckpt_dir,
         max_steps,
     ):
+      # [FUNCTION DOC]
+      # HELPER: builds fresh toy models and an agentic GRPO learner with all
+      # batch sizes 1, checkpoints every step in ckpt_dir, the given
+      # max_steps, reward_fn_1 and MockChatParser. Returns the learner.
       vocab = test_common.MockVocab()
       tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
       model = test_common.ToyTransformer(
@@ -1015,7 +1184,15 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       mini_batch_size,
       train_micro_batch_size,
   ):
+    # [FUNCTION DOC]
+    # Trains a baseline (no mini/micro batching) and a micro-batched learner
+    # on one batch of 8 prompts and verifies both reach the same global
+    # step count, which is 1.
+    # KNOWN ISSUE: the trajectories dicts are passed to create_learner but
+    # never populated, so comparing them is vacuous.
     def reward_fn(prompts, **kwargs):
+      # [FUNCTION DOC]
+      # HELPER: returns reward 1.0 per prompt.
       del kwargs
       return [1.0] * len(prompts)
 
@@ -1024,6 +1201,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         train_micro_batch_size,
         trajectories,
     ):
+      # [FUNCTION DOC]
+      # HELPER: builds fresh toy models and an agentic GRPO learner with the
+      # given mini / train micro batch sizes (max_steps 20, eval every 10).
+      # trajectories is unused. Returns the learner.
       vocab = test_common.MockVocab()
       tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
       model = test_common.ToyTransformer(
@@ -1111,6 +1292,13 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     self.assertEqual(grpo_learner_base.rl_cluster.global_steps, 1)
 
   def test_resume_training(self):
+    # [FUNCTION DOC]
+    # Trains 2 steps uninterrupted (no checkpoints), then 1 step with
+    # checkpointing, then resumes a new learner from step 1 to step 2, and
+    # verifies the resumed model's params are close to the uninterrupted
+    # run's.
+    # KNOWN ISSUE: generation is not mocked and sampling uses temperature
+    # 0.5, so equivalence relies on deterministic rollout seeding.
     ckpt_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, ckpt_dir)
     mini_batch_size = 1
@@ -1120,6 +1308,11 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         max_steps,
         reward_fn=reward_fn_1,
     ):
+      # [FUNCTION DOC]
+      # HELPER: builds fresh toy models and an agentic GRPO learner with
+      # batch sizes 1, the given max_steps and reward fn, checkpointing
+      # every step when ckpt_dir is truthy (none otherwise). Returns
+      # (learner, actor model).
       vocab = test_common.MockVocab()
       tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
       model = test_common.ToyTransformer(
@@ -1235,6 +1428,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       ),
   )
   def test_force_compute_kl(self, beta, force_compute_kl, expect_ref_logps):
+    # [FUNCTION DOC]
+    # Verifies _process_results computes reference log-probs (and sets
+    # ref_per_token_logps on the single resulting example) when beta is
+    # nonzero or force_compute_kl is set, and skips them (None) otherwise.
     vocab = _mock_vocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1288,8 +1485,12 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
     # Mock trajectories to pass into _process_results
     class MockTraj:
+      # [CLASS DOC]
+      # HELPER: fake trajectory item with a single assistant message.
 
       def __init__(self, index):
+        # [FUNCTION DOC]
+        # HELPER: builds the traj dict for the given index.
         self.traj = {
             "conversation_text": [
                 {"role": "assistant", "content": f"msg {index}"}
@@ -1340,6 +1541,12 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
   def test_use_rollout_logps(
       self, use_rollout_logps, return_logprobs, expect_get_actor_logps
   ):
+    # [FUNCTION DOC]
+    # Verifies _process_results takes old per-token log-probs from the
+    # rollout (right-padded with zeros to max_response_length 10) when
+    # use_rollout_logps is on, without calling get_actor_per_token_logps;
+    # when off, it recomputes them via get_actor_per_token_logps (mocked to
+    # all -1.0) and uses that result.
     vocab = _mock_vocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1394,8 +1601,13 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
     # Mock trajectories to pass into _process_results
     class MockTraj:
+      # [CLASS DOC]
+      # HELPER: fake trajectory item whose old logprobs are three 1.0
+      # values when the rollout returns logprobs, else None.
 
       def __init__(self, index):
+        # [FUNCTION DOC]
+        # HELPER: builds the traj dict for the given index.
         self.traj = {
             "conversation_text": [
                 {"role": "assistant", "content": f"msg {index}"}
@@ -1447,6 +1659,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
           self.assertIsNone(train_example.old_per_token_logps)
 
   def test_exception_handling(self):
+    # [FUNCTION DOC]
+    # Verifies an exception raised in the producer (train-example
+    # conversion) propagates out of train with its original message.
     vocab = test_common.MockVocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1519,6 +1734,16 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       ),
   )
   def test_grpo_learner(self, reward_fns, loss_algo, use_old_logprobs):
+    # [FUNCTION DOC]
+    # Trains 20 steps (eval every 2) with mocked generation that may omit
+    # logprobs, and verifies: no weight sync; params changed; global steps
+    # 20; reward, generation length/clip-ratio, step time and custom
+    # metrics logged at least once per global step in train and 10 times
+    # in eval (except step time); actor loss, kl, entropy and pg_clipfrac
+    # logged once per train step and 10 times in eval; grad_norm logged
+    # once per train step.
+    # KNOWN ISSUE: the clip-ratio history is fetched but its assertion is
+    # commented out, and the "rewards/reward_fn_2" skip is unreachable.
     vocab = _mock_vocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1676,6 +1901,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       ),
   )
   def test_on_off_policy_training(self, offpolicy_steps):
+    # [FUNCTION DOC]
+    # Verifies training with off_policy_steps 0, 1 or 2 (how many policy
+    # versions rollouts may lag) still updates params and reaches 4 global
+    # steps.
     vocab = _mock_vocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1750,6 +1979,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     )
 
   def test_put_prompts_to_queue(self):
+    # [FUNCTION DOC]
+    # With the full batch size forced to 2, verifies _put_prompts_to_queue
+    # enqueues a batch of matching size as-is and enqueues a None sentinel
+    # (end of data) for a smaller trailing batch.
     vocab = test_common.MockVocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
     model = test_common.ToyTransformer(
@@ -1806,6 +2039,11 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     self.assertIsNone(prompt_queue.get_nowait())
 
   def test_trajectory_logging(self):
+    # [FUNCTION DOC]
+    # With metrics logging to a temp dir and trajectory_logger.log_item
+    # patched, trains one step on one prompt and verifies log_item is
+    # called once with num_generations trajectory dicts, each containing
+    # conversation_text (the trajectory logger is stopped first to flush).
     log_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, log_dir)
     vocab = _mock_vocab()
@@ -1882,6 +2120,8 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       self.assertLen(logged_items, grpo_config.num_generations)
 
       for traj in logged_items:
+        # Each logged item must also contain an assistant message drawn from
+        # the canned responses and policy_version 0.
         self.assertIn("conversation_text", traj)
         conversation = traj["conversation_text"]
         assistant_msgs = [m for m in conversation if m["role"] == "assistant"]
@@ -1890,6 +2130,11 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         self.assertEqual(traj.get("policy_version"), 0)
 
   def test_grpo_with_lora_model(self):
+    # [FUNCTION DOC]
+    # With a LoRA actor on the first half of devices and rollout on the
+    # second, verifies weight sync is required, and after training with
+    # mocked generation the LoRA params changed, the rollout model's LoRA
+    # params match the trainer's (close), and base params are unchanged.
     # reshard through default device_put.
     split_index = self.device_count // 2
     mesh1 = Mesh(
@@ -1983,16 +2228,40 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     )
 
   def test_customized_agent_env(self):
+    # [FUNCTION DOC]
+    # Trains with user-supplied agent and environment classes (3-step env,
+    # max concurrency 1), capturing created pairs and processed results via
+    # wrappers. Verifies the first processed example's completion mask for
+    # one of its two rows matches the expected pattern: 1 for each word of
+    # each model response, 0 for each observation word plus 2 role tokens,
+    # zero-padded/truncated to max_response_length 128; the decoded prompt
+    # contains "Assistant:" once and the completion twice (the terminal
+    # observation adds no generation prompt).
+    # KNOWN ISSUE: max_concurrency 1 is commented as making output
+    # deterministic, yet the assertion still tolerates either row order.
     class MockEnv(BaseTaskEnv):
+      # [CLASS DOC]
+      # HELPER: task env storing the dataset entry; fixed initial prompt and
+      # numbered observations; done once step_count reaches max_steps.
 
       def __init__(self, entry: dict[str, str], max_steps: int, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: stores entry and forwards max_steps and kwargs to base.
         self.entry = entry
         super().__init__(max_steps=max_steps, **kwargs)
 
       def _initial_observation(self) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: returns "Initial prompt.".
         return "Initial prompt."
 
       def _step_impl(self, action: Any) -> EnvStepResult:
+        # [FUNCTION DOC]
+        # HELPER: returns observation "Observation after step <n>", reward
+        # 1.0 while not done and 0.0 on the final step, done when
+        # step_count reaches max_steps, and info with max_steps.
+        # KNOWN ISSUE: the final (done) step gets reward 0.0 while earlier
+        # steps get 1.0, which looks inverted but only matters for rewards.
         done = self.step_count >= self.max_steps
         reward = 1.0 if not done else 0.0
         return EnvStepResult(
@@ -2003,12 +2272,22 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         )
 
     class MockAgent(ConversationAgentBase):
+      # [CLASS DOC]
+      # HELPER: conversation agent counting model turns, annotating
+      # observations with remaining steps, and recording steps.
 
       def __init__(self, system_prompt: str):
+        # [FUNCTION DOC]
+        # HELPER: initializes the base agent and a step counter at 0.
         super().__init__(system_prompt=system_prompt)
         self.step = 0
 
       def _observation_to_messages(self, observation, reward, done, info):
+        # [FUNCTION DOC]
+        # HELPER: if info has max_steps, appends " Steps Remaining: <k>"
+        # (k = max_steps - step - 1, when positive) or a max-steps-reached
+        # notice; appends the result as a user message and sets it on the
+        # current step if any.
         max_steps = info.get("max_steps", None)
         if max_steps is not None:
           remaining_steps = max_steps - self.step - 1
@@ -2022,6 +2301,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
           step.observation = observation
 
       def update_from_model(self, response, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: appends a Step whose action is "Model action: <response>",
+        # appends an assistant message, increments the step counter, and
+        # returns an Action wrapping that action string.
         step = Step(model_response=response, action=f"Model action: {response}")
         self._trajectory.steps.append(step)
 
@@ -2094,6 +2377,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     original_fn = grpo_learner._create_agent_env_pair
 
     def _patch_create_agent_env_pair(single_example, group_id, pair_index):
+      # [FUNCTION DOC]
+      # HELPER: delegates to the original pair factory and records the
+      # created agent and env.
       agent, env = original_fn(single_example, group_id, pair_index)
       agents.append(agent)
       envs.append(env)
@@ -2107,6 +2393,9 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         mode,
         expected_step,
     ):
+      # [FUNCTION DOC]
+      # HELPER: delegates to the original _process_results and records its
+      # result.
       res = original_process_results(trajectories, mode, expected_step)
       processed_results.append(res)
       return res
